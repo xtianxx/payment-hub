@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+
+*.log
+coverage.out
+coverage.html
+
+bin/
+dist/
+tmp/
+
+.idea/
+.vscode/

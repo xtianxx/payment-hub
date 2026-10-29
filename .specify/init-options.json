@@ -1,0 +1,9 @@
+{
+  "ai": "opencode",
+  "allow_symlinks": false,
+  "feature_numbering": "sequential",
+  "here": false,
+  "integration": "opencode",
+  "script": "sh",
+  "speckit_version": "1.2.5"
+}
