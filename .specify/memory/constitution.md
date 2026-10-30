@@ -1,50 +1,108 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+# Payment Hub Constitution
+
+**状态：已批准。** 项目负责人于 2026-10-30 确认本宪章，自该日起生效。
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### I. 业务契约与小步交付
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+- 实现前必须明确当期用例、关键术语、范围与非目标，以及成功和失败的验收条件。
+- 每次迭代必须围绕可演示、可验证的业务闭环；远期能力不得自动变成当期交付承诺。
+- 后续 Git 提交必须以最小完整成果为单位：每次聚焦单一目标，可说明、可验证、可回退。
+  不得混入无关改动，也不得为缩小提交而拆散该成果不可分割的实现、测试和文档。
+- 业务规则或接口行为变化时，相关需求说明与实现必须同步，不得以代码默默改写约定。
+- Spec Kit 产物中供人阅读的正文必须以中文为主，包括需求规格、计划、任务、研究、
+  澄清记录、检查清单及验收和分析报告。文件名、路径、命令、代码标识符、API 名称及
+  工具要求的固定标题、字段和占位符必须保留原文，不得因翻译破坏工具兼容性；
+  必要的英文技术术语可保留，并按阅读需要补充中文解释。
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+**依据：** 小步验收和需求追踪降低返工，也让学习过程与求职成果有可解释的业务背景。
+中文正文便于项目负责人自行阅读、理解和评审。
+最小成果提交便于审查、定位变更与回退，不以文件数或行数机械衡量粒度。
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+### II. 金额与状态正确性
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+- 金额必须精确表示并明确币种；不得直接使用二进制浮点数进行金额运算。
+  当期用例必须定义金额的有效范围、精度及超界处理，并验证这些边界。
+- 订单状态及合法迁移必须有明确业务依据；不得因迟到或冲突消息直接覆盖已确认结果。
+- 超时、通信失败和结果未知不得直接等同于支付成功或确定失败；必须保留区分与后续处理规则。
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+**依据：** 即使只用 Mock，也必须验证支付语义，而不是仅验证接口能够返回成功。
+退款等能力的专属不变量，在纳入当期范围时再补充，不在此预设完整资金模型。
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+### III. 不可靠交互与幂等
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+- 外部请求和渠道返回必须视为不可信输入，校验其格式、业务标识及与当前操作的匹配关系。
+  引入异步通知时，必须先明确并验证来源、完整性及订单关联，再允许更新业务状态。
+- 引入支付提交、通知或重试时，必须定义幂等的业务边界、重复请求及冲突请求的处理语义。
+  在该边界内，并发、重试或重复事件不得产生重复业务效果，冲突意图不得静默覆盖。
+- 必须明确当前流程面对重复、乱序、超时及不确定结果的行为，并用 Mock 构造相关场景验证；
+  不得未经证明宣称端到端“恰好一次”，也不要求提前实现尚未纳入范围的渠道能力。
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+**依据：** 不可靠网络和重复投递是支付交互的常见风险，不能用理想路径掩盖。
+
+### IV. 风险驱动的验证与可追溯
+
+- 每次实现交付必须提供与当期风险匹配的自动化验证；已纳入范围的金额边界、状态迁移、
+  幂等及相关失败路径必须有测试，修复缺陷必须增加或更新回归验证。
+- 必须记录实际执行的验证命令、结果，以及未执行项及原因；不得将推测或 AI 声明当成通过证据。
+- 必须能通过业务关联标识定位关键状态变化及失败原因；仓库、测试数据及日志不得包含
+  真实凭据、支付敏感信息或未经脱敏的个人数据。
+
+**依据：** 可重复的验证和必要的追踪支撑真实演示与故障定位，无需先引入完整监控平台。
+
+### V. 简单设计与人类负责
+
+- 设计必须服务当前已确认需求；新增抽象、组件或依赖必须说明解决的当前问题和维护代价。
+  不得仅为远期可能性引入分布式复杂度，也不得在需求未明确前锁定技术栈或架构模式。
+- AI 产出必须经项目负责人审查；负责人必须能够解释关键业务规则、设计取舍及验证证据。
+- 影响业务契约、正确性或维护成本的重要取舍必须留下简短记录，不能以 AI 建议代替决策依据。
+
+**依据：** 个人项目的复杂度必须可掌握、可维护；可解释的成果比无法理解的生成代码更有价值。
+
+## 阶段边界与约束
+
+**已确定的约束（来自用户）：**
+
+- Payment Hub 是 Go 聚合支付后端，为业务系统提供统一的第三方支付接入能力。
+- 目标是求职展示，并系统学习业务分析、需求工程、架构、实现、测试与部署。
+- 由个人独立开发、AI 辅助；初期仅使用 Mock Provider，不处理真实资金。
+- Spec Kit 产物以中文为主要阅读和评审语言，具体规则见原则 I；这是用户明确要求。
+- 后续 Git 提交采用最小完整成果粒度。
+- 多渠道、支付订单、退款、异步通知和对账是未来方向，其具体交付范围须逐期确认。
+- 宪章制定不包含编码、部署或技术选型；具体框架、存储、消息系统与架构模式在需求明确后决定。
+
+**合理假设（用于下一阶段讨论，不是已确认需求）：**
+
+- 首期优先完成一个最小、可演示的 Mock 业务闭环；具体业务行为尚未确定。
+- 当前先验证业务正确性和开发过程，不以生产级高可用、规模化或真实渠道接入为验收目标。
+
+**待确认的问题（只保留近期重要项）：**
+
+- 首个 Mock 闭环包含哪些业务行为、失败场景与完成标准？此项在需求阶段确定。
+
+真实资金接入、生产安全合规与运行规模不在当前承诺内；扩展到这些范围前必须重新评估风险。
+
+## 开发与审查流程
+
+1. 宪章制定与修订必须由项目负责人审阅并确认；AI 不得代为批准。
+2. 使用 `/speckit.specify` 明确首个 Mock 业务闭环的需求与验收，不一次性细化全部远期能力。
+3. 需求明确后再形成必要的设计取舍和实现任务；按小步交付保留验证与审查证据。
+4. 每次范围变化时核对业务契约及宪章；按受影响范围更新说明和验证，不机械增加流程。
+5. 每完成一个符合验收条件的最小成果，在用户授权范围内单独提交，不积攒无关成果一起提交。
+   提交前必须审查暂存差异并完成适用验证，提交说明必须准确描述该成果；不得擅自推送。
+
+**阶段建议：** 宪章已满足当前阶段要求，建议进入首个 Mock 闭环的需求阶段，
+无需等待全部未来问题解决。
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+- 本宪章已由项目负责人批准。规格、设计、实现和交付审查必须核对本宪章；
+  个人项目可由负责人自审并保留结论。
+- 修订必须说明原因、影响和必要的迁移或同步事项，并由项目负责人批准。
+  遇到冲突必须修改方案或提出显式修订，不得默许例外，也不得由 AI 自行改变原则。
+- 版本遵循语义化规则：MAJOR 用于不兼容的原则移除或重定义，MINOR 用于新增原则或实质扩展，
+  PATCH 用于不改变约束含义的澄清。首次正式批准版本记为 1.0.0。
+- 原始批准日期一旦确认即保留；后续修订更新最后修订日期和版本。批准与版本变化必须可追溯。
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**Version**: 1.0.0 | **Ratified**: 2026-10-30 | **Last Amended**: 2026-10-30
