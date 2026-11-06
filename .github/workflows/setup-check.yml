@@ -1,0 +1,83 @@
+name: Setup checks / 准备阶段CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOENV: "off"
+  GOWORK: "off"
+  GOFLAGS: ""
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  setup-check:
+    name: Setup checks (linux/amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Isolate Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-setup"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; setup check cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.3
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          check-latest: false
+          cache: false
+
+      - name: Run setup checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/payment-hub-setup/check-setup.log"
+          python3 scripts/check-setup.py --cache-dir "$RUNNER_TEMP/payment-hub-setup" --download-modules | tee "$log"
+
+          {
+            echo "## Setup checks / 准备阶段检查"
+            echo ""
+            echo "仅完成 Go 模块输入/缓存与 Compose 静态检查；未执行应用 build/test/race、真实 PostgreSQL/迁移/HTTP/重启、镜像构建/拉取/运行或部署。"
+            echo ""
+            echo '```text'
+            grep -E '^(scope|module-cache-mode|go-version|goos|goarch|gotoolchain|gotelemetry|docker-version|compose-version|module-graph-count|checks-passed):' "$log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -8,7 +8,7 @@
 
 ## 1. 模块与版本
 
-用户选择单一本地模块名 `payment-hub`。本次检查未配置 Git remote，不虚构 GitHub 地址；以后若确定真实仓库导入路径，再明确调整模块名和引用，不自动创建仓库。
+用户选择单一本地模块名 `payment-hub`。T001 检查时未配置 Git remote，未虚构 GitHub 地址；之后经用户单独授权建立的远程仓库见第6节。模块名仍保持 `payment-hub`，不因添加 Git remote 自动改写导入路径。
 
 | 项目 | 批准基线 | 本批核实边界 |
 |---|---|---|
@@ -108,7 +108,7 @@ T004 采用上述 PG 标签与 linux/amd64 manifest digest，并显式限定平�
 
 分别查询 `https://api.github.com/repos/actions/<action>/releases/latest` 和 `https://api.github.com/repos/actions/<action>/git/ref/tags/<tag>`；本次三个 tag 的 ref 均直接指向 commit，不把 annotated tag 对象 SHA 当 commit。后续 workflow 按完整 commit 引用，实际 runner 要求、权限和保留上限在 T076/T077 核实；本批没有 workflow 或 CI 运行结果。
 
-真实 GitHub 仓库、默认分支、GHCR 包关联、访问权限、可见性和托管产物保留上限仍未知。涉及这些外部资源时先取得用户确认，不认证、不创建资源，不把源码公开等同于镜像公开。
+T001 时 GitHub/GHCR 的真实仓库、权限和可见性尚未确定。之后获单独授权的 GitHub 仓库与主线接入见第6节；GHCR 包关联、上传/拉取权限、镜像可见性和托管产物保留上限仍未核实，不因源码仓库已建立就自动创建包、发布镜像或扩大访问。
 
 ## 5. 本批验证与停止点
 
@@ -149,3 +149,56 @@ Compose 检查的 `DOCKER_CONFIG` 指向临时隔离位置，`DOCKER_HOST` 指�
 没有应用源码，因此本批不宣称应用编译、单元/功能/竞态测试通过；镜像构建/拉取、容器启动、真实 PG、迁移、HTTP、重启、CI 和发布均未执行。后续安装、升级、额外下载或启动服务仍须按当次授权处理；缺少权限就停在相关操作，不换用真实服务或其他环境绕过。
 
 实施前后均检查 `.specify/extensions.yml`；当前只有可选 Git 提交钩子，按本次“不提交”要求展示后跳过，不修改钩子。完成本批验证、更新任务状态并展示差异后停止，不提交、不推送，也不自动开始 T005。
+
+## 6. 独立补充批：远程接入与准备阶段 CI
+
+本节是 T001–T004 验收、用户批准其提交之后，另行获授权的一小批工作，不追溯扩大首批权限，也不开始 T005–T082。用户已批准建立私有 GitHub 仓库、`main` 主线、验证后提交推送并触发最小 CI，允许 runner 获取固定的官方 Actions、Go 1.27.3 和批准模块；随后明确要求使用已有 `gh` 登录创建仓库。授权不包含重新登录、创建凭据、安装或升级本机工具、发布镜像、启动业务容器或部署。
+
+### 仓库与主线
+
+- 仓库：<https://github.com/xtianxx/payment-hub>，已由现有 `gh` 账号创建并核实为 **Private**，未自动添加 README、License、`.gitignore` 或模板。
+- `origin`：`https://github.com/xtianxx/payment-hub.git`，地址中不含凭据；不运行修改全局配置的 `gh auth setup-git`。
+- 本地 `main` 已从早期宪章提交仅快进至首批已验收提交 `5bcb4f4`，没有改写历史；原 `001-mock-payment` 分支仍保留该提交，不删除或强制更新它。
+- 本批首次推送 `main`，以它作为远程默认分支目标；推送后再用远端元数据和提交 SHA 核实，不把空仓库的默认分支占位值当成已有 ref。
+- 后续实现继续使用功能分支和 PR；本批初始主线接入不授权自动合并后续 PR，也不自动公开仓库。
+
+### 最小 CI 的输入与范围
+
+工作流入口为 `.github/workflows/setup-check.yml`，可复用检查入口为 `scripts/check-setup.py`。它们只负责准备阶段，不冒充 T072 的完整 `scripts/check.sh` 或 T077 的完整业务/真实 PG/镜像检查工作流。
+
+| 项目 | 本批约束 |
+|---|---|
+| 触发 | 推送 `main`，以及目标分支为 `main` 的 `pull_request`；不使用 `pull_request_target` |
+| 执行环境 | GitHub-hosted `ubuntu-24.04`、linux/amd64；记录实际 Go、Docker CLI、Compose 版本，不自动安装缺少的 Compose |
+| 权限 | 仅 `contents: read`；不使用业务 secrets，不申请包上传、OIDC 或部署权限 |
+| 外部 Action | 第4节核实的 checkout/setup-go 完整 commit SHA；checkout 不持久化凭据，setup-go 固定 Go `1.27.3`，关闭自动追新与缓存 |
+| 配置隔离 | 首个步骤先在 `RUNNER_TEMP` 内准备 XDG/Go 缓存，使用已有 Go 执行 `go telemetry off`；后续工具继承该隔离目录，不手写遥测内部格式或改全局配置 |
+| 模块 | 固定工具链、模块身份及批准的直接依赖，显式下载模块后解析并校验；不允许隐式切换 Go，不用缓存命中代替校验 |
+| Compose | 清理环境、`--env-file /dev/null`、模拟值；4个隔离模型及10个必填缺失/空值拒绝用例；只调用 `config`，不连接 daemon 或数据库 |
+| 结果表达 | 成功只表示模块与静态配置检查通过；摘要明确列出未执行的应用和运行验收，不以“无包可测”报绿 |
+
+Ubuntu runner 镜像会更新，平台标签不等于 Docker/Compose 的精确版本固定；实际不兼容应明确失败并诊断，不自动升级宿主或放松配置断言。
+
+### 本地焦点检查
+
+使用首批已核实的项目工具链和已有缓存，可离线执行：
+
+```sh
+TMPDIR=/tmp/opencode python3 -B scripts/check-setup.py \
+  --go "$HOME/.cache/payment-hub/toolchains/go1.27.3/bin/go" \
+  --cache-dir "$HOME/.cache/payment-hub"
+```
+
+本机已按此入口执行，退出码 `0`：Go 1.27.3、Docker CLI 29.6.1、Compose 5.3.1；模块图为主模块加43个依赖，4个静态模型和10个必填拒绝用例均符合断言。脚本报告225条准备态断言，不是225个应用测试。本地未开启下载模式；精确命令、日志与源码 SHA256 见本批证据目录中的 `local-verification.json` 和 `local-check.*.log`。
+
+默认离线模式只验证已经准备好的模块缓存，不声称重新取得在线真实性证明。`--download-modules` 是显式网络开关；CI 在本批已获授权的 runner 环境中使用它，通过正常 HTTPS 代理与 sumdb 下载校验。其他环境需要下载或安装时仍须按当次许可处理。
+
+脚本只使用 Python 标准库、现有 Go 和 Docker/Compose CLI。工具缺失、版本不符、依赖校验或静态配置检查失败必须非零退出，不安装工具、不静默跳过，不打印全量环境或真实配置。模拟端口只参与渲染，未证明实际可绑定；不运行应用、SQL、镜像或容器。
+
+### 实际执行证据与停止点
+
+本批本机证据目录为 `/tmp/opencode/payment-hub-bootstrap-ci-k_tssfhn/`，与首批记录分开。提交前核对真实差异、既有规格/业务输入未改，以及适用的本地检查结果；推送后按本次源码 SHA 核实实际 Actions run、job/step 结果及远端 `main`，不沿用其他提交的绿灯。
+
+远程执行发生在提交之后，因此不在被测提交中预填“CI 已通过”；实际 run URL、源码 SHA、结论与日志证据保存在本机记录并在交付时报告。遇到认证、仓库策略、额度或网络阻塞，报告实际状态，不刷新权限、启用付费服务或把未运行算成功。
+
+完成这一小批后停止。T077 仍未完成：真实应用编译、业务测试、PostgreSQL、HTTP、并发与进程重启、配对镜像及产物留存等必须在相应实现和验证关卡补齐；本批不提供 CD、自动部署或镜像发布。
