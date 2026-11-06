@@ -1,0 +1,42 @@
+# Git metadata
+.git/
+.gitignore
+
+# Local environment files and secret configuration directories
+.env*
+**/.env*
+secrets/
+.secrets/
+**/secrets/
+**/.secrets/
+
+# Generated artifacts and coverage
+artifacts/
+**/artifacts/
+coverage/
+coverage.out
+coverage.html
+**/*.log*
+
+# Go build, test, and dependency cache outputs
+bin/
+dist/
+tmp/
+vendor/
+**/*.exe
+**/*.test
+**/*.out
+
+# IDE and OS temporary files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+
+# Docker build inputs are not application content
+Dockerfile*
+**/Dockerfile*
+.dockerignore
+**/.dockerignore

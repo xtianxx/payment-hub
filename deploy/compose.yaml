@@ -1,0 +1,54 @@
+# 本文件只定义本地 PostgreSQL 服务；应用与一次性迁移服务在 T074 补齐。
+# 开发、演示和每次测试必须使用不同的 COMPOSE_PROJECT_NAME，以隔离项目网络与命名卷。
+# 基础文件不发布数据库宿主端口；仅测试时叠加 deploy/compose.test.yaml，并另用独立测试项目。
+# 普通停止或重启保留命名卷；不提供 down -v 作为默认清理步骤。
+name: ${COMPOSE_PROJECT_NAME:?请明确选择隔离的 Compose 项目名，例如 payment-hub-dev 或 payment-hub-test-<run_id>}
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16.15-bookworm@sha256:5983db9a9c6ad225a48a46cfe2e03e6680b1826662befd0465eb05b34cb1c64e
+    platform: linux/amd64
+    restart: "no"
+    stop_grace_period: 25s
+    environment:
+      POSTGRES_DB: ${PAYMENT_HUB_POSTGRES_DB:?请明确设置目标数据库名，不提供默认值}
+      POSTGRES_USER: ${PAYMENT_HUB_POSTGRES_USER:?请明确设置目标数据库用户，不提供默认值}
+      POSTGRES_PASSWORD: ${PAYMENT_HUB_POSTGRES_PASSWORD:?请从未入 Git 的本地配置注入非空数据库密码}
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      - "-c"
+      - timezone=UTC
+      - "-c"
+      - log_timezone=UTC
+      - "-c"
+      - log_statement=none
+      - "-c"
+      - log_min_error_statement=panic
+      - "-c"
+      - log_parameter_max_length=0
+      - "-c"
+      - log_parameter_max_length_on_error=0
+      - "-c"
+      - logging_collector=off
+    volumes:
+      - type: volume
+        source: postgres_data
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready --host=127.0.0.1 --port=5432 --username="$$POSTGRES_USER" --dbname="$$POSTGRES_DB"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data: {}

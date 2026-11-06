@@ -1,0 +1,11 @@
+# 这是显式测试覆盖文件，只给 postgres 增加仅回环的测试端口发布。
+# 只能与 deploy/compose.yaml 同时使用，并配合独立的 COMPOSE_PROJECT_NAME（如 payment-hub-test-<run_id>）。
+# 不提供测试端口默认值，也不放宽宿主绑定地址；不要用于开发或演示环境。
+# 普通停止或重启保留命名卷；不提供 down -v 作为默认清理步骤。
+services:
+  postgres:
+    ports:
+      - target: 5432
+        protocol: tcp
+        host_ip: 127.0.0.1
+        published: "${PAYMENT_HUB_TEST_PG_PORT:?请明确选择未占用的测试端口，不提供默认值}"

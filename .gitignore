@@ -12,3 +12,17 @@ tmp/
 
 .idea/
 .vscode/
+
+artifacts/
+coverage/
+
+vendor/
+
+*.exe
+*.test
+*.out
+
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
