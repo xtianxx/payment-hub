@@ -4,7 +4,7 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 # Tasks: 模拟商城一次性 Mock 支付闭环
 
-**Status**: Setup batch complete — 2026-11-06 已完成获授权的 T001–T004 工程准备及适用的模块/静态检查；T005–T082 共78项未执行。本文件不授予后续实施、安装、运行、迁移、发布、清理数据、提交或推送权限。
+**Status**: Foundation value/auth/log batch complete — 2026-11-07 已完成获授权的 T001–T011；本批基础包 vet/race 单元检查与既有准备态回归通过。T012–T082 共71项未执行，Phase 2尚未整体完成。本文件不授予后续实施、安装、运行、迁移、发布、清理数据、提交或推送权限；本批功能分支提交推送与 Draft PR 另有用户明确授权。
 
 **Input**: `specs/001-mock-payment/` 中已批准的设计，基线提交 `a999f01`。
 
@@ -45,13 +45,15 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 **Purpose**: 建立共享数据契约、鉴权、持久化基础和可信验证夹具。此阶段未完成，不宣称任何故事可交付。
 
-- [ ] T005 在 `internal/payment/types.go`、`internal/payment/ports.go` 定义平台订单、Mock 答复、固定观测及处理决定的业务类型和小接口，使用 Go `int64` 金额；接口表达登记结果、受限定位及完整结果保存，不泄露 Gin、pgx连接、事务或原始 SQL，也不把付款资格定义成可重置字段。（依赖：T001,T002,T003,T004；验收：HTTP/存储/Mock 可各自实现消费侧契约，支付包不反向导入具体实现；字段约束由 T011、T013–T015逐项兑现。）
-- [ ] T006 [P] 在 `internal/payment/validation_test.go` 编写仅CNY整数分及金额上下限、ASCII标识大小写与长度、UUIDv4、原因长度、UTC和结果/确认时间组合测试，覆盖空值及非法枚举；使用原文约束而不是默认转换。（依赖：T005；验收：断言覆盖合法边界和拒绝分支，先记录未实现行为，执行结果由后续关卡证实。）
-- [ ] T007 [P] 在 `internal/app/config_test.go`、`internal/httpapi/auth_test.go` 编写配置缺失/无效拒绝启动、单一 Bearer 映射、缺失/重复/格式错误/空值/不匹配统一401及挑战头测试，以 spy 证明鉴权失败不读订单、不调用 Mock，换钥匙不改变 client_id。（依赖：T005；验收：不依赖真实密钥，头名/方案名与密钥大小写规则分别验证，不提供免鉴权兜底。）
-- [ ] T008 [P] 在 `internal/app/logging_test.go` 编写 UTC JSON 白名单、未知关联省略、稳定错误分类和敏感内容过滤测试，包含框架错误、SQL错误及测试工具输出；业务 FAILED 不被等同系统故障。（依赖：T005；验收：恶意/带模拟密钥错误不原样输出，禁止全量请求、答复、连接串、SQL和参数打印。）
-- [ ] T009 [P] 实现 `internal/app/config.go`、`internal/httpapi/auth.go` 的配置校验与可信身份注入，仅接受一个 Authorization Bearer API key，不接受 URL/JSON/替代头密钥或调用者覆盖身份；配置无效直接失败，401包含 `WWW-Authenticate: Bearer realm="payment-hub"`。（依赖：T007；验收：T007通过，只有验证后的身份进入支付业务，不改宿主全局配置。）
-- [ ] T010 [P] 实现 `internal/app/logging.go` 的白名单结构化标准输出和受控错误转换，覆盖入口、依赖、退出及追踪故障；不以日志代替结果/依据持久化。（依赖：T008；验收：T008通过，不记录密钥、Authorization、数据库连接串、完整报文、原始 SQL 或未经处理异常。）
-- [ ] T011 [P] 在 `internal/payment/validation.go`、`internal/payment/identity.go` 兑现通用约束原文：“三张表各自的主键和入口请求编号采用应用生成的 UUIDv4，数据库用 `UUID`。”；“`client_id`、`business_order_no` 均为1～64个 ASCII 英文字母、数字、短横线或下划线，按原值区分大小写。拒绝空串、空格和其他字符，不截断、不自动裁剪或转小写；数据库比较规则必须区分大小写。”；“`reason_code` 有值时长度为1～64字符，使用稳定分类；`reason_message` 最长512字符，仅保存脱敏摘要。字符数不是 UTF-8 字节数，校验与数据库长度约束应一致。”；“所有时间列使用 `TIMESTAMPTZ`，应用和数据库会话统一 UTC。”；“结果、来源和处理决定均采用 `TEXT` 加合法取值 `CHECK`，首期不使用数据库自定义枚举。”（依赖：T006；验收：T006通过，碰撞不冒充意图重复，字符数不按UTF-8字节截断，时间输出不靠数据库类型猜时区。）
+**T005–T011 本批证据（2026-11-07）**：见 [开发记录第7节](../../docs/development.md#7-基础实现批t005t011)。三条支线先保存测试快照、再实现并执行焦点测试；父会话审查实际产物后合流执行限定三包的 gofmt、`go vet -mod=readonly -p=1` 与 `go test -mod=readonly -race -count=1 -p=1 -timeout=90s`，均退出0。已有 setup 检查退出0；仅模块与 Compose 静态配置，不是数据库/支付流程验收。`tasks.md` 的82项定义不改，需求清单只读；T012及以后未开始，完整T072/T077仍不勾选。远端本批CI须在提交推送与Draft PR创建后核对实际run，不沿用旧提交结果。
+
+- [X] T005 在 `internal/payment/types.go`、`internal/payment/ports.go` 定义平台订单、Mock 答复、固定观测及处理决定的业务类型和小接口，使用 Go `int64` 金额；接口表达登记结果、受限定位及完整结果保存，不泄露 Gin、pgx连接、事务或原始 SQL，也不把付款资格定义成可重置字段。（依赖：T001,T002,T003,T004；验收：HTTP/存储/Mock 可各自实现消费侧契约，支付包不反向导入具体实现；字段约束由 T011、T013–T015逐项兑现。）
+- [X] T006 [P] 在 `internal/payment/validation_test.go` 编写仅CNY整数分及金额上下限、ASCII标识大小写与长度、UUIDv4、原因长度、UTC和结果/确认时间组合测试，覆盖空值及非法枚举；使用原文约束而不是默认转换。（依赖：T005；验收：断言覆盖合法边界和拒绝分支，先记录未实现行为，执行结果由后续关卡证实。）
+- [X] T007 [P] 在 `internal/app/config_test.go`、`internal/httpapi/auth_test.go` 编写配置缺失/无效拒绝启动、单一 Bearer 映射、缺失/重复/格式错误/空值/不匹配统一401及挑战头测试，以 spy 证明鉴权失败不读订单、不调用 Mock，换钥匙不改变 client_id。（依赖：T005；验收：不依赖真实密钥，头名/方案名与密钥大小写规则分别验证，不提供免鉴权兜底。）
+- [X] T008 [P] 在 `internal/app/logging_test.go` 编写 UTC JSON 白名单、未知关联省略、稳定错误分类和敏感内容过滤测试，包含框架错误、SQL错误及测试工具输出；业务 FAILED 不被等同系统故障。（依赖：T005；验收：恶意/带模拟密钥错误不原样输出，禁止全量请求、答复、连接串、SQL和参数打印。）
+- [X] T009 [P] 实现 `internal/app/config.go`、`internal/httpapi/auth.go` 的配置校验与可信身份注入，仅接受一个 Authorization Bearer API key，不接受 URL/JSON/替代头密钥或调用者覆盖身份；配置无效直接失败，401包含 `WWW-Authenticate: Bearer realm="payment-hub"`。（依赖：T007；验收：T007通过，只有验证后的身份进入支付业务，不改宿主全局配置。）
+- [X] T010 [P] 实现 `internal/app/logging.go` 的白名单结构化标准输出和受控错误转换，覆盖入口、依赖、退出及追踪故障；不以日志代替结果/依据持久化。（依赖：T008；验收：T008通过，不记录密钥、Authorization、数据库连接串、完整报文、原始 SQL 或未经处理异常。）
+- [X] T011 [P] 在 `internal/payment/validation.go`、`internal/payment/identity.go` 兑现通用约束原文：“三张表各自的主键和入口请求编号采用应用生成的 UUIDv4，数据库用 `UUID`。”；“`client_id`、`business_order_no` 均为1～64个 ASCII 英文字母、数字、短横线或下划线，按原值区分大小写。拒绝空串、空格和其他字符，不截断、不自动裁剪或转小写；数据库比较规则必须区分大小写。”；“`reason_code` 有值时长度为1～64字符，使用稳定分类；`reason_message` 最长512字符，仅保存脱敏摘要。字符数不是 UTF-8 字节数，校验与数据库长度约束应一致。”；“所有时间列使用 `TIMESTAMPTZ`，应用和数据库会话统一 UTC。”；“结果、来源和处理决定均采用 `TEXT` 加合法取值 `CHECK`，首期不使用数据库自定义枚举。”（依赖：T006；验收：T006通过，碰撞不冒充意图重复，字符数不按UTF-8字节截断，时间输出不靠数据库类型猜时区。）
 - [ ] T012 在 `internal/postgres/schema_test.go`、`internal/mock/schema_test.go` 编写真实PG约束断言，逐项验证 T013–T015的9/6/11列、空值、唯一键、取值、原因长度、JSON对象、外键 RESTRICT 和索引；测试代码先列出预期拒绝/接受，实际迁移及执行由 T017接线。（依赖：T011；验收：有直接 SQL 的正反例，不以 Go 校验或假仓库代替数据库事实，不虚报测试已经运行。）
 - [ ] T013 [P] 编写 `migrations/00001_create_payment_orders.sql`，逐字段保留原文：`id`：“`UUID`，主键”“应用生成 UUIDv4；登记、查询、重启及重复请求关联同一订单，不为重试另建订单”；`client_id`：“`TEXT`，非空”“已验证的业务身份，不是 API key；不随换钥匙改变，格式见通用约定”；`business_order_no`：“`TEXT`，非空”“与接入方一起定位同一支付意图，格式见通用约定”；`amount`：“`BIGINT`，非空”“整数分，Go 使用 `int64`；范围为 1～1,000,000 分，两端包含，不因类型范围更大而放宽”；`currency`：“`TEXT`，非空”“首期仅 CNY；与原金额一起作为不可被重复请求改写的付款事实”；`result`：“`TEXT`，非空”“取 `UNKNOWN`、`SUCCEEDED`、`FAILED`；登记时显式保存 `UNKNOWN`，不默认成功”；`mock_transaction_id`：“`UUID`，可空”“取得并核对后保存；有值时唯一，暂缺不能证明未付款或取得重付资格”；`registered_at`：“`TIMESTAMPTZ`，非空”“平台建立订单记录的时间，不替代事务已提交的确认”；`confirmed_at`：“`TIMESTAMPTZ`，条件可空”“`UNKNOWN` 时为空；确认成功或失败时必须有值，不冒充渠道实际付款时间”；实现联合唯一非空、T011文本限制和结果/时间 CHECK，不加付款资格开关或重复索引。（依赖：T012；验收：T017执行T012证明上下限、空值、重复及结果/时间组合限制真实生效，反向迁移不作为自动恢复。）
 - [ ] T014 [P] 编写 `migrations/00002_create_mock_transactions.sql`，逐字段保留原文：`id`：“`UUID`，主键”“Mock 自己生成 UUIDv4，不把平台支付订单号当成渠道交易号”；`platform_reference_id`：“`UUID`，非空且唯一”“直接使用对应平台支付订单号，不另造发起编号，用于查询原交易”；`amount`：“`BIGINT`，非空”“保存付款调用中实际处理的整数分金额，不在查询时从平台订单表回填”；`currency`：“`TEXT`，非空”“保存 Mock 实际处理的币种，不由查询请求的期望值替换”；`result`：“`TEXT`，非空”“仅取 `SUCCEEDED`、`FAILED`，不设置默认成功，不以答复是否送达决定结果”；`processed_at`：“`TIMESTAMPTZ`，非空”“Mock 形成该交易结果的时间，不等于中台本地确认时间”；不建跨模块外键，不把平台期望值或平台金额/币种校验偷换为渠道事实。（依赖：T012；验收：T017执行T012证明真实约束、唯一关联和独立记录，不增加UNKNOWN交易状态或后台付款表。）

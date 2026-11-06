@@ -1,10 +1,10 @@
-# 开发准备：T001–T004
+# 开发与验证记录
 
-**范围**：2026-11-06 的首批工程准备，仅内部 Mock、无真实资金。业务规则仍以 [计划](../specs/001-mock-payment/plan.md)、[数据模型](../specs/001-mock-payment/data-model.md)和 [HTTP 合同](../specs/001-mock-payment/contracts/http-api.md)为准。
+**范围**：首批 T001–T004 工程准备，以及后续单独获授权的基础实现与 CI 批次；仅内部 Mock、无真实资金。业务规则仍以 [计划](../specs/001-mock-payment/plan.md)、[数据模型](../specs/001-mock-payment/data-model.md)和 [HTTP 合同](../specs/001-mock-payment/contracts/http-api.md)为准。
 
-**状态**：T001–T004 的工程准备及本批适用的模块/静态检查已完成；其余78项未执行。本批未提交或推送。
+**记录方式**：下文第1～5节保留2026-11-06首批准备的事实与验证边界，第6节记录另行授权的远程接入。后续批次单独列明，不将历史检查结果当作新增代码已验收，任务实际状态以 `tasks.md` 为准。
 
-本文件不是完整启动指南。当前批次不实现应用、SQL 迁移、镜像构建或 CI；完整运行流程仍见[尚不可直接执行的指南](../specs/001-mock-payment/quickstart.md)。准备文件和静态检查不能证明支付功能可用。
+本文件不是完整启动指南。首批不实现应用、SQL 迁移、镜像构建或 CI；后续只按当批授权补充。完整运行流程仍见[尚不可直接执行的指南](../specs/001-mock-payment/quickstart.md)。准备文件和静态检查不能证明支付功能可用。
 
 ## 1. 模块与版本
 
@@ -146,7 +146,7 @@ Compose 检查的 `DOCKER_CONFIG` 指向临时隔离位置，`DOCKER_HOST` 指�
 - 初版忽略规则检查误用 `git check-ignore -v` 的退出码判断负规则，曾错误报告 `.env.example` 被忽略；改用 `-q` 判断后局部47条路径通过，最终父会话37条独立路径也通过。规则本身无需为此改变。
 - 静态复核发现 Docker 根目录模式不足以证明嵌套产物被排除，已改用显式 `**/` 模式，并扩大为根/嵌套 `.env*`；修订依据、差异和最终 hash 见 `ignore/dockerignore-revision.md`。这仍不是实际镜像构建验证。
 
-没有应用源码，因此本批不宣称应用编译、单元/功能/竞态测试通过；镜像构建/拉取、容器启动、真实 PG、迁移、HTTP、重启、CI 和发布均未执行。后续安装、升级、额外下载或启动服务仍须按当次授权处理；缺少权限就停在相关操作，不换用真实服务或其他环境绕过。
+首批执行时没有应用源码，因此首批不宣称应用编译、单元/功能/竞态测试通过；当时未执行镜像构建/拉取、容器启动、真实 PG、迁移、HTTP、重启、CI 或发布。后续安装、升级、额外下载或启动服务仍须按当次授权处理；缺少权限就停在相关操作，不换用真实服务或其他环境绕过。
 
 实施前后均检查 `.specify/extensions.yml`；当前只有可选 Git 提交钩子，按本次“不提交”要求展示后跳过，不修改钩子。完成本批验证、更新任务状态并展示差异后停止，不提交、不推送，也不自动开始 T005。
 
@@ -202,3 +202,65 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-setup.py \
 远程执行发生在提交之后，因此不在被测提交中预填“CI 已通过”；实际 run URL、源码 SHA、结论与日志证据保存在本机记录并在交付时报告。遇到认证、仓库策略、额度或网络阻塞，报告实际状态，不刷新权限、启用付费服务或把未运行算成功。
 
 完成这一小批后停止。T077 仍未完成：真实应用编译、业务测试、PostgreSQL、HTTP、并发与进程重启、配对镜像及产物留存等必须在相应实现和验证关卡补齐；本批不提供 CD、自动部署或镜像发布。
+
+## 7. 基础实现批：T005–T011
+
+本批获准实现共享契约、通用值约束、配置鉴权与安全日志，以及相应单元 CI。开始前已 fetch 最新远端 `main`，将本地 `main` 与 `001-mock-payment` 仅快进同步到 `72e6398978bdc8844b6edfc3b47ce67946562533`；没有改写历史。用户随后追加功能分支备份与 PR 审查许可：本批验证后提交推送 `001-mock-payment`，创建指向 `main` 的 Draft PR；不直接推 `main`、不强推、不自动合并。
+
+### 已实现的边界
+
+- `internal/payment/types.go`、`ports.go` 仅依赖标准库，表达平台订单、独立 Mock 事实、固定观测与处理记录，以及登记、当前接入方单笔定位、完整观测保存、Mock 付款和原交易查询的小接口。登记的 `CREATED` 必须表示本次新建且提交已确认；复用、未知或提交不明不授予付款资格。接口声明不证明事务、防重或业务流程已经实现。
+- `validation.go`、`identity.go` 提供通用值校验和标准库 UUIDv4 生成。金额为含端点的 1～1,000,000 分，币种精确为 CNY；标识不裁剪、不转大小写；原因先验证 UTF-8，再按字符计数；时间按 UTC 零偏移校验。此处不实现依据接受、状态迁移或 SQL 约束，也不把平台金额/币种限制套用为 Mock 独立事实。
+- `internal/app/config.go` 只从注入的 lookup 读取 `PAYMENT_HUB_CLIENT_ID`、`PAYMENT_HUB_API_KEY`，没有默认值、替代来源或自动裁剪。前者遵守 client 标识格式，后者遵守 RFC6750 Bearer 凭据字符语法；不新增最短长度、熵或 JWT 政策。无效配置返回受控错误及空配置。数据库、监听、期限、测试模式及进程启动配置后置，未创建演示密钥。
+- `internal/httpapi/auth.go` 只接受唯一 Authorization Bearer 字段；头名与 scheme 不区分大小写，key 原值区分大小写。拒绝重复/合并字段和 URL、JSON、替代头凭据，不读取业务 body；只有匹配后才注入配置中的可信 client。内部请求编号与身份使用私有 context key，不采用调用者替代字段。失败统一返回 401、固定挑战、JSON/no-store 和脱敏错误，不进入后续 handler。
+- `internal/app/logging.go` 的 `NewLogger(io.Writer)` 显式注入输出目标，`Log(LogRecord)` 只构造固定 JSON 白名单：UTC 时间、级别、事件、阶段、合法且已知的关联、结果与受控原因/错误类别。错误仅按已知类型或身份分类，不转发原文；未知关联省略，业务 FAILED 不自动成为系统错误。Logger 自己串行化 writer，写失败返回受控错误。未来 T022 显式接入标准输出；本批尚无真实进程或默认 Gin 日志接线。
+
+### 测试先行与模块准备
+
+T006–T008 测试文件先写并保存快照，再实现 T009–T011；未定义 API 时仅记录“实现未就绪”，没有把编译失败称为业务 red。鉴权与日志测试的脱敏失败消息、日志并发 writer 和一个 UUID 分隔 fixture 在实现前经审查修正，未通过放宽断言迎合实现。Gin 测试使用 `gin.New`、标准库 `httptest` 内存路由和 spy；日志测试只构造模拟 Gin/pgconn 错误，不连接数据库、执行 SQL 或监听端口。
+
+首次离线准备缺少上游 `testify@v1.3.0` 的模块元数据，退出 1；当时 `go.mod/go.sum` 均未变化。用户随后明确允许最小补充下载。仅使用原项目工具链、隔离缓存、官方 HTTPS 代理和正常 sumdb 校验补齐固定 Gin/pgx 图，未新增直接依赖、升级版本、运行 tidy 或安装工具。实际导入图在线准备与离线只读复核均退出 0；完整缓存准备前两次遇官方端点 TLS 超时，随后同一代理/sumdb 配置下下载成功，未关闭校验或更换来源，未据此断定网络根因。并行焦点测试期间，补充下载使用临时模块输入副本，未改被测工作区；合流后由原生 Go 离线补齐校验记录，未手写 hash。最终直接依赖仍为两项，显式 indirect 20项，选中模块图含主模块共58项；图中上游工具/测试输入不等于应用运行时使用全部包。
+
+### 可重复的本批检查
+
+沿用第2节隔离环境和项目 Go 1.27.3，使用现有 C 编译器。以下子 shell 不修改全局配置，已准备缓存时可离线执行：
+
+```sh
+(
+  export XDG_CONFIG_HOME="$HOME/.cache/payment-hub/config"
+  export GOPATH="$HOME/.cache/payment-hub/gopath"
+  export GOMODCACHE="$HOME/.cache/payment-hub/gomod"
+  export GOCACHE="$HOME/.cache/payment-hub/gobuild"
+  export GOENV=off GOTOOLCHAIN=local GOWORK=off GOFLAGS=
+  export GOPROXY=off GOSUMDB=off GOPRIVATE= GONOPROXY= GONOSUMDB=
+  export TMPDIR=/tmp/opencode CGO_ENABLED=1 GOMAXPROCS=2
+  GO="$HOME/.cache/payment-hub/toolchains/go1.27.3/bin/go"
+  "$HOME/.cache/payment-hub/toolchains/go1.27.3/bin/gofmt" -l \
+    internal/payment internal/app internal/httpapi
+  "$GO" vet -mod=readonly -p=1 \
+    ./internal/payment ./internal/app ./internal/httpapi
+  "$GO" test -mod=readonly -race -count=1 -p=1 -timeout=90s \
+    ./internal/payment ./internal/app ./internal/httpapi
+  python3 -B scripts/check-setup.py \
+    --go "$GO" --cache-dir "$HOME/.cache/payment-hub"
+)
+```
+
+### 本批实际结果（2026-11-07）
+
+| 检查 | 实际结果 | 结论边界 |
+|---|---|---|
+| 各支线焦点测试 | payment、httpapi、app 的配置与日志选择测试均退出 `0` | 模拟值和内存路由，不证明真实进程或支付流程 |
+| 项目工具链与模块 | 指定字段 `go env -json`、原生缓存准备和声明核对均 `0` | Go1.27.3、linux/amd64、cgo=1、遥测off；直接版本不变 |
+| 格式与静态 | 上述 `gofmt -l` 无输出，`go vet` 退出 `0`；工作流 YAML/嵌入 bash 静态检查 `0` | 不替代业务断言或远端运行 |
+| 最终合流 race | 上述三个包的 `go test -mod=readonly -race -count=1 -p=1 -timeout=90s` 退出 `0`，三个包均 `ok`，stderr 为空 | 覆盖现有基础单元测试，不是完整 MVP、SQL 或重启验收 |
+| 既有准备态回归 | 上述 `scripts/check-setup.py` 离线运行退出 `0`，225条准备态断言；58项模块图、4个 Compose 静态模型及10个必填拒绝用例符合预期 | 未连接 daemon/数据库，未创建卷、绑定端口或启动容器 |
+| 差异与冻结 | `git diff --check` 退出 `0`；合流检查前后源/测试与已准备模块 hash 一致，需求清单未修改 | 只勾选有实际证据的 T005–T011，不扩大后续任务授权 |
+
+本批原始测试快照、精确命令、退出码和白名单证据位于本机临时目录 `/tmp/opencode/payment-hub-foundation-6gy5gfbr/`，不包含真实密钥或完整环境。最终入口为该目录的 `verify-foundation.py`（退出 `0`），结果与短日志见 `final-checks/result.json`、`06-race.*.log`、`07-setup.*.log`；它不是 T072 的项目全量检查脚本。日志焦点检查的第一次捕获包装脚本遇到 zsh 只读变量错误，原命令重跑退出 `0`；工具包装错误未算业务失败或通过。早期日志测试曾误用系统 gofmt，之后已用项目1.27.3重新格式化，最终版本与格式检查以项目工具链证据为准。
+
+前后实施钩子已复核：只有可选的 Spec Kit Git 提交钩子。跳过自动钩子，按本批追加授权审查后统一提交；不修改钩子、不使用 `--no-verify` 跳过正常 Git 检查。
+
+工作流仍为 `.github/workflows/setup-check.yml`，保留第6节的只读权限、固定 Action 引用及触发规则，新增上述三个基础包的格式、vet 和 race 单元检查。仅推送功能分支不触发此工作流，创建目标为 `main` 的 Draft PR 后才触发本批检查；必须核对本次源码和 PR 合并快照对应的 run，不沿用旧 `72e6398` 准备态绿灯。提交中不预填尚未发生的远程结果。
+
+T012–T082 不在本批范围。数据库、迁移、跨进程夹具、业务路由、应用生命周期、真实 HTTP/重启、镜像和发布均未执行；完整 T072/T077 仍不勾选。基础单元测试通过也不代表 Phase 2 全部完成或支付 MVP 可用。
