@@ -264,3 +264,81 @@ T006–T008 测试文件先写并保存快照，再实现 T009–T011；未定�
 工作流仍为 `.github/workflows/setup-check.yml`，保留第6节的只读权限、固定 Action 引用及触发规则，新增上述三个基础包的格式、vet 和 race 单元检查。仅推送功能分支不触发此工作流，创建目标为 `main` 的 Draft PR 后才触发本批检查；必须核对本次源码和 PR 合并快照对应的 run，不沿用旧 `72e6398` 准备态绿灯。提交中不预填尚未发生的远程结果。
 
 T012–T082 不在本批范围。数据库、迁移、跨进程夹具、业务路由、应用生命周期、真实 HTTP/重启、镜像和发布均未执行；完整 T072/T077 仍不勾选。基础单元测试通过也不代表 Phase 2 全部完成或支付 MVP 可用。
+
+## 8. 数据库基础批：T012–T017 与持续 CI 维护
+
+用户另行批准合并 PR #1 后推进 **T012–T017**，并允许本批所需固定镜像和 Goose 构建输入下载、迁移镜像构建、本机及 CI 的隔离测试容器，以及仅本次明确创建资源的清理。除下文用户亲自完成的一次代理配置例外，不修改宿主全局配置；不碰既有开发/演示库与卷，不改变仓库可见性、不启用付费服务、镜像发布或部署。
+
+PR #1 已经普通 merge 到远端 `main`：`921863deae6ae76e7ea5f63b025e89d602b22f17`，两个父提交为原 main `72e6398` 与已验收功能提交 `cb35345`，合并树与原被测树一致。旧功能分支保留；新一批使用从该 main 创建的 `001-storage-foundation`，后续验证通过再推送并创建 Draft PR，不自动合并下一批。
+
+合并后 [main CI run 42325596531](https://github.com/xtianxx/payment-hub/actions/runs/42325596531) 已独立核对通过：实际 checkout 为上述 main SHA，准备态检查225条断言及三个基础包的 vet/race 步骤成功。证据包含 run、job/step 元数据和时间窗内白名单日志，不仅是 watch 徽标；这仍只验证已合并的基础内容，不代表本批数据库测试通过。
+
+本批先写真实 PostgreSQL 约束和迁移测试，再实现三份 SQL、独立 Goose 镜像与受限夹具。未定义 API、网络故障、镜像拉取失败或数据库不可达都不是业务 red；未完成真实迁移及 SQL 正反例前，不勾选本批完整验收。T018–T082 继续后置，完整 T072/T077 不因增量 CI 而提前完成。
+
+### 已核实的准备与执行期故障
+
+- 三份 integration 测试先保存 v1/v2 快照，再编写三份迁移；没有把缺实现或编译错误当成 SQL 约束 red。项目工具链离线解析真实导入图与三包 `-run '^$'` 编译门禁均退出 `0`，`go.mod/go.sum` hash 未变；此门禁没有执行数据库断言。
+- Docker 代理最初不可用。用户另行允许一次有限全局例外，并亲自在真实终端修改和重启；agent 未使用管理员口令。读回有效配置后，三个批准的固定镜像 pull/inspect 成功，均为 linux/amd64；项目代码和 CI 不依赖本机代理端口，不继续修改 daemon。
+- 独立 Goose 镜像实际构建成功，CLI 为 `v3.29.0`，打包的三份 SQL hash 与源码一致，非 root 且无烘焙连接信息。工具容器最初因错误的 `max-file=1` 返回 `125`；之后已使用约定的 `local/10m/3` 复验同一实际镜像 ID，旧失败及日志参数偏差证据保留，未用重建掩盖。
+- 启动器源码审查修正了超时、中断、资源归属及空测试结果报绿风险；标准库 mock 回归进入 `scripts/test_check_db_foundation.py` 并由 CI 实际调用。mock 检查只验证工具自身，不代替真实 PostgreSQL。
+- 首轮真实入口 run `5e813ed5cb374139821c0ba671878868` 退出 `1`：镜像检查、五项受限参数拒绝和模拟坏 DSN 的容器内安全日志检查通过；`compose up` 退出 `0`，随后 `compose ps` 因未传同一隔离插值环境退出 `1`。尚未执行迁移或 Go integration，不算 SQL 约束命中。该轮工具容器、PG 项目、网络与本次唯一卷均已清理，前后资源清单一致；保留失败报告并为环境传递补充回归，不换库或删既有数据绕过。
+
+### 已实现的边界
+
+- `migrations/00001`–`00003` 分别建立准确9/6/11列的三张业务表：UUID、BIGINT、TIMESTAMPTZ、TEXT/CHECK、JSONB对象、规定的唯一键、RESTRICT外键与历史索引。平台标识按原值区分大小写；Mock事实不套平台金额/币种限制，也不建跨模块外键。不加触发器、自定义枚举、付款资格字段或默认成功；依据白名单和状态处理语义仍待业务层实现。
+- `deploy/Dockerfile.migrate` 使用固定基础镜像，Goose只在独立镜像构建，不进入应用module。`goose-entrypoint.sh` 仅接受默认 `up`、单个 `up/status/version/validate` 或独立CLI版本标志；拒绝危险命令及额外参数。数据库命令的原始输出在**容器内**丢弃，只保留固定JSON事件；宿主过滤不能替代这一边界。
+- `tests/harness/postgres.go` 只连接启动器本次建立的数据库，公开 `OpenPostgres(t)` 与 `SeedFixtures(t, conn)`；严格校验run_id、回环显式端口、数据库名、PG16.15、UTF8及UTC会话后开启事务。夹具为三类平台订单和独立Mock事实，每个测试用有界cleanup回滚；不启动应用、不授予重付资格。
+- `scripts/check-db-foundation.py` 是T017窄入口，不是T072全量检查平台。标准库mock回归由 `scripts/test_check_db_foundation.py` 保存；Compose环境传递缺陷的回归先失败、修复后21项通过，这不是数据库约束red。
+
+### 可重复的本批入口
+
+从仓库根运行；前提是已有项目Go1.27.3、C编译器、Python3、可用的本地Docker unix daemon及Compose。以下使用已准备模块缓存，不下载应用依赖；`--prepare-images` 显式允许缺失的固定镜像下载和迁移镜像构建，存在时仍核验实际ID、版本与SQL，不无故重建。
+
+```sh
+TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
+  --go "$HOME/.cache/payment-hub/toolchains/go1.27.3/bin/go" \
+  --cache-dir "$HOME/.cache/payment-hub" \
+  --prepare-images --cleanup-owned-resources \
+  --artifact-root "$PWD/artifacts"
+```
+
+工具/缓存缺失直接失败，不自动安装或切换工具链。需要应用依赖下载时另加 `--download-modules`，使用正常HTTPS代理和sumdb；正常vet/test仍离线、`-mod=readonly`。每次使用新的32位run_id、项目 `payment-hub-test-db-<run_id>` 和数据库 `payment_hub_test_<run_id>`，仅回环随机发布端口。依赖健康探针30秒；两次显式 `up` 的容器启动/等待各共享独立60秒期限，超时停止本次容器后失败，不后台继续迁移。
+
+省略 `--cleanup-owned-resources` 时普通停止保留卷；提供该开关时也只删除已登记且重新核对精确名称与标签的本次卷，不执行全局prune或 `down -v`。产物 `artifacts/<run_id>/db-foundation.json` 默认保留、不入Git。脚本输出固定摘要与完整白名单报告，不归档连接值、SQL、业务整行或工具原错误。SIGINT/SIGTERM执行有界收尾；SIGKILL或宿主故障不能保证收尾，不宣称具备这类恢复能力。
+
+入口实际执行的数据库Go命令为：
+
+```sh
+go vet -mod=readonly -tags=integration -p=1 ./internal/postgres ./internal/mock ./tests/harness
+go test -mod=readonly -tags=integration -race -count=1 -p=1 -timeout=120s ./internal/postgres ./internal/mock ./tests/harness
+```
+
+连接配置只由启动器向本次子进程注入；不要把这些命令改成连接开发/演示库的手工操作。完整应用尚不可启动。
+
+### 本批实际结果（2026-11-07）
+
+修复后的真实入口 run 为 `a5daed57a2ce449f81b19443b3d44555`，退出 `0`，安全报告与stdout中的报告一致，源码manifest前后未变。
+
+| 检查 | 实际结果 | 结论边界 |
+|---|---|---|
+| 实际迁移镜像 | Goose v3.29.0、linux/amd64，三SQL清单/hash一致；复用实际镜像ID `sha256:65c3a960a3fb17370d715d52089e3113e51202f3d71592fb4101b70e808e95f1` | 本地image ID，不是已发布的registry digest；无应用镜像 |
+| 安全入口 | 五项拒绝均为 `2`；模拟坏DSN为 `1`，实际容器日志符合固定事件协议 | 仅模拟拒绝回归，不是业务故障注入 |
+| 实际PG迁移 | `up` / 再次 `up` 均 `0`，本机分别2.801/2.500秒；版本表1/2/3断言通过 | 不是反向迁移、恢复或业务事务验收 |
+| 三integration包 | 上述vet/race均 `0`，三个包各有真实 `ok`；9/6/11列、SQLSTATE正反例、唯一/NULL/CHECK/JSON/索引/RESTRICT与夹具断言通过 | 实际会话核对PG16.15、UTC、UTF8；不包含T018+ |
+| 夹具与资源清理 | 测试后直接查三表均0行；本次容器/网络/唯一卷清理成功，前后宿主资源清单一致 | 未使用或删除开发/演示数据，产物保留 |
+| 默认包最终检查 | 16个Go文件gofmt无输出；`go vet -mod=readonly -p=1 ./...` 与 `go test -mod=readonly -race -count=1 -p=1 -timeout=90s ./...` 均 `0`，app/httpapi/payment三个包均 `ok` | 默认包检查不替代显式integration检查 |
+| 工具与CI静态 | 21项标准库mock回归、两Python AST与shell语法均 `0`；workflow174条静态断言、7个嵌入bash语法检查通过 | 远端CI尚须对本次提交独立核实 |
+| 准备态回归 | `check-setup.py` 离线退出 `0`，225条准备态断言、58项模块图；模块文件hash未变 | 不升级应用依赖，不把准备态检查冒充数据库验收 |
+
+本机证据位于 `/tmp/opencode/payment-hub-next-foundation-e_07ygnp/`：`runtime/` 保留首轮失败，`runtime/retry-1/` 为通过轮，`final-checks/result.json` 为父会话独立证据核对与默认包最终检查；Goose构建和修订前后回归证据分开保留。真实数据库白名单报告位于上述 `artifacts/<run_id>/`。测试快照先于实现保存，没有伪造三表业务red，也未仅凭子agent声明勾选任务。
+
+本批仅完成T012–T017，Phase 2仍未整体完成。T018–T082、完整支付/HTTP/进程重启、应用镜像、完整T072/T077和发布/CD均未实施。新分支仍需经审查提交、推送与Draft PR触发本次远端CI；本提交不预填尚未发生的远端结果，不自动合并。
+
+### 每批必须同步审视 CI
+
+- 保留仍适用的格式、静态和基础单元检查；新增验证层必须接入对应 PR 与 main 检查，不以旧提交、少量冒烟或无包可测代替新增代码验收。
+- 本批增加独立真实 PG 迁移/约束检查；`scripts/check-setup.py` 保持准备态静态职责，不把它改称数据库验收。带 integration tag 的必测包必须被明确选中；缺工具、配置、镜像或数据库时非零退出，不静默跳过后报绿。
+- 在隔离的模拟环境执行，不继承开发/演示连接；固定工具、镜像平台与构建输入，正常 HTTPS/校验，不因网络失败换版本、换真实环境或关闭验证。
+- 推送功能分支用于备份，Draft PR 才触发现有 PR 门禁。复核本次 head、实际合并 checkout、job/step 与安全日志；经明确授权合并后继续核对 main 的新 run。无硬分支保护时，人工核对不能省略，也不宣称已存在服务端强制门禁。
+- 扩展检查时同时检查运行预算与证据留存，遵守现有额度；额度或权限不足就停报，不自动付费、公开资源或放宽权限。输出与产物必须先脱敏，不导出连接串、原 SQL、完整环境或数据库原始错误。
+- CI 与 CD 分权：普通检查保持 `contents: read`，不启用 `pull_request_target` 执行不可信代码，不上传镜像、不自动发布或部署。未来发布仍需对应任务、人工授权和已验收产物，不能因为代码增多就自动开启 CD。
