@@ -91,18 +91,150 @@ jobs:
           GOSUMDB: "off"
         run: |
           set -euo pipefail
-          packages=(./internal/payment ./internal/app ./internal/httpapi)
-          unformatted="$(gofmt -l internal/payment internal/app internal/httpapi)"
+          mapfile -d '' -t go_files < <(git ls-files -z -- '*.go')
+          if [[ "${#go_files[@]}" -eq 0 ]]; then
+            echo "::error::no tracked Go files found; refusing to report success"
+            exit 1
+          fi
+          unformatted="$(gofmt -l -- "${go_files[@]}")"
           if [[ -n "$unformatted" ]]; then
-            echo "::error::foundation Go files need gofmt"
+            echo "::error::tracked Go files need gofmt"
             printf '%s\n' "$unformatted"
             exit 1
           fi
-          go vet -mod=readonly -p=1 "${packages[@]}"
-          go test -mod=readonly -race -count=1 -p=1 -timeout=90s "${packages[@]}"
+          go vet -mod=readonly -p=1 ./...
+          go test -mod=readonly -race -count=1 -p=1 -timeout=90s ./...
           {
             echo "## Foundation unit checks / 基础包单元检查"
             echo ""
-            echo "上述三个包的格式、go vet 与带 race 的单元测试已通过；Gin 使用内存路由，不启动监听服务。"
-            echo "不代表 SQL 约束、真实数据库、迁移、完整支付流程、应用进程重启或镜像已验收；完整 T072/T077 仍待后续实现。"
+            echo "所有已跟踪 Go 文件已通过 gofmt；默认非 integration 包（./...）已通过 go vet 与带 race 的单元测试；Gin 使用内存路由，不启动监听服务。"
+            echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture 与迁移工具镜像由 database-foundation job 验收；完整支付/HTTP、应用进程重启或应用镜像不在本步骤，也不由该 job 验收，仍待后续 T072/T077。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check launcher syntax and safety regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          if [[ ! -f deploy/goose-entrypoint.sh ]]; then
+            echo "::error::deploy/goose-entrypoint.sh is missing; static shell check cannot run"
+            missing=1
+          fi
+          if [[ ! -f scripts/check-db-foundation.py ]]; then
+            echo "::error::scripts/check-db-foundation.py is missing; AST syntax check cannot run"
+            missing=1
+          fi
+          if [[ ! -f scripts/test_check_db_foundation.py ]]; then
+            echo "::error::scripts/test_check_db_foundation.py is missing; launcher safety regressions cannot run"
+            missing=1
+          fi
+          if [[ "$missing" -ne 0 ]]; then
+            exit 1
+          fi
+          sh -n deploy/goose-entrypoint.sh
+          echo "deploy/goose-entrypoint.sh: sh -n passed"
+          python3 -B -c 'import ast, pathlib; path = pathlib.Path("scripts/check-db-foundation.py"); ast.parse(path.read_text(encoding="utf-8"), filename=str(path))'
+          echo "scripts/check-db-foundation.py: AST parse passed"
+          python3 -B -c 'import ast, pathlib; path = pathlib.Path("scripts/test_check_db_foundation.py"); ast.parse(path.read_text(encoding="utf-8"), filename=str(path))'
+          echo "scripts/test_check_db_foundation.py: AST parse passed"
+          echo "launcher safety regressions: stdlib unittest/mock only; no real PostgreSQL, Docker, or network."
+          python3 -B scripts/test_check_db_foundation.py
+
+  database-foundation:
+    name: PostgreSQL migration and constraints (linux/amd64)
+    needs: setup-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: "1"
+      GOMAXPROCS: "2"
+
+    steps:
+      - name: Isolate database foundation Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-db"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; database foundation checks cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.3
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          check-latest: false
+          cache: false
+
+      - name: Run database foundation checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/payment-hub-db/check-db-foundation.log"
+          status_file="$RUNNER_TEMP/payment-hub-db/check-db-foundation.exit-code"
+          status=0
+          python3 -B scripts/check-db-foundation.py \
+            --go "$(command -v go)" \
+            --cache-dir "$RUNNER_TEMP/payment-hub-db" \
+            --download-modules \
+            --prepare-images \
+            --cleanup-owned-resources \
+            --artifact-root "$RUNNER_TEMP/payment-hub-db/artifacts" \
+            | tee "$log" || status=$?
+          printf '%s\n' "$status" > "$status_file"
+          exit "$status"
+
+      - name: Summarize database foundation results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/payment-hub-db/check-db-foundation.log"
+          status_file="$RUNNER_TEMP/payment-hub-db/check-db-foundation.exit-code"
+          {
+            echo "## Database foundation checks / 数据库基础检查"
+            echo ""
+            echo "本摘要来自安全启动器的固定前缀输出；launcher-exit-code 为 0 才表示启动器自身成功，非零失败不会被摘要掩盖。"
+            echo "本 job 仅覆盖 T012–T017 的真实 PostgreSQL 迁移与约束范围，不代表完整 MVP、T072、T077、发布或部署已完成。"
+            echo ""
+            echo '```text'
+            if [[ -f "$status_file" ]]; then
+              echo "launcher-exit-code: $(<"$status_file")"
+            else
+              echo "launcher-exit-code: missing (launcher step did not complete)"
+            fi
+            if [[ -f "$log" ]]; then
+              grep -E '^(scope|run-id|result|go-version|postgres-version|goose-version|package-result|cleanup-result|artifact-report):' "$log" || true
+            else
+              echo "launcher-log: missing (launcher did not produce a tee log)"
+            fi
+            echo '```'
+            echo ""
+            echo "完整白名单报告以 db-foundation-report 前缀保留在本次 run 日志中，供后续提取；本 job 不上传 artifact，也不声称 runner 临时文件或 30 天保留策略已完成。"
           } >> "$GITHUB_STEP_SUMMARY"

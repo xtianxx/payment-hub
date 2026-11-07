@@ -1,0 +1,43 @@
+# Fixed-input migration tool image for the storage foundation batch (T016).
+# Build from the repository root with an explicit amd64 platform:
+#   docker build --platform linux/amd64 -f deploy/Dockerfile.migrate .
+# The application module, credentials, and .env files are never copied here.
+
+FROM docker.io/library/golang:1.27.3-bookworm@sha256:025eefc1e8dbe63201734a72aaa0a55d7a077f2d8410432f8ae2f3e939f32871 AS build
+
+ENV CGO_ENABLED=0 \
+    GOTOOLCHAIN=local \
+    GOENV=off \
+    GOWORK=off \
+    GOFLAGS= \
+    GOBIN=/out \
+    GOPROXY=https://proxy.golang.org \
+    GOSUMDB=sum.golang.org
+
+RUN go telemetry off
+
+RUN go install -trimpath \
+        -tags='no_azuresql,no_clickhouse,no_libsql,no_mssql,no_mysql,no_sqlite3,no_vertica,no_ydb' \
+        -ldflags='-s -w -X main.version=v3.29.0' \
+        github.com/pressly/goose/v3/cmd/goose@v3.29.0
+
+FROM docker.io/library/debian:bookworm-slim@sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018
+
+ENV TZ=UTC \
+    HOME=/tmp \
+    GOOSE_DRIVER=postgres \
+    GOOSE_MIGRATION_DIR=/migrations
+
+COPY --from=build /out/goose /usr/local/bin/goose
+COPY migrations/00001_create_payment_orders.sql \
+     migrations/00002_create_mock_transactions.sql \
+     migrations/00003_create_result_handling_records.sql \
+     /migrations/
+COPY deploy/goose-entrypoint.sh /usr/local/bin/goose-entrypoint
+
+RUN chmod 0755 /usr/local/bin/goose /usr/local/bin/goose-entrypoint && \
+    chmod 0644 /migrations/*.sql
+
+USER 65534:65534
+
+ENTRYPOINT ["/usr/local/bin/goose-entrypoint"]
