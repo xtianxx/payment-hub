@@ -85,6 +85,10 @@ IMAGE_KEY_FILES = (
     "migrations/00003_create_result_handling_records.sql",
 )
 PACKAGES = ("internal/postgres", "internal/mock", "tests/harness")
+REQUIRED_INTEGRATION_TESTS = (
+    "TestCommitHookIntegrationHidesReplyAfterRealCommit",
+    "TestHarnessProcessPreservesParentStateIntegration",
+)
 
 MOCK_DB_USER = "payment_hub_test_user"
 MOCK_DB_PASSWORD = "payment-hub-test-db-mock-password-not-real"
@@ -123,6 +127,7 @@ SOURCE_MANIFEST_EXPLICIT = (
 SOURCE_MANIFEST_GLOBS = (
     "internal/**/*.go",
     "tests/harness/*.go",
+    "cmd/**/*.go",
     ".github/workflows/*.yml",
     ".github/workflows/*.yaml",
 )
@@ -248,9 +253,12 @@ class Launcher:
         self.database = f"payment_hub_test_{self.run_id}"
         self.repo = REPO_ROOT
         self.scope = (
-            "T017 db-foundation launcher; migration image, real PostgreSQL, "
-            "Goose up/up-again, integration vet/test, owned cleanup only; "
-            "no T018+ observer/application/HTTP/restart"
+            "database foundation plus wired runtime harness: migration image, real "
+            "PostgreSQL, Goose up/up-again, integration vet/test with required "
+            "commit-hook experiment and tool-helper two-generation parent "
+            "Observer/real PostgreSQL retention root result checks, default packages "
+            "covering private UDS and helper self-tests, owned cleanup only; not real "
+            "application restart, payment HTTP, full MVP, T072, T077, or CD"
         )
         self.started_at = utc_now()
 
@@ -293,7 +301,11 @@ class Launcher:
         self.negative: dict[str, Any] = {}
         self.safety_entry: dict[str, Any] = {}
         self.fixtures: dict[str, Any] = {}
-        self.tests: dict[str, Any] = {}
+        self.tests: dict[str, Any] = {
+            "required_test_results": {
+                name: "missing" for name in REQUIRED_INTEGRATION_TESTS
+            },
+        }
         self.cleanup: dict[str, Any] = {}
 
         self.container_id: str | None = None
@@ -2311,6 +2323,40 @@ class Launcher:
             )
         return diagnostics
 
+    def _parse_required_test_results(
+        self, stdout: str
+    ) -> tuple[dict[str, str], list[str]]:
+        results: dict[str, str] = {
+            name: "missing" for name in REQUIRED_INTEGRATION_TESTS
+        }
+        problems: list[str] = []
+        seen: set[str] = set()
+        for line in stdout.splitlines():
+            match = re.match(
+                r"^---\s+(PASS|FAIL|SKIP):\s+(\S+)\s+\(\d+(?:\.\d+)?s\)$",
+                line,
+            )
+            if not match:
+                continue
+            status, name = match.group(1), match.group(2)
+            if name not in results:
+                continue
+            if name in seen:
+                results[name] = "duplicate"
+                problems.append("required-test-duplicate")
+                continue
+            seen.add(name)
+            results[name] = {"PASS": "pass", "FAIL": "fail", "SKIP": "skip"}[status]
+        for name in REQUIRED_INTEGRATION_TESTS:
+            status = results[name]
+            if status == "missing":
+                problems.append("required-test-missing")
+            elif status == "skip":
+                problems.append("required-test-skip")
+            elif status == "fail":
+                problems.append("required-test-fail")
+        return results, problems
+
     def _parse_test_output(
         self, stdout: str, stderr: str, exit_code: int
     ) -> tuple[dict[str, dict[str, str]], list[str]]:
@@ -2353,6 +2399,8 @@ class Launcher:
         for name in PACKAGES:
             if results[name]["status"] != "pass":
                 problems.append("package-not-pass")
+        _, required_problems = self._parse_required_test_results(stdout)
+        problems.extend(required_problems)
         if exit_code != 0:
             problems.append("test-exit")
         return results, sorted(set(problems))
@@ -2410,6 +2458,7 @@ class Launcher:
                 "-count=1",
                 "-p=1",
                 "-timeout=120s",
+                "-v",
                 *package_args,
             ],
             test_env,
@@ -2421,6 +2470,8 @@ class Launcher:
             test.stdout or "", test.stderr or "", test.returncode
         )
         self.tests["package_results"] = results
+        required_results, _ = self._parse_required_test_results(test.stdout or "")
+        self.tests["required_test_results"] = required_results
         if test.returncode != 0 or problems:
             self.tests["failure_diagnostics"] = self._extract_diagnostics(
                 (test.stdout or "") + "\n" + (test.stderr or "")
@@ -2860,6 +2911,11 @@ class Launcher:
                     print(f"package-result: {name}={status}{suffix}")
                 else:
                     print(f"package-result: {name}={result}")
+        required_results = self.tests.get("required_test_results")
+        if isinstance(required_results, dict):
+            for name in REQUIRED_INTEGRATION_TESTS:
+                if name in required_results:
+                    print(f"required-test-result: {name}={required_results[name]}")
         print(f"cleanup-result: {self.cleanup.get('result', 'unknown')}")
         if self.artifact_written:
             print(f"artifact-report: {self.report_path}")
@@ -2915,9 +2971,13 @@ class Launcher:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "T017 one-shot database foundation launcher: fixed-input migration "
-            "image, isolated PostgreSQL Compose project, real Goose up/up-again, "
-            "integration vet/test, and owned cleanup only. Not the T072 full check."
+            "One-shot database foundation and wired runtime harness launcher: "
+            "fixed-input migration image, isolated PostgreSQL Compose project, real "
+            "Goose up/up-again, integration vet/test with required commit-hook "
+            "experiment and tool-helper two-generation parent Observer/real "
+            "PostgreSQL retention root result checks, and owned cleanup only. "
+            "Default packages cover private UDS and helper self-tests. Not real "
+            "application restart, payment HTTP, the T072 full check, T077, or CD."
         )
     )
     parser.add_argument(

@@ -342,3 +342,78 @@ go test -mod=readonly -tags=integration -race -count=1 -p=1 -timeout=120s ./inte
 - 推送功能分支用于备份，Draft PR 才触发现有 PR 门禁。复核本次 head、实际合并 checkout、job/step 与安全日志；经明确授权合并后继续核对 main 的新 run。无硬分支保护时，人工核对不能省略，也不宣称已存在服务端强制门禁。
 - 扩展检查时同时检查运行预算与证据留存，遵守现有额度；额度或权限不足就停报，不自动付费、公开资源或放宽权限。输出与产物必须先脱敏，不导出连接串、原 SQL、完整环境或数据库原始错误。
 - CI 与 CD 分权：普通检查保持 `contents: read`，不启用 `pull_request_target` 执行不可信代码，不上传镜像、不自动发布或部署。未来发布仍需对应任务、人工授权和已验收产物，不能因为代码增多就自动开启 CD。
+
+## 9. 运行基础批：T018–T022（实施中）
+
+本批已另获实施、隔离验证及新分支 Draft PR 授权；仍不合并、发布或部署。Pass A 的 T018–T020 已完成本机合流验收，T021–T022和本批远端 CI 尚未完成，不能沿用上一批 main 绿灯。
+
+### 观察器的可信计数合同
+
+- `internal/testcontrol/protocol.go` 只依赖标准库，共享严格有界协议；`tests/harness/observer.go` 是父进程工具，不进入业务依赖。每条私有 Unix socket 连接只交换一帧请求和一帧响应，必须验证完整 EOF；帧含唯一结尾 LF，总长最多4096字节。未知/重复/越型字段、非法身份或额外帧均拒绝，错误不回显原文。
+- 父先 `Expect` 进程代次，producer 以独立 Begin nonce 开启窗口。每次独立 Call/Reach 分配新的本地序号，即使订单相同也不能合并；只有同一事件完整同义的传输重试可去重。PAYMENT/QUERY 分计，Reach不算渠道调用。每个 run 最多64个代次、4096条唯一 Call/Reach。
+- 并发事件可以乱序抵达。停止输入并排空调用/交付后，producer 以**本地分配总数 N**闭合窗口；`Seal` 核对完整 `1..N`，不能从服务器最大序号、ACK数或某次屏障回执猜N。父工具的直接 `Seal` 也必须遵守这一可信静止边界。
+- 空代次集合、未 Begin、未 Seal 或存在缺口时，`Snapshot` 返回零值计数及明确不确定错误；零值不等于“精确零调用”。同号异义、第二客户端复用代次、身份/协议/交付故障以及失败的完整性断言都会锁存不确定，不能通过更换N恢复通过。最终实验结论还须在父完成子进程 Wait 后形成。
+- 屏障按代次、固定控制点和确切订单匹配，一次性消费，等待不持全局锁。默认上限10秒，并受调用方更短期限约束；取消或超时使实验不确定。合法 postcommit `reply_hidden` 不是工具故障，SavingResult前置点不得冒充已提交；非法本地Release返回协议错误，不返回“已隐藏答复”。实际SQL先提交后隐藏的事实仍由T019另验。
+- `StartObserver` 的ctx只约束启动；成功后由显式 `Close` 管理生命周期。只使用调用方创建的当前uid所有、0700、非symlink私有目录及0600 socket，不覆盖目标或修改全局umask。关闭只删除重验身份后的自身socket；目标被替换或清理无法确认时明确失败。中断未完成交换不能保留可信零，完全静止且已闭合的计数可以保留。
+
+### T018 局部证据（2026-11-07）
+
+测试快照先于实现；初始缺符号没有冒充行为red。首次运行发现socket权限/清理实现问题，保留失败后修复。源码审查补充六项生命周期回归，修复前实测5项失败、1项正例通过；随后修复屏障自身期限、已取消输入、关闭中断、清理失败及异常Accept处理。
+
+固定项目Go1.27.3和离线缓存环境下，以下焦点命令均退出0：
+
+```sh
+go vet -mod=readonly -p=1 ./internal/testcontrol ./tests/harness
+go test -mod=readonly -race -count=1 -p=1 -timeout=90s -json ./internal/testcontrol ./tests/harness
+```
+
+该源码快照包含44个根测试、288个含子测试通过，fail/skip均0；父会话核对了实际源码hash、冻结测试和执行清单。证据为本机 `/tmp/opencode/payment-hub-runtime-foundation-tnh8olst/t018-acceptance.json` 及 `t018-implementation/revision-1/` 的结构化红/绿摘要；不归档原始协议或未经处理的工具输出。
+
+这些结果证明codec、真实私有UDS和受控生命周期机制，不证明真实SQL提交、应用重启、支付流程或CI。250/500ms的短预算测试不冒充默认10秒到期实测；观察器也不提供任意崩溃或断电下无缺口审计。T019之后的在途测试可能暂时缺少实现，以上记录不是当前工作树全量通过声明。
+
+### T019 默认关闭接缝与真实提交证据（2026-11-07）
+
+`Client`、app测试模式和两个消费侧Hooks沿用同一协议，不引入业务仓库占位。`LoadConfig`原身份两变量合同不变；测试模式另行解析，默认关闭且不连接观察器。启用时只接受可信私有UDS配置；消费包不导入harness或协议，nil/零值Hooks为即时no-op。
+
+每个Client生成独立Begin nonce，按本地调用分配序号；传输最多两次同帧重试并共享操作期限，已知坏ACK/协议故障不可通过重试覆盖。`Seal`停止接入并排空在途交付；开始后新调用违反静止边界，吞错也不能让在途或缓存回执恢复成功。取消回调结束后才完成连接收尾，`Close`不隐式Seal。
+
+隐藏答复仅允许已提交控制点：`mock.Committed`、`postgres.Registered`、`postgres.ResultCommitted`。付款/查询入口与`SavingResult`前置点不允许；工具故障不会变成渠道`FAILED`，开关不改写已有交易事实。
+
+五份测试经过v1/v2审查并在实现前冻结，共34个根测试，其中33个默认根和1个真实PG根。父读回四份生产实现、补强取消回调join后执行四包vet/race，52个根测试全部通过（包含全部33个新默认根），fail/skip均0。另一次integration `-run '^$'`仅编译、执行0个测试，未当作SQL验收。
+
+随后独立安全入口实际执行run `1a6b6fe2c55c4fe9b3c7aca887191a67`，退出0、耗时71秒：
+
+- `TestCommitHookIntegrationHidesReplyAfterRealCommit`实际顶层PASS，三包integration vet/race均0；PG16.15、UTC及Goose迁移1/2/3断言通过。
+- 两条独立连接不自动BEGIN；唯一UNKNOWN行真实提交后，app→postgres.Registered→UDS屏障隐藏成功答复，reader在释放前后读回事实不变，按预登记唯一ID精确清理。
+- 最终三表行数为`[0,0,0]`；本次容器、network、唯一volume清理成功，父独立Docker只读查询确认无本轮资源残留。
+- 报告为`artifacts/1a6b6fe2c55c4fe9b3c7aca887191a67/db-foundation.json`，SHA-256为`89913afe1ab521fc2b39c18cc90c3c703a34a8511462799c21513f94dd955d3f`。当轮43项实际源码清单由父逐项重算，运行前后一致；后续新增T020源码必须重新取证，不能沿用此清单当新树绿灯。
+
+接受记录见本机证据根的`t019-tests/acceptance.json`、`t019-parent-validation/acceptance.json`和`t019-acceptance.json`。这些结果只证明受控提交接缝，不代表业务仓库、真实断网、支付HTTP或应用重启已实现。
+
+### T020 真实进程与安全产物
+
+`tests/harness/process.go`只启动显式绝对路径、显式环境的本次进程组，不经shell或继承完整环境。一个协调者管理停止原因、SIGTERM→有界Grace→SIGKILL、leader回收、输出结束和组缺席观察；强制回收及退出后的采集共用一个最多3秒截止。已观察leader退出后不再向历史group发信号；未知资源状态明确失败，不能靠Wait成功全填“已清理”。生命周期ctx、Wait/Stop取消和期限均参与收尾，默认lifetime30秒、Grace2秒；不自动延长实验期限。
+
+`artifacts.go`在实验前写入pending报告，默认保留独立0700目录/0600文件。源码清单包含实际dirty和未跟踪输入；Finish重新核对内容，不用HEAD代替实际源码。启动预登记、记录接入、观察器绑定及封口失败均可见，`collection_complete`只表示采集完整，不自证业务成功。
+
+stdout/stderr只做有界内存解析和白名单重编码：每行最多4096字节含LF，两stream合计65536字节。日志只接受现有12字段合同；自由`client_id/business_order_no`校验后省略。未知字段、重复键、截断、读错误或超限使采集失败；不把原始输出、环境、报文或错误落盘。测试helper显式设置`GORACE=atexit_sleep_ms=0`仅去除race运行时退出休眠，不关闭race检测；生产工具不偷偷修改调用方环境。
+
+测试快照先于实现。源码审查补充了生命周期/封口回归，分别保留旧实现真实行为red及修后绿灯；没有把编译、夹具错误当业务red。最终风险审查还确定性复现了“先复制日志、再确认Wait”造成漏日志却报完整的窗口：两个真实helper受控交错，旧实现失败；仅后移两行快照后同一测试通过，受影响harness包75个根测试、193个含子测试完成项全部通过。失败Finish仍允许已有collector有界排空，不靠静默丢日志绕过测试。
+
+限制：默认30秒/2秒未逐一等满；不承诺同UID恶意rename、任意setsid逃逸或崩溃下无缺口审计。静态祖先和写前后身份检查不等于通用安全文件系统。工具自身两代helper不冒充真实应用重启。
+
+### Pass A 最终合流结果（2026-11-07）
+
+- 默认7包`go vet -mod=readonly -p=1 ./...`及带race的`go test ... ./...`退出0；37项工具回归、225项既有setup断言、58模块离线核对、格式与工作流静态检查通过。
+- 默认结果汇总器最初只按测试名索引，跨mock/postgres的四个同名根发生覆盖；原144个不同名条目保留，不能冒称完整148根原始元数据。修正为包＋测试名后，仅补测8个受影响根并记录来源。最终两行修复只重验发生变化的harness包；当前149个包限定根由66个仍有效原full-run、8个focused补测及75个修后harness结果组成，不宣称完整`./...`又重新跑过。
+- fresh PG最终run为`a8bc2166a0b844b592a9ac4ed95f948c`，原安全入口退出0、80秒。两个必需根`TestCommitHookIntegrationHidesReplyAfterRealCommit`、`TestHarnessProcessPreservesParentStateIntegration`实际PASS，三包integration vet/race均0。后者在同一父Observer/数据库下运行两代真实helper，逐次Wait后独立读回已提交UNKNOWN行，计数1/1→2/2、两代回执及产物断言通过。
+- 最终三表`[0,0,0]`；报告确认本次资源清理，父另行只读Docker查询确认无本轮残留。PG16.15、UTC、迁移1/2/3及再次迁移通过；没有清空既有库或降级迁移。
+- 最终报告`artifacts/a8bc2166a0b844b592a9ac4ed95f948c/db-foundation.json`的SHA-256为`7ff5bd403d9e0dc8df92f6d0381dce26ec8b753ab570741e7d270ceb0503b4a6`；48项输入摘要为`084ba6347c784eb28b3dbe963e75d34b5b335aca49c643fb18b7ef6d6b0ad9b3`，父逐项重算与当前源码一致，运行前后一致，module未变。
+
+总接受记录为本机证据根的`pass-a-acceptance.json`；统计校正和两轮风险gate见`pass-a-validation/`，修复回归见`t020-implementation/gate-fix-1/`。T020内部JSON在明确的测试临时目录中由`Cleanup`删除，未宣称长期保留；外层安全PG报告保留。仅完成T018–T020，不代表T021–T022、支付HTTP、镜像、完整MVP/T072/T077或远端CI已验收。
+
+### 本批 CI 接线与证据边界
+
+现有两个job和只读权限保持不变。默认`./...`纳入UDS及真实helper自测；数据库启动器增加`cmd/**/*.go`实际输入清单，integration使用`-v`核对上述两个必需根。缺失、跳过、失败或重复结果均不能只靠包级`ok`报绿；白名单报告和摘要保存固定测试名/状态，不归档原始输出。本机工具回归37项通过，后续第二根接线有原始测试快照及6项真实行为red→绿证据；这不消除首轮下述历史缺口，也不等于GitHub Actions已执行成功。
+
+CI工具增量存在一项**流程证据缺口**：没有保存最初实现前的测试hash快照，首次red也未留原始输出，不能据文件mtime声称完整测试先行留证。之后对旧HEAD启动器与最终测试建立了明确标注的事后复现快照，实测7项行为失败、1项正例通过，再对照最终29项绿灯；这能核对回归行为，不能补造原始历史。详细记录在本机证据根的`ci-pass-a/SUPPLEMENT-process-evidence.md`，不将此缺口隐去，也不把事后复现改称原始red。

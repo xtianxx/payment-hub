@@ -4,7 +4,7 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 # Tasks: 模拟商城一次性 Mock 支付闭环
 
-**Status**: Database foundation batch complete locally — 2026-11-07 已完成获授权的 T001–T017；本批真实PG迁移/约束/夹具、显式integration与默认包vet/race、工具回归及既有准备态检查通过。T018–T082 共65项未执行，Phase 2尚未整体完成；本次远端CI待提交推送及Draft PR后独立核对。本文件不授予后续实施、安装、运行、迁移、发布、清理数据、提交或推送权限；本批功能分支提交推送与Draft PR另有用户明确授权。
+**Status**: Runtime harness Pass A complete locally — 2026-11-07 已完成获授权的 T001–T020；本批真实UDS、默认关闭接缝、真实helper/安全产物、隔离PG提交及父状态保留实验验收通过。T021–T082 共62项未完成，Phase 2尚未整体完成；本批远端CI仍待新分支推送及Draft PR后独立核对。本文件不授予后续实施、安装、运行、迁移、发布、清理数据、提交或推送权限；当前T018–T022及功能分支提交推送/Draft PR另有用户明确授权，不进入T023+。
 
 **Input**: `specs/001-mock-payment/` 中已批准的设计，基线提交 `a999f01`。
 
@@ -49,6 +49,8 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 **T005–T011 本批证据（2026-11-07）**：见 [开发记录第7节](../../docs/development.md#7-基础实现批t005t011)。三条支线先保存测试快照、再实现并执行焦点测试；父会话审查实际产物后合流执行限定三包的 gofmt、`go vet -mod=readonly -p=1` 与 `go test -mod=readonly -race -count=1 -p=1 -timeout=90s`，均退出0。已有 setup 检查退出0；仅模块与 Compose 静态配置，不是数据库/支付流程验收。`tasks.md` 的82项定义不改，需求清单只读；T012及以后未开始，完整T072/T077仍不勾选。远端本批CI须在提交推送与Draft PR创建后核对实际run，不沿用旧提交结果。
 
+**T018–T020 Pass A证据（2026-11-07）**：见 [开发记录第9节](../../docs/development.md#9-运行基础批t018t022实施中)。测试先写/快照，生命周期及日志封口缺口有真实red→green回归；默认7包广检查和受影响harness75根race、37项工具回归及旧setup通过。最终fresh PG run `a8bc2166a0b844b592a9ac4ed95f948c` 两个必需根实际PASS，48项当前源码清单由父重算，三表`[0,0,0]`及本次资源清理通过；风险gate第二次接受。统计碰撞及首轮CI原始快照缺口诚实记录，不补造历史。仅勾本批三项；T021–T022未实施，真实应用/支付重启、远端CI及完整T072/T077未验。
+
 - [X] T005 在 `internal/payment/types.go`、`internal/payment/ports.go` 定义平台订单、Mock 答复、固定观测及处理决定的业务类型和小接口，使用 Go `int64` 金额；接口表达登记结果、受限定位及完整结果保存，不泄露 Gin、pgx连接、事务或原始 SQL，也不把付款资格定义成可重置字段。（依赖：T001,T002,T003,T004；验收：HTTP/存储/Mock 可各自实现消费侧契约，支付包不反向导入具体实现；字段约束由 T011、T013–T015逐项兑现。）
 - [X] T006 [P] 在 `internal/payment/validation_test.go` 编写仅CNY整数分及金额上下限、ASCII标识大小写与长度、UUIDv4、原因长度、UTC和结果/确认时间组合测试，覆盖空值及非法枚举；使用原文约束而不是默认转换。（依赖：T005；验收：断言覆盖合法边界和拒绝分支，先记录未实现行为，执行结果由后续关卡证实。）
 - [X] T007 [P] 在 `internal/app/config_test.go`、`internal/httpapi/auth_test.go` 编写配置缺失/无效拒绝启动、单一 Bearer 映射、缺失/重复/格式错误/空值/不匹配统一401及挑战头测试，以 spy 证明鉴权失败不读订单、不调用 Mock，换钥匙不改变 client_id。（依赖：T005；验收：不依赖真实密钥，头名/方案名与密钥大小写规则分别验证，不提供免鉴权兜底。）
@@ -62,9 +64,9 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 - [X] T015 编写 `migrations/00003_create_result_handling_records.sql`，逐字段保留原文：`id`：“`UUID`，主键”“应用生成 UUIDv4；同次观测的保存重试复用编号，不重新付款”；`payment_order_id`：“`UUID`，非空”“引用已有平台订单，不为追踪创建支付或空订单”；`request_id`：“`UUID`，非空”“由入口为本次请求生成 UUIDv4，不承担支付意图识别或付款资格判断”；`source`：“`TEXT`，非空”“`PAYMENT` 表示首次付款调用的答复或故障，`QUERY` 表示后续核实”；`observed_at`：“`TIMESTAMPTZ`，非空”“本地取得答复或发现故障的时间，不冒充渠道实际处理时间”；`evidence`：“`JSONB`，非空且为对象”“仅保存下文允许字段；无答复时可显式记录空对象并说明原因，不补造渠道结果”；`result_before`、`result_after`、`decision`：“三列均为非空 `TEXT`”“前后结果取平台三类值；处理决定见下文，不用调用 Mock 前的旧快照拼装”；`reason_code`、`reason_message`：“两列均为可空 `TEXT`”“分类码最长64字符，脱敏说明最长512字符；无异常时可空，有异常时必须提供原因分类，不整包保存原始错误或报文”；落实T011字符长度、三类结果、PAYMENT/QUERY和四类决定的CHECK，外键删除采用 `RESTRICT`，索引为 `(payment_order_id, observed_at, id)`。（依赖：T013,T014；验收：T017执行T012证明列数、JSON对象、允许值、长度和外键，不建立证据中渠道编号外键，不级联删证据。）
 - [X] T016 实现 `deploy/Dockerfile.migrate`，使用精确 goose v3.29.0和T013–T015的 SQL 形成独立一次性迁移工具镜像，按T001核实的基础镜像固定引用，不让应用启动自动执行迁移。（依赖：T013,T014,T015；验收：实际获授权构建后核对CLI版本、SQL清单和源码对应关系，迁移任务独立60秒预算，不声称宿主goose已经安装。）
 - [X] T017 实现 `tests/harness/postgres.go`、`tests/harness/migration_test.go`，在明确隔离的真实 PostgreSQL 上执行独立迁移并运行T012，设置会话UTC，准备已确认/未知订单及独立Mock事实夹具；缺依赖显式失败，清理只处理已确认的本次测试目标。（依赖：T004,T009,T010,T011,T012,T016；验收：保存真实迁移/约束正反例及命令退出码，不使用开发/演示卷，不默认降级或删卷恢复。）
-- [ ] T018 实现并自测 `tests/harness/observer.go`、`tests/harness/observer_test.go` 的父进程同步观察器：每次独立调用使用独立身份，仅同一事件的传输重试可去重，查询与付款分计，观察器跨应用重启保持且不按订单替业务防重。（依赖：T005,T010；验收：重复真实调用不会被合并，ACK不明/掉线/观察器重启有缺口时判不确定或失败，不按零调用通过。）
-- [ ] T019 实现 `internal/app/testmode.go`、`internal/mock/hooks.go`、`internal/postgres/hooks.go` 的窄测试接缝，默认关闭；可信配置通过私有目录Unix socket启用付款入口防重前观测、有界屏障和登记/Mock提交/结果保存窗口控制，不新增TCP控制端口、商户路径或业务计数表，不让业务包导入父进程工具。（依赖：T009,T018；验收：正常启动不依赖观察器，故障开关不改已有交易事实；真实SQL先执行再受控隐藏提交答复，不以假错误替代数据库事实。）
-- [ ] T020 实现并自测 `tests/harness/process.go`、`tests/harness/artifacts.go`、`tests/harness/harness_test.go`，负责启动/停止真实子进程、保留父观察器及DB、收集脱敏响应/SQL状态/日志/版本和预算，采集先于实验且默认不删产物；工具自身测试不冒充应用重启验收。（依赖：T017,T018,T019；验收：进程代次能关联、异常写入/采集失败可见，未提交源码记录实际快照，敏感原文不进入归档。）
+- [X] T018 实现并自测 `tests/harness/observer.go`、`tests/harness/observer_test.go` 的父进程同步观察器：每次独立调用使用独立身份，仅同一事件的传输重试可去重，查询与付款分计，观察器跨应用重启保持且不按订单替业务防重。（依赖：T005,T010；验收：重复真实调用不会被合并，ACK不明/掉线/观察器重启有缺口时判不确定或失败，不按零调用通过。）
+- [X] T019 实现 `internal/app/testmode.go`、`internal/mock/hooks.go`、`internal/postgres/hooks.go` 的窄测试接缝，默认关闭；可信配置通过私有目录Unix socket启用付款入口防重前观测、有界屏障和登记/Mock提交/结果保存窗口控制，不新增TCP控制端口、商户路径或业务计数表，不让业务包导入父进程工具。（依赖：T009,T018；验收：正常启动不依赖观察器，故障开关不改已有交易事实；真实SQL先执行再受控隐藏提交答复，不以假错误替代数据库事实。）
+- [X] T020 实现并自测 `tests/harness/process.go`、`tests/harness/artifacts.go`、`tests/harness/harness_test.go`，负责启动/停止真实子进程、保留父观察器及DB、收集脱敏响应/SQL状态/日志/版本和预算，采集先于实验且默认不删产物；工具自身测试不冒充应用重启验收。（依赖：T017,T018,T019；验收：进程代次能关联、异常写入/采集失败可见，未提交源码记录实际快照，敏感原文不进入归档。）
 - [ ] T021 编写 `internal/httpapi/readyz_test.go`、`internal/app/lifecycle_test.go`，覆盖readyz仅200/503最小状态、无需密钥且不读订单/调用Mock、启动配置/迁移检查，以及期限层级与资源关闭顺序；使用可控依赖，不把探针等待错误计为目标超时。（依赖：T009,T010,T017,T020；验收：明确无效配置直接失败、依赖检查1秒、启动等待30秒，不把健康状态当支付验收。）
 - [ ] T022 实现 `cmd/payment-hub/main.go`、`internal/app/app.go`、`internal/app/lifecycle.go`、`internal/httpapi/router.go`、`internal/httpapi/readyz.go` 的手工组装与生命周期，连接配置、日志、PG和迁移状态检查；落实读取5秒、写出期限20秒起点、退出20秒总期限及容器25秒宽限，预留关闭时间，readyz和正常运行不依赖测试控制器。（依赖：T005,T009,T010,T011,T017,T019,T020,T021；验收：T021通过，无隐式迁移或后台补付；基础启动不等于已交付支付入口。）
 

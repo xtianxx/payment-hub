@@ -24,8 +24,31 @@ MOD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MOD)
 
 
+REQUIRED_INTEGRATION_TEST = "TestCommitHookIntegrationHidesReplyAfterRealCommit"
+T020_REQUIRED_INTEGRATION_TEST = "TestHarnessProcessPreservesParentStateIntegration"
+PACKAGE_OK_OUTPUT = (
+    "ok  \tpayment-hub/internal/postgres\t0.1s\n"
+    "ok  \tpayment-hub/internal/mock\t0.2s\n"
+    "ok  \tpayment-hub/tests/harness\t0.3s\n"
+)
+
+
 def completed(argv, code=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(argv, code, stdout, stderr)
+
+
+def required_pass_output(name=REQUIRED_INTEGRATION_TEST):
+    return (
+        f"=== RUN   {name}\n"
+        f"--- PASS: {name} (0.00s)\n"
+        "PASS\n"
+    )
+
+
+def both_required_pass_output():
+    return required_pass_output(REQUIRED_INTEGRATION_TEST) + required_pass_output(
+        T020_REQUIRED_INTEGRATION_TEST
+    )
 
 
 class FakeProcess:
@@ -66,6 +89,225 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.launcher.docker = "/bin/true"
         self.launcher.docker_env = {}
         self.launcher.compose_env = {}
+
+    def _write_manifest_fixture(self, root):
+        for relative in MOD.SOURCE_MANIFEST_EXPLICIT:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n", encoding="utf-8")
+        return root
+
+    def test_runtime_source_manifest_tracks_untracked_cmd_build_inputs(self):
+        fixture = self._write_manifest_fixture(
+            Path(self.temp.name) / "manifest-cmd-fixture"
+        )
+        self.launcher.repo = fixture
+        before = self.launcher.collect_source_manifest()
+        manifest_paths = {entry["path"] for entry in self.launcher.source["manifest"]}
+        self.assertNotIn("cmd/payment-hub/main.go", manifest_paths)
+
+        cmd_main = fixture / "cmd" / "payment-hub" / "main.go"
+        cmd_main.parent.mkdir(parents=True)
+        cmd_main.write_text("package main\n\nfunc main() {}\n", encoding="utf-8")
+
+        after = self.launcher.collect_source_manifest()
+        self.assertNotEqual(after, before)
+        manifest_paths = {entry["path"] for entry in self.launcher.source["manifest"]}
+        self.assertIn("cmd/payment-hub/main.go", manifest_paths)
+        self.launcher.verify_source_manifest()
+        self.assertTrue(self.launcher.source["manifest_unchanged"])
+
+    def test_runtime_parser_requires_required_root_verbose_pass(self):
+        _, problems = self.launcher._parse_test_output(PACKAGE_OK_OUTPUT, "", 0)
+        self.assertIn("required-test-missing", problems)
+
+    def test_runtime_parser_accepts_required_root_verbose_pass(self):
+        results, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT + both_required_pass_output(), "", 0
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(results["tests/harness"]["status"], "pass")
+
+    def test_runtime_parser_rejects_duplicate_required_root_pass(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + both_required_pass_output()
+            + required_pass_output(REQUIRED_INTEGRATION_TEST),
+            "",
+            0,
+        )
+        self.assertIn("required-test-duplicate", problems)
+
+    def test_runtime_parser_rejects_required_root_skip(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + required_pass_output(T020_REQUIRED_INTEGRATION_TEST)
+            + f"--- SKIP: {REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            "",
+            0,
+        )
+        self.assertIn("required-test-skip", problems)
+
+    def test_runtime_parser_rejects_required_root_fail(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + required_pass_output(T020_REQUIRED_INTEGRATION_TEST)
+            + f"--- FAIL: {REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            "",
+            0,
+        )
+        self.assertIn("required-test-fail", problems)
+
+    def test_runtime_run_tests_uses_verbose_and_reports_required_root(self):
+        self.launcher.published_port = 54321
+        self.launcher._run_process_group = mock.Mock(
+            side_effect=[
+                completed(["go", "vet"], 0, "", ""),
+                completed(
+                    ["go", "test"],
+                    0,
+                    PACKAGE_OK_OUTPUT + both_required_pass_output(),
+                    "",
+                ),
+            ]
+        )
+        self.launcher.run_tests()
+        test_argv = self.launcher._run_process_group.call_args_list[1].args[3]
+        self.assertIn("-v", test_argv)
+        self.assertEqual(
+            self.launcher.tests["required_test_results"].get(
+                REQUIRED_INTEGRATION_TEST
+            ),
+            "pass",
+        )
+        report_tests = self.launcher._build_report()["tests"]
+        self.assertEqual(
+            report_tests["required_test_results"].get(REQUIRED_INTEGRATION_TEST),
+            "pass",
+        )
+
+    def test_runtime_run_tests_rejects_missing_required_root(self):
+        self.launcher.published_port = 54321
+        self.launcher._run_process_group = mock.Mock(
+            side_effect=[
+                completed(["go", "vet"], 0, "", ""),
+                completed(["go", "test"], 0, PACKAGE_OK_OUTPUT, ""),
+            ]
+        )
+        with self.assertRaises(MOD.LauncherError) as raised:
+            self.launcher.run_tests()
+        self.assertEqual(raised.exception.stage, "test")
+        self.assertEqual(
+            self.launcher.tests["required_test_results"].get(
+                REQUIRED_INTEGRATION_TEST
+            ),
+            "missing",
+        )
+
+    def test_t020_parser_requires_second_required_root(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT + required_pass_output(REQUIRED_INTEGRATION_TEST),
+            "",
+            0,
+        )
+        self.assertIn("required-test-missing", problems)
+
+    def test_t020_parser_accepts_both_required_roots(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT + both_required_pass_output(), "", 0
+        )
+        self.assertEqual(problems, [])
+
+    def test_t020_parser_rejects_second_root_skip(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + required_pass_output(REQUIRED_INTEGRATION_TEST)
+            + f"--- SKIP: {T020_REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            "",
+            0,
+        )
+        self.assertIn("required-test-skip", problems)
+
+    def test_t020_parser_rejects_second_root_fail(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + required_pass_output(REQUIRED_INTEGRATION_TEST)
+            + f"--- FAIL: {T020_REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            "",
+            0,
+        )
+        self.assertIn("required-test-fail", problems)
+
+    def test_t020_parser_rejects_second_root_duplicate(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + required_pass_output(REQUIRED_INTEGRATION_TEST)
+            + required_pass_output(T020_REQUIRED_INTEGRATION_TEST)
+            + required_pass_output(T020_REQUIRED_INTEGRATION_TEST),
+            "",
+            0,
+        )
+        self.assertIn("required-test-duplicate", problems)
+
+    def test_t020_parser_keeps_commit_root_mandatory(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + required_pass_output(T020_REQUIRED_INTEGRATION_TEST),
+            "",
+            0,
+        )
+        self.assertIn("required-test-missing", problems)
+
+    def test_t020_run_tests_reports_both_required_roots(self):
+        self.launcher.published_port = 54321
+        self.launcher._run_process_group = mock.Mock(
+            side_effect=[
+                completed(["go", "vet"], 0, "", ""),
+                completed(
+                    ["go", "test"],
+                    0,
+                    PACKAGE_OK_OUTPUT + both_required_pass_output(),
+                    "",
+                ),
+            ]
+        )
+        self.launcher.run_tests()
+        test_argv = self.launcher._run_process_group.call_args_list[1].args[3]
+        self.assertIn("-v", test_argv)
+        expected = {
+            REQUIRED_INTEGRATION_TEST: "pass",
+            T020_REQUIRED_INTEGRATION_TEST: "pass",
+        }
+        self.assertEqual(self.launcher.tests["required_test_results"], expected)
+        self.assertEqual(
+            self.launcher._build_report()["tests"]["required_test_results"],
+            expected,
+        )
+
+    def test_t020_run_tests_rejects_only_commit_root_pass(self):
+        self.launcher.published_port = 54321
+        self.launcher._run_process_group = mock.Mock(
+            side_effect=[
+                completed(["go", "vet"], 0, "", ""),
+                completed(
+                    ["go", "test"],
+                    0,
+                    PACKAGE_OK_OUTPUT
+                    + required_pass_output(REQUIRED_INTEGRATION_TEST),
+                    "",
+                ),
+            ]
+        )
+        with self.assertRaises(MOD.LauncherError) as raised:
+            self.launcher.run_tests()
+        self.assertEqual(raised.exception.stage, "test")
+        self.assertEqual(
+            self.launcher.tests["required_test_results"],
+            {
+                REQUIRED_INTEGRATION_TEST: "pass",
+                T020_REQUIRED_INTEGRATION_TEST: "missing",
+            },
+        )
 
     def test_go_environment_cgo_gomax_and_offline_test_env(self):
         self.args.download_modules = True
@@ -292,6 +534,10 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.assertEqual(self.launcher.tool_containers[0]["container_exit_code"], 1)
 
     def test_source_manifest_unchanged_after_collection(self):
+        fixture = self._write_manifest_fixture(
+            Path(self.temp.name) / "manifest-unchanged-fixture"
+        )
+        self.launcher.repo = fixture
         before = self.launcher.collect_source_manifest()
         self.launcher.verify_source_manifest()
         self.assertEqual(self.launcher.source["manifest_digest"], before)
@@ -377,9 +623,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
 
     def test_test_output_requires_three_real_ok_lines(self):
         results, problems = self.launcher._parse_test_output(
-            "ok  \tpayment-hub/internal/postgres\t0.1s\n"
-            "ok  \tpayment-hub/internal/mock\t0.2s\n"
-            "ok  \tpayment-hub/tests/harness\t0.3s\n",
+            PACKAGE_OK_OUTPUT + both_required_pass_output(),
             "",
             0,
         )
@@ -389,10 +633,9 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         _, empty_problems = self.launcher._parse_test_output("", "", 0)
         self.assertIn("package-not-pass", empty_problems)
         _, skip_problems = self.launcher._parse_test_output(
-            "ok  \tpayment-hub/internal/postgres\t0.1s\n"
-            "ok  \tpayment-hub/internal/mock\t0.2s\n"
-            "ok  \tpayment-hub/tests/harness\t0.3s\n"
-            "--- SKIP: TestOne (0.00s)\n",
+            PACKAGE_OK_OUTPUT
+            + both_required_pass_output()
+            + "--- SKIP: TestOne (0.00s)\n",
             "",
             0,
         )
