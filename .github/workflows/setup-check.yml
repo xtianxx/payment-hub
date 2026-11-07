@@ -1,4 +1,4 @@
-name: Setup checks / 准备阶段CI
+name: Setup and unit checks / 准备与单元检查
 
 on:
   push:
@@ -20,7 +20,7 @@ env:
 
 jobs:
   setup-check:
-    name: Setup checks (linux/amd64)
+    name: Setup and foundation units (linux/amd64)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
@@ -75,9 +75,34 @@ jobs:
           {
             echo "## Setup checks / 准备阶段检查"
             echo ""
-            echo "仅完成 Go 模块输入/缓存与 Compose 静态检查；未执行应用 build/test/race、真实 PostgreSQL/迁移/HTTP/重启、镜像构建/拉取/运行或部署。"
+            echo "本节仅报告 Go 模块输入/缓存与 Compose 静态检查；基础单元与 race 结果另见后续步骤，不代表真实 PostgreSQL、迁移、HTTP 进程、重启、镜像或部署已验收。"
             echo ""
             echo '```text'
             grep -E '^(scope|module-cache-mode|go-version|goos|goarch|gotoolchain|gotelemetry|docker-version|compose-version|module-graph-count|checks-passed):' "$log"
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run foundation unit checks
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOMAXPROCS: "2"
+          GOPROXY: "off"
+          GOSUMDB: "off"
+        run: |
+          set -euo pipefail
+          packages=(./internal/payment ./internal/app ./internal/httpapi)
+          unformatted="$(gofmt -l internal/payment internal/app internal/httpapi)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::foundation Go files need gofmt"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+          go vet -mod=readonly -p=1 "${packages[@]}"
+          go test -mod=readonly -race -count=1 -p=1 -timeout=90s "${packages[@]}"
+          {
+            echo "## Foundation unit checks / 基础包单元检查"
+            echo ""
+            echo "上述三个包的格式、go vet 与带 race 的单元测试已通过；Gin 使用内存路由，不启动监听服务。"
+            echo "不代表 SQL 约束、真实数据库、迁移、完整支付流程、应用进程重启或镜像已验收；完整 T072/T077 仍待后续实现。"
           } >> "$GITHUB_STEP_SUMMARY"
