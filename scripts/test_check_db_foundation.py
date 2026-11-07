@@ -26,6 +26,7 @@ SPEC.loader.exec_module(MOD)
 
 REQUIRED_INTEGRATION_TEST = "TestCommitHookIntegrationHidesReplyAfterRealCommit"
 T020_REQUIRED_INTEGRATION_TEST = "TestHarnessProcessPreservesParentStateIntegration"
+T022_REQUIRED_INTEGRATION_TEST = "TestApplicationLifecycleIntegration"
 PACKAGE_OK_OUTPUT = (
     "ok  \tpayment-hub/internal/postgres\t0.1s\n"
     "ok  \tpayment-hub/internal/mock\t0.2s\n"
@@ -48,6 +49,12 @@ def required_pass_output(name=REQUIRED_INTEGRATION_TEST):
 def both_required_pass_output():
     return required_pass_output(REQUIRED_INTEGRATION_TEST) + required_pass_output(
         T020_REQUIRED_INTEGRATION_TEST
+    )
+
+
+def all_required_pass_output():
+    return both_required_pass_output() + required_pass_output(
+        T022_REQUIRED_INTEGRATION_TEST
     )
 
 
@@ -123,7 +130,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
 
     def test_runtime_parser_accepts_required_root_verbose_pass(self):
         results, problems = self.launcher._parse_test_output(
-            PACKAGE_OK_OUTPUT + both_required_pass_output(), "", 0
+            PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 0
         )
         self.assertEqual(problems, [])
         self.assertEqual(results["tests/harness"]["status"], "pass")
@@ -131,7 +138,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
     def test_runtime_parser_rejects_duplicate_required_root_pass(self):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
-            + both_required_pass_output()
+            + all_required_pass_output()
             + required_pass_output(REQUIRED_INTEGRATION_TEST),
             "",
             0,
@@ -166,7 +173,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 completed(
                     ["go", "test"],
                     0,
-                    PACKAGE_OK_OUTPUT + both_required_pass_output(),
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(),
                     "",
                 ),
             ]
@@ -214,7 +221,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
 
     def test_t020_parser_accepts_both_required_roots(self):
         _, problems = self.launcher._parse_test_output(
-            PACKAGE_OK_OUTPUT + both_required_pass_output(), "", 0
+            PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 0
         )
         self.assertEqual(problems, [])
 
@@ -266,7 +273,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 completed(
                     ["go", "test"],
                     0,
-                    PACKAGE_OK_OUTPUT + both_required_pass_output(),
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(),
                     "",
                 ),
             ]
@@ -277,6 +284,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         expected = {
             REQUIRED_INTEGRATION_TEST: "pass",
             T020_REQUIRED_INTEGRATION_TEST: "pass",
+            T022_REQUIRED_INTEGRATION_TEST: "pass",
         }
         self.assertEqual(self.launcher.tests["required_test_results"], expected)
         self.assertEqual(
@@ -306,6 +314,120 @@ class CheckDBFoundationMockTests(unittest.TestCase):
             {
                 REQUIRED_INTEGRATION_TEST: "pass",
                 T020_REQUIRED_INTEGRATION_TEST: "missing",
+                T022_REQUIRED_INTEGRATION_TEST: "missing",
+            },
+        )
+
+    def test_t022_parser_requires_third_required_root(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT + both_required_pass_output(), "", 0
+        )
+        self.assertIn("required-test-missing", problems)
+
+    def test_t022_parser_accepts_all_three_required_roots(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 0
+        )
+        self.assertEqual(problems, [])
+
+    def test_t022_parser_rejects_third_root_skip(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + both_required_pass_output()
+            + f"--- SKIP: {T022_REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            "",
+            0,
+        )
+        self.assertIn("required-test-skip", problems)
+
+    def test_t022_parser_rejects_third_root_fail(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + both_required_pass_output()
+            + f"--- FAIL: {T022_REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            "",
+            0,
+        )
+        self.assertIn("required-test-fail", problems)
+
+    def test_t022_parser_rejects_third_root_duplicate(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + both_required_pass_output()
+            + required_pass_output(T022_REQUIRED_INTEGRATION_TEST)
+            + required_pass_output(T022_REQUIRED_INTEGRATION_TEST),
+            "",
+            0,
+        )
+        self.assertIn("required-test-duplicate", problems)
+
+    def test_t022_parser_keeps_old_roots_mandatory(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + required_pass_output(T020_REQUIRED_INTEGRATION_TEST)
+            + required_pass_output(T022_REQUIRED_INTEGRATION_TEST),
+            "",
+            0,
+        )
+        self.assertIn("required-test-missing", problems)
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT
+            + required_pass_output(REQUIRED_INTEGRATION_TEST)
+            + required_pass_output(T022_REQUIRED_INTEGRATION_TEST),
+            "",
+            0,
+        )
+        self.assertIn("required-test-missing", problems)
+
+    def test_t022_run_tests_reports_all_three_required_roots(self):
+        self.launcher.published_port = 54321
+        self.launcher._run_process_group = mock.Mock(
+            side_effect=[
+                completed(["go", "vet"], 0, "", ""),
+                completed(
+                    ["go", "test"],
+                    0,
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(),
+                    "",
+                ),
+            ]
+        )
+        self.launcher.run_tests()
+        test_argv = self.launcher._run_process_group.call_args_list[1].args[3]
+        self.assertIn("-v", test_argv)
+        expected = {
+            REQUIRED_INTEGRATION_TEST: "pass",
+            T020_REQUIRED_INTEGRATION_TEST: "pass",
+            T022_REQUIRED_INTEGRATION_TEST: "pass",
+        }
+        self.assertEqual(self.launcher.tests["required_test_results"], expected)
+        self.assertEqual(
+            self.launcher._build_report()["tests"]["required_test_results"],
+            expected,
+        )
+
+    def test_t022_run_tests_rejects_only_old_two_roots(self):
+        self.launcher.published_port = 54321
+        self.launcher._run_process_group = mock.Mock(
+            side_effect=[
+                completed(["go", "vet"], 0, "", ""),
+                completed(
+                    ["go", "test"],
+                    0,
+                    PACKAGE_OK_OUTPUT + both_required_pass_output(),
+                    "",
+                ),
+            ]
+        )
+        with self.assertRaises(MOD.LauncherError) as raised:
+            self.launcher.run_tests()
+        self.assertEqual(raised.exception.stage, "test")
+        self.assertEqual(
+            self.launcher.tests["required_test_results"],
+            {
+                REQUIRED_INTEGRATION_TEST: "pass",
+                T020_REQUIRED_INTEGRATION_TEST: "pass",
+                T022_REQUIRED_INTEGRATION_TEST: "missing",
             },
         )
 
@@ -623,7 +745,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
 
     def test_test_output_requires_three_real_ok_lines(self):
         results, problems = self.launcher._parse_test_output(
-            PACKAGE_OK_OUTPUT + both_required_pass_output(),
+            PACKAGE_OK_OUTPUT + all_required_pass_output(),
             "",
             0,
         )
@@ -634,7 +756,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.assertIn("package-not-pass", empty_problems)
         _, skip_problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
-            + both_required_pass_output()
+            + all_required_pass_output()
             + "--- SKIP: TestOne (0.00s)\n",
             "",
             0,

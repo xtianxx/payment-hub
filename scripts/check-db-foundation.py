@@ -88,6 +88,7 @@ PACKAGES = ("internal/postgres", "internal/mock", "tests/harness")
 REQUIRED_INTEGRATION_TESTS = (
     "TestCommitHookIntegrationHidesReplyAfterRealCommit",
     "TestHarnessProcessPreservesParentStateIntegration",
+    "TestApplicationLifecycleIntegration",
 )
 
 MOCK_DB_USER = "payment_hub_test_user"
@@ -255,10 +256,12 @@ class Launcher:
         self.scope = (
             "database foundation plus wired runtime harness: migration image, real "
             "PostgreSQL, Goose up/up-again, integration vet/test with required "
-            "commit-hook experiment and tool-helper two-generation parent "
-            "Observer/real PostgreSQL retention root result checks, default packages "
-            "covering private UDS and helper self-tests, owned cleanup only; not real "
-            "application restart, payment HTTP, full MVP, T072, T077, or CD"
+            "commit-hook experiment, tool-helper two-generation parent Observer/real "
+            "PostgreSQL retention, and current application-binary readyz/SIGTERM/"
+            "bad-config/missing-migration startup-failure root result checks, default "
+            "packages covering private UDS, readyz/lifecycle short real-connection "
+            "semantics and helper self-tests, owned cleanup only; not payment HTTP, "
+            "business restart/idempotency, application image, full MVP, T072, T077, or CD"
         )
         self.started_at = utc_now()
 
@@ -2974,10 +2977,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "One-shot database foundation and wired runtime harness launcher: "
             "fixed-input migration image, isolated PostgreSQL Compose project, real "
             "Goose up/up-again, integration vet/test with required commit-hook "
-            "experiment and tool-helper two-generation parent Observer/real "
-            "PostgreSQL retention root result checks, and owned cleanup only. "
-            "Default packages cover private UDS and helper self-tests. Not real "
-            "application restart, payment HTTP, the T072 full check, T077, or CD."
+            "experiment, tool-helper two-generation parent Observer/real PostgreSQL "
+            "retention, and current application-binary readyz/SIGTERM/bad-config/"
+            "missing-migration startup-failure root result checks, and owned cleanup "
+            "only. Default packages cover private UDS, readyz/lifecycle short "
+            "real-connection semantics and helper self-tests. Not payment HTTP, "
+            "business restart/idempotency, application image, the T072 full check, "
+            "T077, or CD."
         )
     )
     parser.add_argument(

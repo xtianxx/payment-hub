@@ -4,7 +4,7 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 # Tasks: 模拟商城一次性 Mock 支付闭环
 
-**Status**: Runtime harness Pass A complete locally — 2026-11-07 已完成获授权的 T001–T020；本批真实UDS、默认关闭接缝、真实helper/安全产物、隔离PG提交及父状态保留实验验收通过。T021–T082 共62项未完成，Phase 2尚未整体完成；本批远端CI仍待新分支推送及Draft PR后独立核对。本文件不授予后续实施、安装、运行、迁移、发布、清理数据、提交或推送权限；当前T018–T022及功能分支提交推送/Draft PR另有用户明确授权，不进入T023+。
+**Status**: Runtime foundation complete locally — 2026-11-08 已完成获授权的 T001–T022；本批可信观察器/接缝/真实进程工具、最小readyz应用及隔离PG实际验收通过。T023–T082 共60项未执行；基础阶段本机检查不等于故事或完整MVP完成。远端结论须以Draft PR精确head及实际checkout的检查为准。本文件不授予后续实施、安装、运行、迁移、发布、清理数据、提交或推送权限；本批功能分支提交推送/Draft PR另有明确授权，不合并、不进入T023+。
 
 **Input**: `specs/001-mock-payment/` 中已批准的设计，基线提交 `a999f01`。
 
@@ -49,7 +49,9 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 **T005–T011 本批证据（2026-11-07）**：见 [开发记录第7节](../../docs/development.md#7-基础实现批t005t011)。三条支线先保存测试快照、再实现并执行焦点测试；父会话审查实际产物后合流执行限定三包的 gofmt、`go vet -mod=readonly -p=1` 与 `go test -mod=readonly -race -count=1 -p=1 -timeout=90s`，均退出0。已有 setup 检查退出0；仅模块与 Compose 静态配置，不是数据库/支付流程验收。`tasks.md` 的82项定义不改，需求清单只读；T012及以后未开始，完整T072/T077仍不勾选。远端本批CI须在提交推送与Draft PR创建后核对实际run，不沿用旧提交结果。
 
-**T018–T020 Pass A证据（2026-11-07）**：见 [开发记录第9节](../../docs/development.md#9-运行基础批t018t022实施中)。测试先写/快照，生命周期及日志封口缺口有真实red→green回归；默认7包广检查和受影响harness75根race、37项工具回归及旧setup通过。最终fresh PG run `a8bc2166a0b844b592a9ac4ed95f948c` 两个必需根实际PASS，48项当前源码清单由父重算，三表`[0,0,0]`及本次资源清理通过；风险gate第二次接受。统计碰撞及首轮CI原始快照缺口诚实记录，不补造历史。仅勾本批三项；T021–T022未实施，真实应用/支付重启、远端CI及完整T072/T077未验。
+**T018–T020 Pass A证据（2026-11-07）**：见 [开发记录第9节](../../docs/development.md#9-运行基础批t018t022本机验收)。测试先写/快照，生命周期及日志封口缺口有真实red→green回归；默认7包广检查和受影响harness75根race、37项工具回归及旧setup通过。最终fresh PG run `a8bc2166a0b844b592a9ac4ed95f948c` 两个必需根实际PASS，48项当前源码清单由父重算，三表`[0,0,0]`及本次资源清理通过；风险gate第二次接受。统计碰撞及首轮CI原始快照缺口诚实记录，不补造历史。仅勾本批三项；当时T021–T022未实施，真实应用/支付重启、远端CI及完整T072/T077未验。
+
+**T021–T022 Pass B证据（2026-11-08，本机日期）**：同见开发记录第9节。测试先写快照；就绪/生命周期与真实短连接、PG环境隔离、启动与退出顺序通过。180根全仓race后，Serve错误唯一gate修复有确定性red→green，受影响app48根复验；当前181个包限定根按来源核对，不伪称完整重跑。最终run `0e32b9e063e04e7da399eb9c306e4746` 三个必需根实际PASS，包括当前二进制回环readyz/SIGTERM及坏配置/空schema缺迁移负例；57项源码清单、三表`[0,0,0]`和本次清理由父独立核验，gate2接受。仅增加勾选本批两项；不代表支付HTTP、业务重启防重、容器/镜像、完整MVP/T072/T077或CD验收，远端CI仍须核对精确提交。
 
 - [X] T005 在 `internal/payment/types.go`、`internal/payment/ports.go` 定义平台订单、Mock 答复、固定观测及处理决定的业务类型和小接口，使用 Go `int64` 金额；接口表达登记结果、受限定位及完整结果保存，不泄露 Gin、pgx连接、事务或原始 SQL，也不把付款资格定义成可重置字段。（依赖：T001,T002,T003,T004；验收：HTTP/存储/Mock 可各自实现消费侧契约，支付包不反向导入具体实现；字段约束由 T011、T013–T015逐项兑现。）
 - [X] T006 [P] 在 `internal/payment/validation_test.go` 编写仅CNY整数分及金额上下限、ASCII标识大小写与长度、UUIDv4、原因长度、UTC和结果/确认时间组合测试，覆盖空值及非法枚举；使用原文约束而不是默认转换。（依赖：T005；验收：断言覆盖合法边界和拒绝分支，先记录未实现行为，执行结果由后续关卡证实。）
@@ -67,8 +69,8 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 - [X] T018 实现并自测 `tests/harness/observer.go`、`tests/harness/observer_test.go` 的父进程同步观察器：每次独立调用使用独立身份，仅同一事件的传输重试可去重，查询与付款分计，观察器跨应用重启保持且不按订单替业务防重。（依赖：T005,T010；验收：重复真实调用不会被合并，ACK不明/掉线/观察器重启有缺口时判不确定或失败，不按零调用通过。）
 - [X] T019 实现 `internal/app/testmode.go`、`internal/mock/hooks.go`、`internal/postgres/hooks.go` 的窄测试接缝，默认关闭；可信配置通过私有目录Unix socket启用付款入口防重前观测、有界屏障和登记/Mock提交/结果保存窗口控制，不新增TCP控制端口、商户路径或业务计数表，不让业务包导入父进程工具。（依赖：T009,T018；验收：正常启动不依赖观察器，故障开关不改已有交易事实；真实SQL先执行再受控隐藏提交答复，不以假错误替代数据库事实。）
 - [X] T020 实现并自测 `tests/harness/process.go`、`tests/harness/artifacts.go`、`tests/harness/harness_test.go`，负责启动/停止真实子进程、保留父观察器及DB、收集脱敏响应/SQL状态/日志/版本和预算，采集先于实验且默认不删产物；工具自身测试不冒充应用重启验收。（依赖：T017,T018,T019；验收：进程代次能关联、异常写入/采集失败可见，未提交源码记录实际快照，敏感原文不进入归档。）
-- [ ] T021 编写 `internal/httpapi/readyz_test.go`、`internal/app/lifecycle_test.go`，覆盖readyz仅200/503最小状态、无需密钥且不读订单/调用Mock、启动配置/迁移检查，以及期限层级与资源关闭顺序；使用可控依赖，不把探针等待错误计为目标超时。（依赖：T009,T010,T017,T020；验收：明确无效配置直接失败、依赖检查1秒、启动等待30秒，不把健康状态当支付验收。）
-- [ ] T022 实现 `cmd/payment-hub/main.go`、`internal/app/app.go`、`internal/app/lifecycle.go`、`internal/httpapi/router.go`、`internal/httpapi/readyz.go` 的手工组装与生命周期，连接配置、日志、PG和迁移状态检查；落实读取5秒、写出期限20秒起点、退出20秒总期限及容器25秒宽限，预留关闭时间，readyz和正常运行不依赖测试控制器。（依赖：T005,T009,T010,T011,T017,T019,T020,T021；验收：T021通过，无隐式迁移或后台补付；基础启动不等于已交付支付入口。）
+- [X] T021 编写 `internal/httpapi/readyz_test.go`、`internal/app/lifecycle_test.go`，覆盖readyz仅200/503最小状态、无需密钥且不读订单/调用Mock、启动配置/迁移检查，以及期限层级与资源关闭顺序；使用可控依赖，不把探针等待错误计为目标超时。（依赖：T009,T010,T017,T020；验收：明确无效配置直接失败、依赖检查1秒、启动等待30秒，不把健康状态当支付验收。）
+- [X] T022 实现 `cmd/payment-hub/main.go`、`internal/app/app.go`、`internal/app/lifecycle.go`、`internal/httpapi/router.go`、`internal/httpapi/readyz.go` 的手工组装与生命周期，连接配置、日志、PG和迁移状态检查；落实读取5秒、写出期限20秒起点、退出20秒总期限及容器25秒宽限，预留关闭时间，readyz和正常运行不依赖测试控制器。（依赖：T005,T009,T010,T011,T017,T019,T020,T021；验收：T021通过，无隐式迁移或后台补付；基础启动不等于已交付支付入口。）
 
 **Checkpoint**: 共享类型、真实迁移、鉴权、日志、生命周期和观测夹具可供故事使用；只有实际关卡证据齐全才完成基础验收。T013/T014可并行写SQL，不能并行迁移同一测试库。
 

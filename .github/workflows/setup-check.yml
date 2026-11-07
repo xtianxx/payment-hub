@@ -107,8 +107,8 @@ jobs:
           {
             echo "## Foundation unit checks / 基础包单元检查"
             echo ""
-            echo "所有已跟踪 Go 文件已通过 gofmt；默认非 integration 包（./...）已通过 go vet 与带 race 的单元测试，覆盖真实私有 UDS 协议包与可用 helper 自测；不代表支付 HTTP、应用重启或完整 MVP 已验收。"
-            echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture、迁移工具镜像、必需 commit-hook 提交实验，以及工具 helper 真两代进程并核对父 Observer/真实 PG 保留的根，由 database-foundation job 逐项核对实际根测试 PASS；新 helper 根需 harness 测试合流后才可执行，本摘要不声称其已运行。完整支付 HTTP、真实应用重启、应用镜像、完整 MVP/T072/T077/CD 不在本步骤，也不由该 job 验收。"
+            echo "所有已跟踪 Go 文件已通过 gofmt；默认非 integration 包（./...）已通过 go vet 与带 race 的单元测试，覆盖真实私有 UDS、readyz/lifecycle 与短真实连接语义；这些是 unit/默认包结果，不代表支付 HTTP、业务重启防重、应用镜像、默认全时长实测或完整 MVP 已验收。"
+            echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture、迁移工具镜像、必需 commit-hook 提交实验、工具 helper 两代父 Observer/真实 PG 保留，以及当前应用二进制 readyz/SIGTERM/坏配置/缺迁移启动失败根，由 database-foundation job 在实际执行时逐项核对；完整支付 HTTP、业务重启防重、应用镜像、完整 MVP/T072/T077/CD 不在本步骤，也不由该 job 验收。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check launcher syntax and safety regressions
@@ -221,7 +221,7 @@ jobs:
             echo "## Database foundation checks / 数据库基础检查"
             echo ""
             echo "本摘要来自安全启动器的固定前缀输出；launcher-exit-code 为 0 才表示启动器自身成功，非零失败不会被摘要掩盖。"
-            echo "本 job 覆盖数据库约束与已接线的 runtime harness integration，必需根包括 commit-hook 提交实验及工具 helper 两代父 Observer/真实 PG 保留；新 helper 根需 harness 测试合流后才可执行，本摘要不声称其已运行。不包含支付 HTTP、真实应用重启、完整 MVP、T072、T077、CD、发布或部署。"
+            echo "本 job 覆盖数据库约束与已接线的 runtime harness integration，必需根包括 commit-hook 提交实验、工具 helper 两代父 Observer/真实 PG 保留，以及当前应用二进制 readyz/SIGTERM/坏配置/缺迁移启动失败；由启动器实际执行时逐项核对。不包含支付 HTTP、业务重启防重、应用镜像、完整 MVP、T072、T077、CD、发布或部署。"
             echo ""
             echo '```text'
             if [[ -f "$status_file" ]]; then
