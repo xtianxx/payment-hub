@@ -1713,6 +1713,332 @@ class ExportReportsTests(unittest.TestCase):
             )
         )
 
+    def db_timeout_report(self, manifest_unchanged="omit"):
+        """Main-run shape: result fail, source manifest collected, no verify."""
+        value = self.db_report(result="fail")
+        value["failure"] = {
+            "stage": "test",
+            "kind": "timeout",
+            "message": (
+                "rawOutput SECRET_MAIN_CI_RAW "
+                "Authorization: Bearer FAKE_CANARY_TOKEN"
+            ),
+        }
+        value["tests"] = {
+            "required_test_results": {
+                name: "missing" for name in MOD.DB_REQUIRED_TEST_KEYS
+            },
+        }
+        value["cleanup"] = {
+            "result": "pass",
+            "errors": [],
+            "repeat_signal_ignored": False,
+            "network_removed": True,
+            "volume_removed": True,
+            "volume_retained": False,
+            "compose_down_exit": 0,
+        }
+        value["commands"] = [
+            {
+                "argv": [
+                    "psql",
+                    "postgres://FAKE_USER:FAKE_PASSWORD@FAKE_HOST/FAKE_DB",
+                ]
+            }
+        ]
+        value["diagnostics"] = ["SELECT * FROM FAKE_ORDERS"]
+        value["env"] = {
+            "PAYMENT_HUB_TEST_DATABASE_URL": (
+                "postgres://FAKE_USER:FAKE_PASSWORD@FAKE_HOST/FAKE_DB"
+            )
+        }
+        value["raw_output"] = "rawOutput SECRET_MAIN_CI_RAW"
+        value["authorization"] = "Authorization: Bearer FAKE_CANARY_TOKEN"
+        value["unknown_field"] = "SECRET_MAIN_CI_UNKNOWN"
+        if manifest_unchanged == "omit":
+            value["source"].pop("manifest_unchanged", None)
+        else:
+            value["source"]["manifest_unchanged"] = manifest_unchanged
+        return value
+
+    def read_safe_db(self):
+        return json.loads(
+            (
+                self.report_dir / "upload" / "db-foundation.safe.json"
+            ).read_text()
+        )
+
+    def assert_no_main_run_canaries(self, text):
+        for forbidden in (
+            "SECRET_MAIN_CI_RAW",
+            "rawOutput",
+            "FAKE_CANARY_TOKEN",
+            "Authorization",
+            "postgres://",
+            "SELECT",
+            "FAKE_ORDERS",
+            "SECRET_MAIN_CI_UNKNOWN",
+            "raw_output",
+            "unknown_field",
+            '"commands":',
+            '"diagnostics":',
+            '"env":',
+        ):
+            self.assertNotIn(forbidden, text)
+
+    def test_export_db_fail_missing_manifest_unchanged_is_not_verified(self):
+        value = self.db_timeout_report()
+        self.assertNotIn("manifest_unchanged", value["source"])
+        self.write_db(value)
+        code, _ = self.export(["db"])
+        self.assertEqual(code, 1)
+        safe_path = self.report_dir / "upload" / "db-foundation.safe.json"
+        text = safe_path.read_text()
+        safe = json.loads(text)
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertEqual(
+            safe["failure"], {"stage": "test", "kind": "timeout"}
+        )
+        self.assertIsNone(safe["source"]["manifest_unchanged"])
+        self.assertEqual(
+            safe["source"].get("manifest_verification"), "not-verified"
+        )
+        self.assertEqual(
+            safe["source"]["manifest_digest"],
+            value["source"]["manifest_digest"],
+        )
+        self.assertEqual(safe["source"]["file_count"], 2)
+        self.assertEqual(
+            safe["source"]["files"], value["source"]["manifest"]
+        )
+        self.assertIsNone(safe["vet_exit"])
+        self.assertIsNone(safe["test_exit"])
+        self.assertEqual(safe["package_results"], {})
+        self.assertEqual(safe["cleanup"]["result"], "pass")
+        self.assertTrue(
+            all(
+                status == "missing"
+                for status in safe["required_test_results"].values()
+            )
+        )
+        self.assert_no_main_run_canaries(text)
+        provenance = json.loads(
+            (self.report_dir / "upload" / "provenance.json").read_text()
+        )
+        self.assertEqual(provenance["errors"], [])
+        self.assertEqual(provenance["expect"], ["db"])
+        self.assertEqual(provenance["reports"][0]["status"], "exported")
+        self.assertEqual(provenance["reports"][0]["result"], "fail")
+        self.assertNotIn("error", provenance["reports"][0])
+        self.assertEqual(
+            provenance["reports"][0]["export_sha256"],
+            hashlib.sha256(safe_path.read_bytes()).hexdigest(),
+        )
+
+    def test_export_db_fail_explicit_none_manifest_unchanged_is_same(self):
+        self.write_db(self.db_timeout_report(manifest_unchanged=None))
+        code, _ = self.export(["db"])
+        self.assertEqual(code, 1)
+        safe = self.read_safe_db()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertIsNone(safe["source"]["manifest_unchanged"])
+        self.assertEqual(
+            safe["source"].get("manifest_verification"), "not-verified"
+        )
+        provenance = json.loads(
+            (self.report_dir / "upload" / "provenance.json").read_text()
+        )
+        self.assertEqual(provenance["errors"], [])
+        self.assertEqual(provenance["reports"][0]["status"], "exported")
+
+    def test_export_db_fail_rejects_non_bool_manifest_unchanged(self):
+        for marker in ("true", 1, [], {}):
+            with self.subTest(marker=marker):
+                self.write_db(
+                    self.db_timeout_report(manifest_unchanged=marker)
+                )
+                code, _ = self.export(["db"])
+                self.assertEqual(code, 1)
+                safe = self.read_safe_db()
+                self.assertEqual(safe["status"], "error")
+                self.assertEqual(
+                    safe["error"], "unsafe-field-source.manifest_unchanged"
+                )
+
+    def test_export_db_fail_bool_manifest_unchanged_keeps_semantics(self):
+        for marker, expected, verification in (
+            (True, True, "verified-unchanged"),
+            (False, False, "verified-changed"),
+        ):
+            with self.subTest(marker=marker):
+                self.write_db(
+                    self.db_timeout_report(manifest_unchanged=marker)
+                )
+                code, _ = self.export(["db"])
+                self.assertEqual(code, 1)
+                safe = self.read_safe_db()
+                self.assertEqual(safe["status"], "exported")
+                self.assertEqual(safe["result"], "fail")
+                self.assertIs(
+                    safe["source"]["manifest_unchanged"], expected
+                )
+                self.assertEqual(
+                    safe["source"].get("manifest_verification"),
+                    verification,
+                )
+
+    def test_export_db_pass_requires_explicit_true_manifest_unchanged(self):
+        for marker in ("omit", None, False, "true", 1):
+            with self.subTest(marker=marker):
+                value = self.db_report()
+                if marker == "omit":
+                    del value["source"]["manifest_unchanged"]
+                else:
+                    value["source"]["manifest_unchanged"] = marker
+                self.write_db(value)
+                code, _ = self.export(["db"])
+                self.assertEqual(code, 1)
+                safe = self.read_safe_db()
+                self.assertEqual(safe["status"], "error")
+                self.assertEqual(
+                    safe["error"], "unsafe-field-source.manifest_unchanged"
+                )
+                self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_db_fail_empty_source_is_unknown_not_changed(self):
+        value = self.db_report(result="fail")
+        value["source"] = {}
+        value["tests"] = {
+            "required_test_results": {
+                name: "missing" for name in MOD.DB_REQUIRED_TEST_KEYS
+            },
+        }
+        self.write_db(value)
+        code, _ = self.export(["db"])
+        self.assertEqual(code, 1)
+        safe = self.read_safe_db()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertIsNone(safe["source"]["manifest_unchanged"])
+        self.assertEqual(
+            safe["source"].get("manifest_verification"), "not-verified"
+        )
+        self.assertIsNone(safe["source"]["manifest_digest"])
+        self.assertEqual(safe["source"]["files"], [])
+
+    def test_export_db_fail_manifest_security_still_rejected(self):
+        def with_manifest(manifest, digest=None):
+            value = self.db_timeout_report()
+            value["source"]["manifest"] = manifest
+            value["source"]["manifest_digest"] = (
+                self.manifest_digest(manifest)
+                if digest is None
+                else digest
+            )
+            return value
+
+        cases = {
+            "digest-mismatch": with_manifest(
+                self.db_timeout_report()["source"]["manifest"],
+                digest="e" * 64,
+            ),
+            "path-traversal": with_manifest(
+                [{"path": "../../etc/passwd", "sha256": "c" * 64}]
+            ),
+            "bad-hash": with_manifest(
+                [{"path": "go.mod", "sha256": "not-a-hash"}]
+            ),
+            "duplicate": with_manifest(
+                [
+                    {"path": "go.mod", "sha256": "c" * 64},
+                    {"path": "go.mod", "sha256": "d" * 64},
+                ]
+            ),
+            "order": with_manifest(
+                [
+                    {
+                        "path": "scripts/check-db-foundation.py",
+                        "sha256": "d" * 64,
+                    },
+                    {"path": "go.mod", "sha256": "c" * 64},
+                ]
+            ),
+        }
+        for name, value in cases.items():
+            with self.subTest(case=name):
+                self.write_db(value)
+                code, _ = self.export(["db"])
+                self.assertEqual(code, 1)
+                text = (
+                    self.report_dir
+                    / "upload"
+                    / "db-foundation.safe.json"
+                ).read_text()
+                safe = json.loads(text)
+                self.assertEqual(safe["status"], "error")
+                self.assertNotIn("../../etc/passwd", text)
+                self.assertNotIn("not-a-hash", text)
+
+    def test_cli_export_db_fail_timeout_is_exported_but_nonzero(self):
+        self.write_db(self.db_timeout_report())
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stderr(stderr):
+                code = MOD.main(
+                    [
+                        "export-reports",
+                        "--report-dir",
+                        str(self.report_dir),
+                        "--db-artifact-root",
+                        str(self.db_root),
+                        "--expect",
+                        "db",
+                    ]
+                )
+        self.assertEqual(code, 1)
+        safe = self.read_safe_db()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertEqual(
+            safe["failure"], {"stage": "test", "kind": "timeout"}
+        )
+        self.assertIsNone(safe["source"]["manifest_unchanged"])
+        self.assertEqual(
+            safe["source"].get("manifest_verification"), "not-verified"
+        )
+        provenance = json.loads(
+            (self.report_dir / "upload" / "provenance.json").read_text()
+        )
+        self.assertEqual(provenance["errors"], [])
+        self.assertEqual(provenance["expect"], ["db"])
+        self.assertEqual(provenance["reports"][0]["status"], "exported")
+        self.assertEqual(provenance["reports"][0]["result"], "fail")
+        self.assertNotIn("unsafe-field", stderr.getvalue())
+        self.assertNotIn("unsafe-field", json.dumps(provenance))
+
+    def test_export_missing_cancellation_is_placeholder_non_green(self):
+        self.write_db(self.db_timeout_report())
+        code, _ = self.export(["db", "cancellation"])
+        self.assertEqual(code, 1)
+        cancellation = json.loads(
+            (
+                self.report_dir / "upload" / "cancellation.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(cancellation["status"], "missing")
+        provenance = json.loads(
+            (self.report_dir / "upload" / "provenance.json").read_text()
+        )
+        statuses = {
+            entry["name"]: entry["status"]
+            for entry in provenance["reports"]
+        }
+        self.assertEqual(
+            statuses, {"db": "exported", "cancellation": "missing"}
+        )
+
     def test_export_db_safe_rebuild(self):
         self.write_db(self.db_report())
         code, _ = self.export(["db"])

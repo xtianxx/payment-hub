@@ -415,6 +415,22 @@ Go业务与模块未变，复用前述207根/766子测试本机结果，不冒�
 
 结论仅为最终最小依赖整改的本地验证通过。旧7漏洞红灯原样保留；没有远端Actions/实际上传、提交、推送、合并或CD。取消仍仅有前轮PG健康阶段证明，不新增runner硬杀/孙进程清理保证。US1继续暂停。
 
+### PR3 合并后 main CI 超时修复（本地验证，尚未远端复验）
+
+PR #3 的最终 head `85c17f3` 在远端run `42482907670` 三个job及安全报告上传通过，随后用户授权合并；main合并提交为`b05da766e4a45cb74793c6b1491aecc012a3e535`。合并本身成功，但push main的run `42484196418` 数据库阶段失败：vet 77.847秒后，go test被外层150秒截止终止，stage=test/kind=timeout；取消验收因此跳过。默认与漏洞job通过，不把PR绿灯冒充main绿灯。
+
+原失败未保留Go测试进度，无法证明当时具体哪个测试挂起。独立空GOCACHE的仅编译实验累计115.067秒；修复后空编译缓存真实集成的go test用了166.005秒并正常通过，说明旧150秒预算确实无法覆盖本地这次合法完整运行，但不把它冒称为远端故障逐事件复现。模块缓存借用既有缓存，没有下载模块或修改版本。
+
+最小修复保留`-race -count=1 -p=1 -json`和每包`-timeout=120s`，将外层预算显式计算为冷编译余量180秒＋三个串行包各120秒＋收尾余量30秒＝570秒；不是放宽测试断言或重试。发生外层超时后，kill/reap再用既有JSON白名单解析已捕获事件，保存test_exit=124及安全进度/问题分类，仍失败，不归档原Output、stack或错误报文。
+
+另一缺口是超时发生在源码复核前，缺失的`manifest_unchanged`被导出器当成非法字段，遮蔽了原失败报告。现合法失败报告导出`manifest_unchanged: null`、`manifest_verification: not-verified`，明确未知，不写成已变或未变；pass仍要求完整合法manifest、正确digest及明确true，非法路径/hash/类型继续拒绝。
+
+证据位于隔离worktree的`artifacts/main-ci-timeout/`：两个修复分别保留6项和8项真实AssertionError red及同测试hash green；最终249项工具回归、9脚本AST、14个workflow shell块及原只读上传配置检查通过。真实子进程synthetic-emitter超时实验验证kill/reap、脱敏诊断及非绿导出（CLI退出1、provenance无错误），它不是Go测试。
+
+fresh PG run `b582a69fa71e4d349682b72c779ea7c7` 入口退出0、总286.32秒；三包、4项必需结果、106根/259子测试、两次迁移和三表`[0,0,0]`通过，清理正常。首次取消报告通过但采证脚本事后丢失实际退出码，未伪造该值；另一个独立取消run `ef9ede46ef50439eb6718d8fa6ead143` 实测checker退出0、launcher退出1/interrupted/sigterm、清理通过。新取消报告与原正常PG报告联合安全导出退出0，两个身份和source/export哈希均核对。旧证据未覆盖，补验证据见`final-validation/cancellation-exit-confirmation/`。
+
+父另行核对实际报告、哈希/provenance和Docker资源缺席。执行前后67项输入稳定，digest `c0faf6286055851e81f9ec0a30d97510c1719bf78f57fa9a53e1b0ab41c64bb8`；原US1未提交改动保持不变并暂停。Go业务及模块未改，复用main运行的默认/漏洞job通过证据，不重复无关扫描。当前修复只完成本地验证，未提交、推送或重跑远端CI；不新增Go孙进程或runner硬杀清理保证，20分钟job上限不变。
+
 本批已另获实施、隔离验证及新分支 Draft PR 授权；仍不合并、发布或部署。T018–T022 已分两次完成本机合流验收；远端结论须以 Draft PR 精确提交的实际检查为准，不能沿用上一批 main 绿灯。
 
 ### 观察器的可信计数合同

@@ -167,6 +167,29 @@ class FakeProcess:
         return 0
 
 
+class PartialOutputProcess:
+    """A timed-out process whose second communicate returns buffered output."""
+
+    def __init__(self, stdout="", stderr="", pid=23456):
+        self.pid = pid
+        self.returncode = -9
+        self.calls = 0
+        self._stdout = stdout
+        self._stderr = stderr
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise subprocess.TimeoutExpired("go test", timeout)
+        return self._stdout, self._stderr
+
+    def kill(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+
 class CheckDBFoundationMockTests(unittest.TestCase):
     """Mock-only launcher regression tests; not Docker/DB acceptance."""
 
@@ -1016,6 +1039,182 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         fake.finish.assert_called_once()
         self.assertEqual(fake.failure["stage"], "interrupted")
         self.assertEqual(fake.failure["kind"], "sigterm")
+
+    def test_go_test_external_budget_covers_cold_build_and_each_package(self):
+        budget = MOD.BUDGETS["go_test_external_seconds"]
+        self.assertEqual(budget, 180 + len(MOD.PACKAGES) * 120 + 30)
+        self.assertEqual(budget, 570)
+
+    def test_go_test_external_budget_scales_per_package_without_drift(self):
+        budget = MOD.BUDGETS["go_test_external_seconds"]
+        per_package = 120
+        fixed_margin = budget - len(MOD.PACKAGES) * per_package
+        self.assertEqual(fixed_margin, 180 + 30)
+        self.assertEqual(
+            fixed_margin + (len(MOD.PACKAGES) + 1) * per_package,
+            budget + per_package,
+        )
+
+    def test_run_tests_keeps_package_timeout_and_derived_outer_budget(self):
+        self.launcher.published_port = 54321
+        self.launcher._run_process_group = mock.Mock(
+            side_effect=[
+                completed(["go", "vet"], 0, "", ""),
+                completed(
+                    ["go", "test"],
+                    0,
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(),
+                    "",
+                ),
+            ]
+        )
+        self.launcher.run_tests()
+        test_call = self.launcher._run_process_group.call_args_list[1]
+        argv = test_call.args[3]
+        outer_timeout = test_call.args[5]
+        self.assertIn("-timeout=120s", argv)
+        for flag in ("-race", "-count=1", "-p=1", "-json"):
+            self.assertIn(flag, argv)
+        self.assertEqual(
+            outer_timeout,
+            180 + len(MOD.PACKAGES) * 120 + 30,
+        )
+        self.assertEqual(outer_timeout, MOD.BUDGETS["go_test_external_seconds"])
+        self.assertEqual(self.launcher.tests["test_exit"], 0)
+
+    def test_go_test_timeout_records_safe_partial_results(self):
+        partial = (
+            json_event("start", POSTGRES_PACKAGE)
+            + json_event("run", POSTGRES_PACKAGE, "TestPackageHealth")
+            + json_event("pass", POSTGRES_PACKAGE, "TestPackageHealth", elapsed=0.01)
+            + json_event("pass", POSTGRES_PACKAGE, elapsed=0.1)
+            + json_event("start", HARNESS_PACKAGE)
+            + json_event("run", HARNESS_PACKAGE, REQUIRED_INTEGRATION_TEST)
+        )
+        fake = PartialOutputProcess(partial)
+        with mock.patch.object(
+            MOD.subprocess, "Popen", return_value=fake
+        ), mock.patch.object(MOD.os, "killpg") as killpg:
+            with self.assertRaises(MOD.LauncherError) as raised:
+                self.launcher._run_process_group(
+                    "test",
+                    "test",
+                    "go test integration",
+                    ["go", "test"],
+                    {},
+                    570,
+                )
+        self.assertEqual(raised.exception.stage, "test")
+        self.assertEqual(raised.exception.kind, "timeout")
+        killpg.assert_called_once_with(fake.pid, signal.SIGKILL)
+        tests = self.launcher.tests
+        self.assertEqual(tests.get("test_exit"), 124)
+        package_results = tests.get("package_results", {})
+        self.assertEqual(
+            package_results.get("internal/postgres", {}).get("status"), "pass"
+        )
+        self.assertEqual(
+            package_results.get("internal/mock", {}).get("status"), "missing"
+        )
+        self.assertEqual(
+            tests.get("required_test_results", {}).get(REQUIRED_INTEGRATION_TEST),
+            "missing",
+        )
+        self.assertEqual(tests.get("test_root_count"), 1)
+        self.assertEqual(tests.get("test_subtest_count"), 0)
+        problems = tests.get("problems", [])
+        self.assertIn("test-exit", problems)
+        self.assertIn("required-test-missing", problems)
+        self.assertIn("test-incomplete", problems)
+        self.assertNotIn("no-captured-test-events", problems)
+        self.assertTrue(tests.get("failure_diagnostics"))
+        self.assertEqual(self.launcher._build_report()["result"], "fail")
+
+    def test_go_test_timeout_without_events_marks_no_captured_events(self):
+        canary = "db-foundation-canary-not-real"
+        stdout = (
+            canary
+            + "\n"
+            + json_event(
+                "output",
+                POSTGRES_PACKAGE,
+                "TestPackageHealth",
+                output=canary + "\n",
+            )
+        )
+        fake = PartialOutputProcess(stdout)
+        with mock.patch.object(
+            MOD.subprocess, "Popen", return_value=fake
+        ), mock.patch.object(MOD.os, "killpg"):
+            with self.assertRaises(MOD.LauncherError) as raised:
+                self.launcher._run_process_group(
+                    "test",
+                    "test",
+                    "go test integration",
+                    ["go", "test"],
+                    {},
+                    570,
+                )
+        self.assertEqual(raised.exception.kind, "timeout")
+        tests = self.launcher.tests
+        self.assertEqual(tests.get("test_exit"), 124)
+        self.assertEqual(tests.get("test_root_count"), 0)
+        self.assertEqual(tests.get("test_subtest_count"), 0)
+        self.assertIn("no-captured-test-events", tests.get("problems", []))
+        package_results = tests.get("package_results", {})
+        for name in MOD.PACKAGES:
+            self.assertEqual(
+                package_results.get(name, {}).get("status"), "missing"
+            )
+        self.assertNotIn(canary, json.dumps(tests, sort_keys=True))
+        self.assertNotIn(
+            canary,
+            json.dumps(self.launcher._build_report(), sort_keys=True),
+        )
+
+    def test_go_test_timeout_redacts_malicious_package_and_test_labels(self):
+        canary = "db-foundation-canary-not-real"
+        stdout = (
+            json_event("run", "evil.example/" + canary, "Test/" + canary)
+            + json_event("fail", "evil.example/" + canary, "Test/" + canary)
+            + json_event("run", HARNESS_PACKAGE, REQUIRED_INTEGRATION_TEST)
+            + json_event(
+                "pass",
+                HARNESS_PACKAGE,
+                REQUIRED_INTEGRATION_TEST,
+                elapsed=0.01,
+            )
+        )
+        fake = PartialOutputProcess(stdout)
+        with mock.patch.object(
+            MOD.subprocess, "Popen", return_value=fake
+        ), mock.patch.object(MOD.os, "killpg"):
+            with self.assertRaises(MOD.LauncherError) as raised:
+                self.launcher._run_process_group(
+                    "test",
+                    "test",
+                    "go test integration",
+                    ["go", "test"],
+                    {},
+                    570,
+                )
+        self.assertEqual(raised.exception.kind, "timeout")
+        tests = self.launcher.tests
+        self.assertEqual(tests.get("test_exit"), 124)
+        self.assertIn("unexpected-package", tests.get("problems", []))
+        diagnostics = tests.get("failure_diagnostics", [])
+        self.assertTrue(diagnostics)
+        for entry in diagnostics:
+            self.assertIn(
+                entry["package"],
+                ("", "unknown", POSTGRES_PACKAGE, MOCK_PACKAGE, HARNESS_PACKAGE),
+            )
+            self.assertNotIn(canary, entry["test"])
+            self.assertNotIn(canary, entry["location"])
+        self.assertNotIn(
+            canary,
+            json.dumps(self.launcher._build_report(), sort_keys=True),
+        )
 
 
 class SharedSetupLauncherConfigurationTests(unittest.TestCase):
