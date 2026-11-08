@@ -96,6 +96,14 @@ IMAGE_KEY_FILES = (
     "migrations/00003_create_result_handling_records.sql",
 )
 PACKAGES = ("internal/postgres", "internal/mock", "tests/harness")
+GO_TEST_PACKAGE_TIMEOUT_SECONDS = 120
+GO_TEST_COLD_BUILD_MARGIN_SECONDS = 180
+GO_TEST_FINALIZE_MARGIN_SECONDS = 30
+GO_TEST_EXTERNAL_TIMEOUT_SECONDS = (
+    GO_TEST_COLD_BUILD_MARGIN_SECONDS
+    + len(PACKAGES) * GO_TEST_PACKAGE_TIMEOUT_SECONDS
+    + GO_TEST_FINALIZE_MARGIN_SECONDS
+)
 REQUIRED_INTEGRATION_TESTS = (
     "TestCommitHookIntegrationHidesReplyAfterRealCommit",
     "TestHarnessProcessPreservesParentStateIntegration",
@@ -191,7 +199,7 @@ BUDGETS = {
     "migration_up_seconds": 60,
     "migration_up_again_seconds": 60,
     "go_vet_seconds": 120,
-    "go_test_external_seconds": 150,
+    "go_test_external_seconds": GO_TEST_EXTERNAL_TIMEOUT_SECONDS,
     "compose_down_seconds": 60,
     "container_stop_seconds": 15,
     "container_remove_seconds": 15,
@@ -686,6 +694,23 @@ class Launcher:
                 except subprocess.TimeoutExpired:
                     self.cleanup_failures.append(f"{stage}:reap")
                 stdout, stderr = "", ""
+            if name == "go test integration":
+                parsed = self._parse_go_test_results(
+                    stdout or "", stderr or "", 124
+                )
+                self._record_go_test_results(parsed, 124)
+                captured_events = bool(
+                    parsed["root_count"]
+                    or parsed["subtest_count"]
+                    or {
+                        "test-incomplete",
+                        "test-run-duplicate",
+                    }.intersection(parsed["problems"])
+                )
+                if not captured_events:
+                    problems = list(self.tests.get("problems", []))
+                    problems.append("no-captured-test-events")
+                    self.tests["problems"] = sorted(set(problems))
             raise LauncherError(
                 stage, "timeout", f"process group timed out after {timeout}s"
             ) from exc
@@ -2387,6 +2412,26 @@ class Launcher:
             )
         return results, parsed["problems"]
 
+    def _record_go_test_results(
+        self, parsed: Mapping[str, Any], exit_code: int
+    ) -> None:
+        """Record only whitelisted go-test results for normal and timeout paths."""
+        self.tests["test_exit"] = exit_code
+        results: dict[str, dict[str, str]] = {}
+        for name, package in zip(PACKAGES, EXPECTED_PACKAGE_PATHS):
+            value = parsed["package_results"].get(package, {"status": "missing"})
+            results[name] = (
+                dict(value) if isinstance(value, dict) else {"status": str(value)}
+            )
+        self.tests["package_results"] = results
+        self.tests["required_test_results"] = parsed["required_test_results"]
+        self.tests["test_root_count"] = parsed["root_count"]
+        self.tests["test_subtest_count"] = parsed["subtest_count"]
+        problems = list(parsed["problems"])
+        if exit_code != 0 or problems:
+            self.tests["failure_diagnostics"] = parsed["failure_diagnostics"]
+            self.tests["problems"] = problems
+
     def run_tests(self) -> None:
         if self.published_port is None:
             raise LauncherError("environment", "published-port", "published port is unavailable")
@@ -2439,7 +2484,7 @@ class Launcher:
                 "-race",
                 "-count=1",
                 "-p=1",
-                "-timeout=120s",
+                f"-timeout={GO_TEST_PACKAGE_TIMEOUT_SECONDS}s",
                 "-json",
                 *package_args,
             ],
@@ -2447,24 +2492,12 @@ class Launcher:
             BUDGETS["go_test_external_seconds"],
             allow_failure=True,
         )
-        self.tests["test_exit"] = test.returncode
         parsed = self._parse_go_test_results(
             test.stdout or "", test.stderr or "", test.returncode
         )
-        results: dict[str, dict[str, str]] = {}
-        for name, package in zip(PACKAGES, EXPECTED_PACKAGE_PATHS):
-            value = parsed["package_results"].get(package, {"status": "missing"})
-            results[name] = (
-                dict(value) if isinstance(value, dict) else {"status": str(value)}
-            )
-        self.tests["package_results"] = results
-        self.tests["required_test_results"] = parsed["required_test_results"]
-        self.tests["test_root_count"] = parsed["root_count"]
-        self.tests["test_subtest_count"] = parsed["subtest_count"]
+        self._record_go_test_results(parsed, test.returncode)
         problems = parsed["problems"]
         if test.returncode != 0 or problems:
-            self.tests["failure_diagnostics"] = parsed["failure_diagnostics"]
-            self.tests["problems"] = problems
             kind = "test-failed" if test.returncode != 0 else "package-result"
             raise LauncherError(
                 "test",

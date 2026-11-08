@@ -37,6 +37,9 @@ SAFE_EXPORT_SCHEMA = "payment-hub.ci-safe-export.v1"
 DB_SCHEMA = "payment-hub.db-foundation.v1"
 VULNERABILITY_SCHEMA = "payment-hub.ci.vulnerability-report.v1"
 CANCELLATION_SCHEMA = "payment-hub.ci-cancellation.v1"
+MANIFEST_VERIFICATION_UNCHANGED = "verified-unchanged"
+MANIFEST_VERIFICATION_CHANGED = "verified-changed"
+MANIFEST_VERIFICATION_NOT_VERIFIED = "not-verified"
 VULNERABILITY_RESULTS = frozenset({"pass", "vulnerable", "failure"})
 CANCELLATION_RESULTS = frozenset({"pass", "fail"})
 CANCELLATION_CLEANUP_RESULTS = frozenset(
@@ -1334,6 +1337,8 @@ def _safe_go_ids(value: Any, name: str) -> list[str]:
 
 def _safe_manifest(
     source: dict[str, Any],
+    *,
+    require_verified: bool,
 ) -> dict[str, Any]:
     manifest = _require_list(source.get("manifest"), "source.manifest")
     if not manifest:
@@ -1360,12 +1365,27 @@ def _safe_manifest(
         raise CiError("unsafe-field-source.manifest_digest")
     if declared != digest.hexdigest():
         raise CiError("source-manifest-mismatch")
-    unchanged = _require_bool(
-        source.get("manifest_unchanged"), "source.manifest_unchanged"
-    )
+    unchanged_value = source.get("manifest_unchanged")
+    if isinstance(unchanged_value, bool):
+        unchanged: bool | None = unchanged_value
+        verification = (
+            MANIFEST_VERIFICATION_UNCHANGED
+            if unchanged_value
+            else MANIFEST_VERIFICATION_CHANGED
+        )
+    elif unchanged_value is None:
+        if require_verified:
+            raise CiError("unsafe-field-source.manifest_unchanged")
+        unchanged = None
+        verification = MANIFEST_VERIFICATION_NOT_VERIFIED
+    else:
+        raise CiError("unsafe-field-source.manifest_unchanged")
+    if require_verified and unchanged is not True:
+        raise CiError("unsafe-field-source.manifest_unchanged")
     return {
         "manifest_digest": declared,
         "manifest_unchanged": unchanged,
+        "manifest_verification": verification,
         "file_count": len(files),
         "files": files,
     }
@@ -1550,13 +1570,16 @@ def _safe_db_report(source: dict[str, Any]) -> dict[str, Any]:
     source_result = source.get("result")
     source_value = source.get("source")
     if isinstance(source_value, dict) and source_value:
-        source_safe = _safe_manifest(source_value)
+        source_safe = _safe_manifest(
+            source_value, require_verified=source_result == "pass"
+        )
     elif source_result == "pass":
         raise CiError("unsafe-field-source")
     else:
         source_safe = {
             "manifest_digest": None,
-            "manifest_unchanged": False,
+            "manifest_unchanged": None,
+            "manifest_verification": MANIFEST_VERIFICATION_NOT_VERIFIED,
             "file_count": 0,
             "files": [],
         }
