@@ -3,9 +3,13 @@
 
 This script is the narrow T017 entry point: it prepares the fixed-input
 migration image, starts one isolated PostgreSQL Compose project, runs the real
-Goose migration twice, runs the integration vet/test commands, and cleans up
-only the resources it created. It is not the T072 full check script and does
-not start the application, observer, HTTP server, or any T018+ feature.
+Goose migrations twice, runs the integration vet/test commands, and cleans up
+only the resources it created. Its integration roots cover the trusted private
+UDS observer and helper lifecycle, and the current real application binary's
+readyz/SIGTERM, bad-config, missing-migration, startup-timeout, startup-cancel,
+and startup-listen diagnostics. It is not the T072 full check and does not
+claim payment HTTP, business restart/idempotency, application image, full MVP,
+T077, or CD.
 
 Only Python's standard library is used. No tool is installed automatically.
 The script never prints raw Docker/build/Goose/Go output; all tool output is
@@ -21,6 +25,7 @@ sys.dont_write_bytecode = True
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -35,6 +40,12 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+CI_CHECKS_PATH = Path(__file__).resolve().parent / "ci_checks.py"
+_CI_CHECKS_SPEC = importlib.util.spec_from_file_location(
+    "payment_hub_ci_checks", CI_CHECKS_PATH
+)
+ci_checks = importlib.util.module_from_spec(_CI_CHECKS_SPEC)
+_CI_CHECKS_SPEC.loader.exec_module(ci_checks)
 
 EXPECTED_GO_VERSION = "go1.27.3"
 EXPECTED_GOOS = "linux"
@@ -90,6 +101,15 @@ REQUIRED_INTEGRATION_TESTS = (
     "TestHarnessProcessPreservesParentStateIntegration",
     "TestApplicationLifecycleIntegration",
 )
+REQUIRED_TEST_PACKAGES = {
+    name: f"{EXPECTED_MODULE}/tests/harness" for name in REQUIRED_INTEGRATION_TESTS
+}
+REQUIRED_TEST_PACKAGES[
+    "TestApplicationLifecycleIntegration/startup_diagnostics"
+] = f"{EXPECTED_MODULE}/tests/harness"
+EXPECTED_PACKAGE_PATHS = tuple(
+    f"{EXPECTED_MODULE}/{name}" for name in PACKAGES
+)
 
 MOCK_DB_USER = "payment_hub_test_user"
 MOCK_DB_PASSWORD = "payment-hub-test-db-mock-password-not-real"
@@ -117,6 +137,12 @@ SOURCE_MANIFEST_EXPLICIT = (
     "scripts/check-setup.py",
     "scripts/check-db-foundation.py",
     "scripts/test_check_db_foundation.py",
+    "scripts/ci_checks.py",
+    "scripts/test_ci_checks.py",
+    "scripts/check-vulnerabilities.py",
+    "scripts/test_check_vulnerabilities.py",
+    "scripts/check-ci-cancellation.py",
+    "scripts/test_check_ci_cancellation.py",
     "deploy/compose.yaml",
     "deploy/compose.test.yaml",
     "deploy/Dockerfile.migrate",
@@ -254,14 +280,19 @@ class Launcher:
         self.database = f"payment_hub_test_{self.run_id}"
         self.repo = REPO_ROOT
         self.scope = (
-            "database foundation plus wired runtime harness: migration image, real "
-            "PostgreSQL, Goose up/up-again, integration vet/test with required "
-            "commit-hook experiment, tool-helper two-generation parent Observer/real "
-            "PostgreSQL retention, and current application-binary readyz/SIGTERM/"
-            "bad-config/missing-migration startup-failure root result checks, default "
-            "packages covering private UDS, readyz/lifecycle short real-connection "
-            "semantics and helper self-tests, owned cleanup only; not payment HTTP, "
-            "business restart/idempotency, application image, full MVP, T072, T077, or CD"
+            "database foundation plus wired runtime harness: fixed-input migration "
+            "image, isolated real PostgreSQL Compose project, Goose up/up-again, "
+            "integration vet/test with required commit-hook experiment, trusted "
+            "private-UDS observer/helper two-generation parent retention, and "
+            "current real application-binary readyz/SIGTERM, bad-config, "
+            "missing-migration, startup-timeout, startup-cancel, and "
+            "startup-listen diagnostics; default packages cover private-UDS/"
+            "readyz/lifecycle short real-connection semantics, explicit empty-Env "
+            "child isolation, post-leader-exit cleanup deadlines, bounded startup "
+            "diagnostic logs, safe release after failed Seal, immutable final "
+            "snapshot archiving, and helper self-tests; owned cleanup only; not "
+            "payment HTTP, business restart/idempotency, application image, full "
+            "MVP, T072, T077, or CD"
         )
         self.started_at = utc_now()
 
@@ -306,7 +337,7 @@ class Launcher:
         self.fixtures: dict[str, Any] = {}
         self.tests: dict[str, Any] = {
             "required_test_results": {
-                name: "missing" for name in REQUIRED_INTEGRATION_TESTS
+                name: "missing" for name in REQUIRED_TEST_PACKAGES
             },
         }
         self.cleanup: dict[str, Any] = {}
@@ -2326,87 +2357,35 @@ class Launcher:
             )
         return diagnostics
 
+    def _parse_go_test_results(
+        self, stdout: str, stderr: str, exit_code: int
+    ) -> dict[str, Any]:
+        return ci_checks.parse_go_test_json(
+            stdout,
+            stderr,
+            exit_code,
+            EXPECTED_PACKAGE_PATHS,
+            REQUIRED_TEST_PACKAGES,
+            allowed_no_test_files=(),
+        )
+
     def _parse_required_test_results(
-        self, stdout: str
+        self, stdout: str, stderr: str = "", exit_code: int = 0
     ) -> tuple[dict[str, str], list[str]]:
-        results: dict[str, str] = {
-            name: "missing" for name in REQUIRED_INTEGRATION_TESTS
-        }
-        problems: list[str] = []
-        seen: set[str] = set()
-        for line in stdout.splitlines():
-            match = re.match(
-                r"^---\s+(PASS|FAIL|SKIP):\s+(\S+)\s+\(\d+(?:\.\d+)?s\)$",
-                line,
-            )
-            if not match:
-                continue
-            status, name = match.group(1), match.group(2)
-            if name not in results:
-                continue
-            if name in seen:
-                results[name] = "duplicate"
-                problems.append("required-test-duplicate")
-                continue
-            seen.add(name)
-            results[name] = {"PASS": "pass", "FAIL": "fail", "SKIP": "skip"}[status]
-        for name in REQUIRED_INTEGRATION_TESTS:
-            status = results[name]
-            if status == "missing":
-                problems.append("required-test-missing")
-            elif status == "skip":
-                problems.append("required-test-skip")
-            elif status == "fail":
-                problems.append("required-test-fail")
-        return results, problems
+        parsed = self._parse_go_test_results(stdout, stderr, exit_code)
+        return parsed["required_test_results"], parsed["problems"]
 
     def _parse_test_output(
         self, stdout: str, stderr: str, exit_code: int
     ) -> tuple[dict[str, dict[str, str]], list[str]]:
-        combined = stdout + "\n" + stderr
-        lowered = combined.lower()
-        problems: list[str] = []
-        if "no tests to run" in lowered:
-            problems.append("no-tests")
-        if "no test files" in lowered:
-            problems.append("no-test-files")
-        if re.search(r"---\s+SKIP:", combined):
-            problems.append("skip")
-        results: dict[str, dict[str, str]] = {
-            name: {"status": "missing"} for name in PACKAGES
-        }
-        seen: set[str] = set()
-        for line in stdout.splitlines():
-            stripped = line.strip()
-            ok_match = re.match(r"^ok\s+(\S+)\s+(\d+(?:\.\d+)?s)$", stripped)
-            if ok_match:
-                path = ok_match.group(1)
-                duration = ok_match.group(2)
-                for name in PACKAGES:
-                    if path.endswith(name):
-                        if name in seen:
-                            problems.append("duplicate-package")
-                        seen.add(name)
-                        results[name] = {"status": "pass", "duration": duration}
-            fail_match = re.match(r"^FAIL\s+(\S+)", stripped)
-            if fail_match:
-                path = fail_match.group(1)
-                for name in PACKAGES:
-                    if path.endswith(name):
-                        results[name] = {"status": "fail"}
-                        problems.append("package-fail")
-            if stripped.startswith("?") and "no test files" in stripped:
-                problems.append("no-test-files")
-            if stripped.startswith("--- FAIL:"):
-                problems.append("test-failure")
-        for name in PACKAGES:
-            if results[name]["status"] != "pass":
-                problems.append("package-not-pass")
-        _, required_problems = self._parse_required_test_results(stdout)
-        problems.extend(required_problems)
-        if exit_code != 0:
-            problems.append("test-exit")
-        return results, sorted(set(problems))
+        parsed = self._parse_go_test_results(stdout, stderr, exit_code)
+        results: dict[str, dict[str, str]] = {}
+        for name, package in zip(PACKAGES, EXPECTED_PACKAGE_PATHS):
+            value = parsed["package_results"].get(package, {"status": "missing"})
+            results[name] = (
+                dict(value) if isinstance(value, dict) else {"status": str(value)}
+            )
+        return results, parsed["problems"]
 
     def run_tests(self) -> None:
         if self.published_port is None:
@@ -2461,7 +2440,7 @@ class Launcher:
                 "-count=1",
                 "-p=1",
                 "-timeout=120s",
-                "-v",
+                "-json",
                 *package_args,
             ],
             test_env,
@@ -2469,16 +2448,22 @@ class Launcher:
             allow_failure=True,
         )
         self.tests["test_exit"] = test.returncode
-        results, problems = self._parse_test_output(
+        parsed = self._parse_go_test_results(
             test.stdout or "", test.stderr or "", test.returncode
         )
-        self.tests["package_results"] = results
-        required_results, _ = self._parse_required_test_results(test.stdout or "")
-        self.tests["required_test_results"] = required_results
-        if test.returncode != 0 or problems:
-            self.tests["failure_diagnostics"] = self._extract_diagnostics(
-                (test.stdout or "") + "\n" + (test.stderr or "")
+        results: dict[str, dict[str, str]] = {}
+        for name, package in zip(PACKAGES, EXPECTED_PACKAGE_PATHS):
+            value = parsed["package_results"].get(package, {"status": "missing"})
+            results[name] = (
+                dict(value) if isinstance(value, dict) else {"status": str(value)}
             )
+        self.tests["package_results"] = results
+        self.tests["required_test_results"] = parsed["required_test_results"]
+        self.tests["test_root_count"] = parsed["root_count"]
+        self.tests["test_subtest_count"] = parsed["subtest_count"]
+        problems = parsed["problems"]
+        if test.returncode != 0 or problems:
+            self.tests["failure_diagnostics"] = parsed["failure_diagnostics"]
             self.tests["problems"] = problems
             kind = "test-failed" if test.returncode != 0 else "package-result"
             raise LauncherError(
@@ -2916,7 +2901,7 @@ class Launcher:
                     print(f"package-result: {name}={result}")
         required_results = self.tests.get("required_test_results")
         if isinstance(required_results, dict):
-            for name in REQUIRED_INTEGRATION_TESTS:
+            for name in REQUIRED_TEST_PACKAGES:
                 if name in required_results:
                     print(f"required-test-result: {name}={required_results[name]}")
         print(f"cleanup-result: {self.cleanup.get('result', 'unknown')}")
@@ -2977,13 +2962,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "One-shot database foundation and wired runtime harness launcher: "
             "fixed-input migration image, isolated PostgreSQL Compose project, real "
             "Goose up/up-again, integration vet/test with required commit-hook "
-            "experiment, tool-helper two-generation parent Observer/real PostgreSQL "
-            "retention, and current application-binary readyz/SIGTERM/bad-config/"
-            "missing-migration startup-failure root result checks, and owned cleanup "
-            "only. Default packages cover private UDS, readyz/lifecycle short "
-            "real-connection semantics and helper self-tests. Not payment HTTP, "
-            "business restart/idempotency, application image, the T072 full check, "
-            "T077, or CD."
+            "experiment, trusted private-UDS observer/helper two-generation parent "
+            "retention, and current real application-binary readyz/SIGTERM/"
+            "bad-config/missing-migration/startup-timeout/startup-cancel/"
+            "startup-listen diagnostics, and owned cleanup only. Default packages "
+            "cover private UDS, readyz/lifecycle short real-connection semantics, "
+            "explicit empty-Env child isolation, post-leader-exit cleanup deadlines, "
+            "bounded startup diagnostic logs, safe release after failed Seal, "
+            "immutable final snapshot archiving, and helper self-tests. Not payment "
+            "HTTP, business restart/idempotency, application image, the T072 full "
+            "check, T077, or CD."
         )
     )
     parser.add_argument(

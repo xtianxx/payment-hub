@@ -23,26 +23,104 @@ SPEC = importlib.util.spec_from_file_location(
 MOD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MOD)
 
+# Read-only import of the setup checker; its main guard keeps execution off.
+SETUP_SPEC = importlib.util.spec_from_file_location(
+    "check_setup", REPO / "scripts/check-setup.py"
+)
+SETUP_MOD = importlib.util.module_from_spec(SETUP_SPEC)
+SETUP_SPEC.loader.exec_module(SETUP_MOD)
+
+CI_SPEC = importlib.util.spec_from_file_location(
+    "ci_checks_for_launcher_test", REPO / "scripts/ci_checks.py"
+)
+CI_MOD = importlib.util.module_from_spec(CI_SPEC)
+CI_SPEC.loader.exec_module(CI_MOD)
+
 
 REQUIRED_INTEGRATION_TEST = "TestCommitHookIntegrationHidesReplyAfterRealCommit"
 T020_REQUIRED_INTEGRATION_TEST = "TestHarnessProcessPreservesParentStateIntegration"
 T022_REQUIRED_INTEGRATION_TEST = "TestApplicationLifecycleIntegration"
+REQUIRED_SUBTEST = "TestApplicationLifecycleIntegration/startup_diagnostics"
+HARNESS_PACKAGE = "payment-hub/tests/harness"
+POSTGRES_PACKAGE = "payment-hub/internal/postgres"
+MOCK_PACKAGE = "payment-hub/internal/mock"
+
+
+def json_event(action, package, test=None, elapsed=None, output=None):
+    event = {"Action": action, "Package": package}
+    if test is not None:
+        event["Test"] = test
+    if elapsed is not None:
+        event["Elapsed"] = elapsed
+    if output is not None:
+        event["Output"] = output
+    event["Time"] = "2026-11-08T00:00:00Z"
+    return json.dumps(event, separators=(",", ":")) + "\n"
+
+
 PACKAGE_OK_OUTPUT = (
-    "ok  \tpayment-hub/internal/postgres\t0.1s\n"
-    "ok  \tpayment-hub/internal/mock\t0.2s\n"
-    "ok  \tpayment-hub/tests/harness\t0.3s\n"
+    json_event("start", POSTGRES_PACKAGE)
+    + json_event("run", POSTGRES_PACKAGE, "TestPackageHealth")
+    + json_event("pass", POSTGRES_PACKAGE, "TestPackageHealth", elapsed=0.01)
+    + json_event("pass", POSTGRES_PACKAGE, elapsed=0.1)
+    + json_event("start", MOCK_PACKAGE)
+    + json_event("run", MOCK_PACKAGE, "TestPackageHealth")
+    + json_event("pass", MOCK_PACKAGE, "TestPackageHealth", elapsed=0.01)
+    + json_event("pass", MOCK_PACKAGE, elapsed=0.2)
+    + json_event("start", HARNESS_PACKAGE)
+    + json_event("run", HARNESS_PACKAGE, "TestPackageHealth")
+    + json_event("pass", HARNESS_PACKAGE, "TestPackageHealth", elapsed=0.01)
+    + json_event("pass", HARNESS_PACKAGE, elapsed=0.3)
 )
 
 
-def completed(argv, code=0, stdout="", stderr=""):
-    return subprocess.CompletedProcess(argv, code, stdout, stderr)
+def required_root_pass_output(name=REQUIRED_INTEGRATION_TEST):
+    return (
+        json_event("run", HARNESS_PACKAGE, name)
+        + json_event("pass", HARNESS_PACKAGE, name, elapsed=0.01)
+    )
 
 
 def required_pass_output(name=REQUIRED_INTEGRATION_TEST):
+    if name == T022_REQUIRED_INTEGRATION_TEST:
+        return (
+            json_event("run", HARNESS_PACKAGE, name)
+            + json_event("run", HARNESS_PACKAGE, REQUIRED_SUBTEST)
+            + json_event("pass", HARNESS_PACKAGE, REQUIRED_SUBTEST, elapsed=0.01)
+            + json_event("pass", HARNESS_PACKAGE, name, elapsed=0.02)
+        )
+    return required_root_pass_output(name)
+
+
+def required_skip_output(name=REQUIRED_INTEGRATION_TEST):
     return (
-        f"=== RUN   {name}\n"
-        f"--- PASS: {name} (0.00s)\n"
-        "PASS\n"
+        json_event("run", HARNESS_PACKAGE, name)
+        + json_event("skip", HARNESS_PACKAGE, name)
+    )
+
+
+def required_fail_output(name=REQUIRED_INTEGRATION_TEST):
+    return (
+        json_event("run", HARNESS_PACKAGE, name)
+        + json_event("fail", HARNESS_PACKAGE, name)
+    )
+
+
+def required_subtest_skip_output():
+    return (
+        json_event("run", HARNESS_PACKAGE, T022_REQUIRED_INTEGRATION_TEST)
+        + json_event("run", HARNESS_PACKAGE, REQUIRED_SUBTEST)
+        + json_event("skip", HARNESS_PACKAGE, REQUIRED_SUBTEST)
+        + json_event("pass", HARNESS_PACKAGE, T022_REQUIRED_INTEGRATION_TEST, elapsed=0.02)
+    )
+
+
+def required_subtest_fail_output():
+    return (
+        json_event("run", HARNESS_PACKAGE, T022_REQUIRED_INTEGRATION_TEST)
+        + json_event("run", HARNESS_PACKAGE, REQUIRED_SUBTEST)
+        + json_event("fail", HARNESS_PACKAGE, REQUIRED_SUBTEST)
+        + json_event("fail", HARNESS_PACKAGE, T022_REQUIRED_INTEGRATION_TEST)
     )
 
 
@@ -56,6 +134,18 @@ def all_required_pass_output():
     return both_required_pass_output() + required_pass_output(
         T022_REQUIRED_INTEGRATION_TEST
     )
+
+
+def roots_only_required_pass_output():
+    return (
+        required_root_pass_output(REQUIRED_INTEGRATION_TEST)
+        + required_root_pass_output(T020_REQUIRED_INTEGRATION_TEST)
+        + required_root_pass_output(T022_REQUIRED_INTEGRATION_TEST)
+    )
+
+
+def completed(argv, code=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(argv, code, stdout, stderr)
 
 
 class FakeProcess:
@@ -149,7 +239,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
             + required_pass_output(T020_REQUIRED_INTEGRATION_TEST)
-            + f"--- SKIP: {REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            + required_skip_output(REQUIRED_INTEGRATION_TEST),
             "",
             0,
         )
@@ -159,7 +249,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
             + required_pass_output(T020_REQUIRED_INTEGRATION_TEST)
-            + f"--- FAIL: {REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            + required_fail_output(REQUIRED_INTEGRATION_TEST),
             "",
             0,
         )
@@ -180,7 +270,8 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         )
         self.launcher.run_tests()
         test_argv = self.launcher._run_process_group.call_args_list[1].args[3]
-        self.assertIn("-v", test_argv)
+        self.assertIn("-json", test_argv)
+        self.assertNotIn("-v", test_argv)
         self.assertEqual(
             self.launcher.tests["required_test_results"].get(
                 REQUIRED_INTEGRATION_TEST
@@ -229,7 +320,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
             + required_pass_output(REQUIRED_INTEGRATION_TEST)
-            + f"--- SKIP: {T020_REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            + required_skip_output(T020_REQUIRED_INTEGRATION_TEST),
             "",
             0,
         )
@@ -239,7 +330,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
             + required_pass_output(REQUIRED_INTEGRATION_TEST)
-            + f"--- FAIL: {T020_REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            + required_fail_output(T020_REQUIRED_INTEGRATION_TEST),
             "",
             0,
         )
@@ -280,11 +371,13 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         )
         self.launcher.run_tests()
         test_argv = self.launcher._run_process_group.call_args_list[1].args[3]
-        self.assertIn("-v", test_argv)
+        self.assertIn("-json", test_argv)
+        self.assertNotIn("-v", test_argv)
         expected = {
             REQUIRED_INTEGRATION_TEST: "pass",
             T020_REQUIRED_INTEGRATION_TEST: "pass",
             T022_REQUIRED_INTEGRATION_TEST: "pass",
+            REQUIRED_SUBTEST: "pass",
         }
         self.assertEqual(self.launcher.tests["required_test_results"], expected)
         self.assertEqual(
@@ -315,6 +408,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 REQUIRED_INTEGRATION_TEST: "pass",
                 T020_REQUIRED_INTEGRATION_TEST: "missing",
                 T022_REQUIRED_INTEGRATION_TEST: "missing",
+                REQUIRED_SUBTEST: "missing",
             },
         )
 
@@ -334,7 +428,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
             + both_required_pass_output()
-            + f"--- SKIP: {T022_REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            + required_skip_output(T022_REQUIRED_INTEGRATION_TEST),
             "",
             0,
         )
@@ -344,7 +438,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
             + both_required_pass_output()
-            + f"--- FAIL: {T022_REQUIRED_INTEGRATION_TEST} (0.00s)\n",
+            + required_fail_output(T022_REQUIRED_INTEGRATION_TEST),
             "",
             0,
         )
@@ -354,8 +448,8 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
             + both_required_pass_output()
-            + required_pass_output(T022_REQUIRED_INTEGRATION_TEST)
-            + required_pass_output(T022_REQUIRED_INTEGRATION_TEST),
+            + required_root_pass_output(T022_REQUIRED_INTEGRATION_TEST)
+            + required_root_pass_output(T022_REQUIRED_INTEGRATION_TEST),
             "",
             0,
         )
@@ -394,11 +488,13 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         )
         self.launcher.run_tests()
         test_argv = self.launcher._run_process_group.call_args_list[1].args[3]
-        self.assertIn("-v", test_argv)
+        self.assertIn("-json", test_argv)
+        self.assertNotIn("-v", test_argv)
         expected = {
             REQUIRED_INTEGRATION_TEST: "pass",
             T020_REQUIRED_INTEGRATION_TEST: "pass",
             T022_REQUIRED_INTEGRATION_TEST: "pass",
+            REQUIRED_SUBTEST: "pass",
         }
         self.assertEqual(self.launcher.tests["required_test_results"], expected)
         self.assertEqual(
@@ -428,7 +524,104 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 REQUIRED_INTEGRATION_TEST: "pass",
                 T020_REQUIRED_INTEGRATION_TEST: "pass",
                 T022_REQUIRED_INTEGRATION_TEST: "missing",
+                REQUIRED_SUBTEST: "missing",
             },
+        )
+
+    def test_runtime_parser_rejects_missing_required_subtest(self):
+        stdout = PACKAGE_OK_OUTPUT + roots_only_required_pass_output()
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(required.get(REQUIRED_SUBTEST), "missing")
+        self.assertIn("required-test-missing", problems)
+
+    def test_runtime_parser_rejects_required_subtest_skip(self):
+        stdout = (
+            PACKAGE_OK_OUTPUT
+            + roots_only_required_pass_output()
+            + required_subtest_skip_output()
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(required.get(REQUIRED_SUBTEST), "skip")
+        self.assertIn("required-test-skip", problems)
+
+    def test_runtime_parser_rejects_required_subtest_fail(self):
+        stdout = (
+            PACKAGE_OK_OUTPUT
+            + roots_only_required_pass_output()
+            + required_subtest_fail_output()
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(required.get(REQUIRED_SUBTEST), "fail")
+        self.assertIn("required-test-fail", problems)
+
+    def test_runtime_parser_rejects_fake_output_subtest_pass(self):
+        stdout = (
+            PACKAGE_OK_OUTPUT
+            + roots_only_required_pass_output()
+            + json_event(
+                "output",
+                HARNESS_PACKAGE,
+                output=(
+                    "--- PASS: "
+                    + REQUIRED_SUBTEST
+                    + " (0.00s)\n"
+                ),
+            )
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(required.get(REQUIRED_SUBTEST), "missing")
+        self.assertIn("required-test-missing", problems)
+
+    def test_runtime_parser_rejects_cross_package_required_subtest(self):
+        stdout = (
+            PACKAGE_OK_OUTPUT
+            + roots_only_required_pass_output()
+            + json_event("run", MOCK_PACKAGE, REQUIRED_SUBTEST)
+            + json_event("pass", MOCK_PACKAGE, REQUIRED_SUBTEST)
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(required.get(REQUIRED_SUBTEST), "wrong-package")
+        self.assertIn("required-test-wrong-package", problems)
+
+    def test_runtime_parser_rejects_package_suffix_lookalike(self):
+        lookalike = "evil/payment-hub/internal/postgres"
+        stdout = (
+            json_event("start", lookalike)
+            + json_event("run", lookalike, "TestOne")
+            + json_event("pass", lookalike, "TestOne")
+            + json_event("pass", lookalike, elapsed=0.1)
+        )
+        results, problems = self.launcher._parse_test_output(stdout, "", 0)
+        self.assertNotEqual(results["internal/postgres"]["status"], "pass")
+        self.assertIn("unexpected-package", problems)
+
+    def test_runtime_parser_rejects_non_json_and_truncated(self):
+        _, problems = self.launcher._parse_test_output("not json\n", "", 0)
+        self.assertIn("non-json-output", problems)
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT[:-1], "", 0
+        )
+        self.assertIn("truncated-output", problems)
+
+    def test_runtime_parser_rejects_nonzero_exit(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 1
+        )
+        self.assertIn("test-exit", problems)
+
+    def test_required_package_bindings_are_centralized(self):
+        expected = {
+            name: HARNESS_PACKAGE for name in MOD.REQUIRED_INTEGRATION_TESTS
+        }
+        expected[REQUIRED_SUBTEST] = HARNESS_PACKAGE
+        self.assertEqual(MOD.REQUIRED_TEST_PACKAGES, expected)
+        self.assertEqual(
+            tuple(MOD.REQUIRED_TEST_PACKAGES),
+            CI_MOD.DB_REQUIRED_TEST_KEYS,
+        )
+        self.assertEqual(
+            MOD.EXPECTED_PACKAGE_PATHS,
+            tuple("payment-hub/" + name for name in MOD.PACKAGES),
         )
 
     def test_go_environment_cgo_gomax_and_offline_test_env(self):
@@ -757,7 +950,8 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         _, skip_problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT
             + all_required_pass_output()
-            + "--- SKIP: TestOne (0.00s)\n",
+            + json_event("run", HARNESS_PACKAGE, "TestOne")
+            + json_event("skip", HARNESS_PACKAGE, "TestOne"),
             "",
             0,
         )
@@ -822,6 +1016,45 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         fake.finish.assert_called_once()
         self.assertEqual(fake.failure["stage"], "interrupted")
         self.assertEqual(fake.failure["kind"], "sigterm")
+
+
+class SharedSetupLauncherConfigurationTests(unittest.TestCase):
+    """Read-only setup/launcher pin parity; an existing invariant, no Go/Docker."""
+
+    def test_shared_setup_launcher_configuration_stays_in_sync(self):
+        shared = {
+            "EXPECTED_GO_VERSION": (
+                MOD.EXPECTED_GO_VERSION,
+                SETUP_MOD.EXPECTED_GO_VERSION,
+            ),
+            "EXPECTED_GOOS": (MOD.EXPECTED_GOOS, SETUP_MOD.EXPECTED_GOOS),
+            "EXPECTED_GOARCH": (MOD.EXPECTED_GOARCH, SETUP_MOD.EXPECTED_GOARCH),
+            "EXPECTED_GOTOOLCHAIN": (
+                MOD.EXPECTED_GOTOOLCHAIN,
+                SETUP_MOD.EXPECTED_GOTOOLCHAIN,
+            ),
+            "EXPECTED_GOTELEMETRY": (
+                MOD.EXPECTED_GOTELEMETRY,
+                SETUP_MOD.EXPECTED_GOTELEMETRY,
+            ),
+            "EXPECTED_PLATFORM": (
+                MOD.EXPECTED_PLATFORM,
+                SETUP_MOD.EXPECTED_PLATFORM,
+            ),
+            "EXPECTED_MODULE": (MOD.EXPECTED_MODULE, SETUP_MOD.EXPECTED_MODULE),
+            "EXPECTED_GO_DIRECTIVE": (
+                MOD.EXPECTED_GO_DIRECTIVE,
+                SETUP_MOD.EXPECTED_GO_DIRECTIVE,
+            ),
+            "APPROVED_DIRECT": (
+                MOD.APPROVED_DIRECT,
+                SETUP_MOD.APPROVED_DIRECT,
+            ),
+            "POSTGRES_IMAGE/PG_IMAGE": (MOD.POSTGRES_IMAGE, SETUP_MOD.PG_IMAGE),
+        }
+        for field, (launcher_value, setup_value) in shared.items():
+            with self.subTest(field=field):
+                self.assertEqual(launcher_value, setup_value)
 
 
 if __name__ == "__main__":
