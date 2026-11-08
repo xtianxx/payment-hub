@@ -822,10 +822,13 @@ func (a *Artifacts) RecordObserver(observer *Observer) error {
 	expectedEpoch := a.observerEpoch
 	a.mu.Unlock()
 
-	observer.mu.Lock()
-	_, category := snapshotObserverLocked(observer, a.cfg.RunID, expectedEpoch)
-	epoch := observer.cfg.Epoch
-	observer.mu.Unlock()
+	runID, epoch := observer.Identity()
+	category := ""
+	if runID != a.cfg.RunID || (expectedEpoch != "" && epoch != expectedEpoch) {
+		category = "invalid_record"
+	} else if _, err := observer.Snapshot(); err != nil {
+		category = "observer_uncertain"
+	}
 
 	a.mu.Lock()
 	a.observerInflight = false
@@ -857,38 +860,21 @@ func (a *Artifacts) RecordObserver(observer *Observer) error {
 	return nil
 }
 
-func snapshotObserverLocked(observer *Observer, runID, epoch string) (*artifactObserver, string) {
-	if observer.cfg.RunID != runID {
-		return nil, "invalid_record"
-	}
-	if epoch != "" && observer.cfg.Epoch != epoch {
-		return nil, "invalid_record"
-	}
-	if observer.uncertain || len(observer.generations) == 0 {
-		return nil, "observer_uncertain"
-	}
-	for _, state := range observer.generations {
-		if state.status != observerGenerationSealed {
-			return nil, "observer_uncertain"
-		}
-	}
-	receipts := make([]artifactReceipt, 0, len(observer.generations))
-	for generation, state := range observer.generations {
+func artifactObserverFromFinal(final ObserverFinalSnapshot) *artifactObserver {
+	receipts := make([]artifactReceipt, 0, len(final.Receipts))
+	for _, receipt := range final.Receipts {
 		receipts = append(receipts, artifactReceipt{
-			RunID:      observer.cfg.RunID,
-			Epoch:      observer.cfg.Epoch,
-			Generation: generation,
-			LastSeq:    state.expectedLastSeq,
+			RunID:      receipt.RunID,
+			Epoch:      receipt.Epoch,
+			Generation: receipt.Generation,
+			LastSeq:    receipt.LastSeq,
 		})
 	}
-	sort.Slice(receipts, func(i, j int) bool {
-		return receipts[i].Generation < receipts[j].Generation
-	})
 	return &artifactObserver{
-		Epoch:    observer.cfg.Epoch,
-		Counts:   artifactCounts{Payment: observer.counts.Payment, Query: observer.counts.Query},
+		Epoch:    final.Epoch,
+		Counts:   artifactCounts{Payment: final.Counts.Payment, Query: final.Counts.Query},
 		Receipts: receipts,
-	}, ""
+	}
 }
 
 func (a *Artifacts) Finish() (string, error) {
@@ -962,13 +948,17 @@ func (a *Artifacts) Finish() (string, error) {
 
 	var observerSnapshot *artifactObserver
 	if observer != nil {
-		observer.mu.Lock()
-		snapshot, category := snapshotObserverLocked(observer, a.cfg.RunID, observerEpoch)
-		observer.mu.Unlock()
-		if category != "" {
-			a.latchFault(category)
-		} else {
-			observerSnapshot = snapshot
+		final, ok := observer.FinalSnapshot()
+		switch {
+		case !ok:
+			a.latchFault("observer_uncertain")
+		case final.RunID != a.cfg.RunID ||
+			(observerEpoch != "" && final.Epoch != observerEpoch):
+			a.latchFault("invalid_record")
+		case !final.Trusted:
+			a.latchFault("observer_uncertain")
+		default:
+			observerSnapshot = artifactObserverFromFinal(final)
 		}
 	}
 

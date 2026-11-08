@@ -48,6 +48,13 @@ const (
 	t022SchemaBudget   = 5 * time.Second
 	t022CleanupBudget  = 5 * time.Second
 	t022ApplicationDir = "cmd/payment-hub"
+
+	t022DiagnosticCanary       = "FAKE_T023_STARTUP_DIAGNOSTIC_CANARY"
+	t022DiagnosticLifetime     = 45 * time.Second
+	t022DiagnosticWaitBudget   = 40 * time.Second
+	t022DiagnosticListenBudget = 15 * time.Second
+	t022DiagnosticCancelDelay  = time.Second
+	t022DiagnosticMinStartup   = 25 * time.Second
 )
 
 // TestApplicationLifecycleIntegration is the single new mandatory root for
@@ -75,6 +82,9 @@ func TestApplicationLifecycleIntegration(t *testing.T) {
 	})
 	t.Run("missing_goose_migrations", func(t *testing.T) {
 		t022MissingMigrationScenario(t, artifacts, binary, repoRoot, runID, 4)
+	})
+	t.Run("startup_diagnostics", func(t *testing.T) {
+		t022StartupDiagnosticsScenario(t, binary, repoRoot, runID)
 	})
 
 	path, finishErr := artifacts.Finish()
@@ -699,6 +709,243 @@ func t022DropSchemaIfEmpty(t *testing.T, schema, quoted string) {
 	}
 	if exists {
 		t.Errorf("application integration schema cleanup schema still exists after drop")
+	}
+}
+
+// t022StartupDiagnosticsScenario uses an independent Artifacts root so the
+// existing four-process report assertions stay unchanged. Its report is read
+// back from a t020TempDir and then removed by cleanup; it is not a long-term
+// report. Raw child stdout/stderr is never saved.
+func t022StartupDiagnosticsScenario(t *testing.T, binary, repoRoot, runID string) {
+	t.Helper()
+	diagnosticRoot := t022AbsoluteTempDir(t)
+	artifacts, err := BeginArtifacts(ArtifactConfig{
+		Root:       diagnosticRoot,
+		SourceRoot: repoRoot,
+		RunID:      runID,
+	})
+	if err != nil {
+		t.Fatal("application integration startup diagnostics artifacts begin failed")
+	}
+
+	t022StartupTimeoutDiagnostic(t, artifacts, binary, repoRoot)
+	t022StartupCancelDiagnostic(t, artifacts, binary, repoRoot)
+	t022StartupListenDiagnostic(t, artifacts, binary, repoRoot)
+
+	path, err := artifacts.Finish()
+	if err != nil {
+		t.Fatal("application integration startup diagnostics artifacts finish failed")
+	}
+	t022AssertStartupDiagnosticsReport(t, path, runID)
+}
+
+func t022StartupTimeoutDiagnostic(t *testing.T, artifacts *Artifacts, binary, repoRoot string) {
+	t.Helper()
+	dbAddr, closeDB := t022HoldLoopbackListener(t)
+	defer func() {
+		if err := closeDB(); err != nil {
+			t.Errorf("application integration startup timeout database listener close failed")
+		}
+	}()
+	httpAddr := t022FreeLoopbackAddr(t)
+	env := t022AppEnv(t, t022UnreachableDatabaseDSN(dbAddr), httpAddr, true, true)
+	start := time.Now()
+	process := t022StartApplication(t, artifacts, binary, repoRoot, 1, env, 5*time.Second, t022DiagnosticLifetime, true)
+	ctx, cancel := context.WithTimeout(context.Background(), t022DiagnosticWaitBudget)
+	exit, err := process.Wait(ctx)
+	cancel()
+	if !errors.Is(err, ErrProcess) {
+		t.Fatal("application integration startup timeout child did not exit nonzero")
+	}
+	if elapsed := time.Since(start); elapsed < t022DiagnosticMinStartup {
+		t.Fatalf("application integration startup timeout child exited before the default startup timeout: %v", elapsed)
+	}
+	t022RequireStartupDiagnosticExit(t, exit, false)
+	t022RequireNoHTTP(t, httpAddr)
+	t022RequireLoopbackFree(t, httpAddr)
+}
+
+func t022StartupCancelDiagnostic(t *testing.T, artifacts *Artifacts, binary, repoRoot string) {
+	t.Helper()
+	dbAddr, closeDB := t022HoldLoopbackListener(t)
+	defer func() {
+		if err := closeDB(); err != nil {
+			t.Errorf("application integration startup cancel database listener close failed")
+		}
+	}()
+	httpAddr := t022FreeLoopbackAddr(t)
+	env := t022AppEnv(t, t022UnreachableDatabaseDSN(dbAddr), httpAddr, true, true)
+	process := t022StartApplication(t, artifacts, binary, repoRoot, 2, env, 5*time.Second, t022DiagnosticLifetime, true)
+
+	time.Sleep(t022DiagnosticCancelDelay)
+	if exit, _ := process.snapshotForReport(); exit.Reaped {
+		t.Fatal("application integration startup cancel child exited before cancellation")
+	}
+	t022RequireNoHTTP(t, httpAddr)
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), t022StopBudget)
+	exit, err := process.Stop(stopCtx)
+	stopCancel()
+	if !errors.Is(err, ErrProcess) {
+		t.Fatal("application integration startup cancel child did not exit nonzero")
+	}
+	t022RequireStartupDiagnosticExit(t, exit, true)
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), t022CleanupBudget)
+	waitExit, waitErr := process.Wait(waitCtx)
+	waitCancel()
+	if waitExit != exit || !errors.Is(waitErr, ErrProcess) {
+		t.Fatal("application integration startup cancel stop and wait did not share the terminal exit")
+	}
+	t022RequireNoHTTP(t, httpAddr)
+	t022RequireLoopbackFree(t, httpAddr)
+}
+
+func t022StartupListenDiagnostic(t *testing.T, artifacts *Artifacts, binary, repoRoot string) {
+	t.Helper()
+	admin := t022OpenAdmin(t)
+	before := t022ReadPublicState(t, admin)
+	addr, closeListener := t022HoldLoopbackListener(t)
+	env := t022AppEnv(t, t022DatabaseDSN(t, ""), addr, true, true)
+	process := t022StartApplication(t, artifacts, binary, repoRoot, 3, env, 5*time.Second, 20*time.Second, true)
+	ctx, cancel := context.WithTimeout(context.Background(), t022DiagnosticListenBudget)
+	exit, err := process.Wait(ctx)
+	cancel()
+	if !errors.Is(err, ErrProcess) {
+		t.Fatal("application integration startup listen child did not exit nonzero")
+	}
+	t022RequireStartupDiagnosticExit(t, exit, false)
+	if err := closeListener(); err != nil {
+		t.Fatal("application integration startup listen held listener close failed")
+	}
+	t022RequireNoHTTP(t, addr)
+	after := t022ReadPublicState(t, admin)
+	if !slices.Equal(before.applied, after.applied) ||
+		before.paymentOrders != after.paymentOrders ||
+		before.mockTransactions != after.mockTransactions ||
+		before.resultHandlingRecords != after.resultHandlingRecords {
+		t.Fatal("application integration startup listen changed public state")
+	}
+}
+
+func t022HoldLoopbackListener(t *testing.T) (string, func() error) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("application integration held loopback listener bind failed")
+	}
+	addr := listener.Addr().String()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host != "127.0.0.1" || port == "0" {
+		_ = listener.Close()
+		t.Fatal("application integration held loopback address is invalid")
+	}
+	closed := false
+	closeFn := func() error {
+		if closed {
+			return nil
+		}
+		closed = true
+		return listener.Close()
+	}
+	t.Cleanup(func() {
+		if err := closeFn(); err != nil {
+			t.Errorf("application integration held loopback listener cleanup close failed")
+		}
+	})
+	return addr, closeFn
+}
+
+func t022UnreachableDatabaseDSN(addr string) string {
+	target := url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword("fake-diagnostic-user", t022DiagnosticCanary),
+		Host:   addr,
+		Path:   "/payment_hub_test",
+	}
+	query := url.Values{}
+	query.Set("sslmode", "disable")
+	target.RawQuery = query.Encode()
+	return target.String()
+}
+
+func t022RequireStartupDiagnosticExit(t *testing.T, exit Exit, canceled bool) {
+	t.Helper()
+	if exit.Code <= 0 || exit.Canceled != canceled || exit.TimedOut || exit.Forced ||
+		!exit.Reaped || !exit.OutputComplete || !exit.GroupGone {
+		t.Fatal("application integration startup diagnostic exit mismatch")
+	}
+}
+
+func t022AssertStartupDiagnosticsReport(t *testing.T, path, runID string) {
+	t.Helper()
+	report, data := t020ReadReport(t, path)
+	if !report.CollectionComplete || len(report.Faults) != 0 {
+		t.Fatal("application integration startup diagnostics report claims incomplete collection")
+	}
+	if report.RunID != runID || !report.Source.Unchanged || len(report.Source.Manifest) == 0 {
+		t.Fatal("application integration startup diagnostics report source identity mismatch")
+	}
+	if len(report.Processes) != 3 {
+		t.Fatal("application integration startup diagnostics process count mismatch")
+	}
+	processes := make(map[uint64]t020ReportProcess, len(report.Processes))
+	for _, process := range report.Processes {
+		processes[process.Generation] = process
+		if !process.Waited || !process.Reaped || !process.OutputComplete || !process.GroupGone || process.Forced {
+			t.Fatal("application integration startup diagnostics process resources are not confirmed")
+		}
+	}
+	first, ok := processes[1]
+	if !ok || first.Code <= 0 || first.Canceled || first.TimedOut {
+		t.Fatal("application integration startup timeout process mismatch")
+	}
+	second, ok := processes[2]
+	if !ok || second.Code <= 0 || !second.Canceled || second.TimedOut {
+		t.Fatal("application integration startup cancel process mismatch")
+	}
+	third, ok := processes[3]
+	if !ok || third.Code <= 0 || third.Canceled || third.TimedOut {
+		t.Fatal("application integration startup listen process mismatch")
+	}
+	if len(report.HTTP) != 0 {
+		t.Fatal("application integration startup diagnostics served an HTTP request")
+	}
+	t022RequireStartupDiagnosticLog(t, report, 1, "persistence", "timeout", "timeout")
+	t022RequireStartupDiagnosticLog(t, report, 2, "persistence", "canceled", "canceled")
+	t022RequireStartupDiagnosticLog(t, report, 3, "entry", "dependency", "internal")
+	for _, marker := range []string{
+		t022DiagnosticCanary,
+		t022APIKey,
+		"Authorization",
+		"postgresql://",
+		"postgres://",
+		"address already in use",
+		"connection refused",
+	} {
+		if bytes.Contains(data, []byte(marker)) {
+			t.Fatal("application integration startup diagnostics report leaked a sensitive or raw error value")
+		}
+	}
+}
+
+func t022RequireStartupDiagnosticLog(t *testing.T, report t020Report, generation uint64, stage, reason, errorKind string) {
+	t.Helper()
+	errorCount := 0
+	matches := 0
+	for _, log := range report.Logs {
+		if log.Generation != generation || log.Level != "error" {
+			continue
+		}
+		errorCount++
+		if log.Event != "dependency" {
+			continue
+		}
+		matches++
+		if log.Stage != stage || log.Reason != reason || log.ErrorKind != errorKind {
+			t.Fatal("application integration startup diagnostic classification mismatch")
+		}
+	}
+	if errorCount != 1 || matches != 1 {
+		t.Fatalf("application integration startup diagnostic count mismatch: errors=%d matches=%d", errorCount, matches)
 	}
 }
 

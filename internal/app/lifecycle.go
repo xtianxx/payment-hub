@@ -16,6 +16,38 @@ import (
 
 var errReadyzAdmissionClosed = errors.New("app: readiness admission closed")
 
+const startupDiagnosticReserveCap = 250 * time.Millisecond
+
+type startupBudget struct {
+	deadline time.Time
+	reserve  time.Duration
+}
+
+// newStartupBudget carves a short diagnostic reserve out of the original
+// absolute startup deadline. The reserve is not additive: dependency work stops
+// at deadline-reserve, and the diagnostic window is bounded by the same
+// deadline. The proportional term keeps short test budgets usable, and the cap
+// keeps a blocked writer from consuming a large part of the default 30s budget.
+func newStartupBudget(ctx context.Context, startup time.Duration) startupBudget {
+	deadline := time.Now().Add(startup)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	total := time.Until(deadline)
+	reserve := total / 4
+	if reserve > startupDiagnosticReserveCap {
+		reserve = startupDiagnosticReserveCap
+	}
+	if reserve < 0 {
+		reserve = 0
+	}
+	return startupBudget{deadline: deadline, reserve: reserve}
+}
+
+func (budget startupBudget) workDeadline() time.Time {
+	return budget.deadline.Add(-budget.reserve)
+}
+
 func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.Writer, deps runtimeDeps, limits runtimeLimits) error {
 	if ctx == nil || ctx.Err() != nil || lookup == nil || writer == nil ||
 		deps.openDatabase == nil || deps.listen == nil || deps.newServer == nil ||
@@ -45,11 +77,15 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 	}
 
 	logger := newRuntimeLogger(writer)
-	startupCtx, cancelStartup := context.WithTimeout(ctx, limits.startup)
+	startup := newStartupBudget(ctx, limits.startup)
+	startupCtx, cancelStartup := context.WithDeadline(ctx, startup.workDeadline())
 	defer cancelStartup()
+	cleanupCtx, cancelCleanup := context.WithDeadline(ctx, startup.deadline)
+	defer cancelCleanup()
 
 	db, err := deps.openDatabase(startupCtx, databaseURL)
 	if err != nil {
+		logger.logStartupFailure(startup, LogStagePersistence, startupCtx.Err(), err)
 		return ErrStartup
 	}
 	var testMode *TestMode
@@ -65,55 +101,59 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 		if listener != nil {
 			_ = listener.Close()
 		}
-		_ = closeRuntimeDatabaseStartup(db, startupCtx, limits)
+		_ = closeRuntimeDatabaseStartup(db, cleanupCtx, limits)
 	}()
 
+	var pingErr error
 	for {
-		if err := db.Ping(startupCtx); err == nil {
+		pingErr = db.Ping(startupCtx)
+		if pingErr == nil {
 			if startupCtx.Err() != nil {
+				logger.logStartupFailure(startup, LogStagePersistence, startupCtx.Err(), nil)
 				return ErrStartup
 			}
 			break
 		}
 		if startupCtx.Err() != nil {
+			logger.logStartupFailure(startup, LogStagePersistence, startupCtx.Err(), pingErr)
 			return ErrStartup
 		}
 		timer := time.NewTimer(limits.retry)
 		select {
 		case <-startupCtx.Done():
 			timer.Stop()
+			logger.logStartupFailure(startup, LogStagePersistence, startupCtx.Err(), pingErr)
 			return ErrStartup
 		case <-timer.C:
 		}
 	}
 
 	if err := db.CheckMigrations(startupCtx); err != nil {
-		_ = logger.log(startupCtx, LogRecord{
-			Level:  LogLevelError,
-			Event:  LogEventDependency,
-			Stage:  LogStagePersistence,
-			Reason: LogReasonDependency,
-			Err:    err,
-		})
+		logger.logStartupFailure(startup, LogStagePersistence, startupCtx.Err(), err)
 		return ErrStartup
 	}
 	if startupCtx.Err() != nil {
+		logger.logStartupFailure(startup, LogStagePersistence, startupCtx.Err(), nil)
 		return ErrStartup
 	}
 	if testModeConfig.Enabled {
 		testMode, err = OpenTestMode(startupCtx, testModeConfig)
 		if err != nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), err)
 			return ErrStartup
 		}
 		if startupCtx.Err() != nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), nil)
 			return ErrStartup
 		}
 	}
 	listener, err = deps.listen(startupCtx, httpAddr)
 	if err != nil {
+		logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), err)
 		return ErrStartup
 	}
 	if startupCtx.Err() != nil {
+		logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), nil)
 		return ErrStartup
 	}
 
@@ -155,6 +195,7 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 		return ErrRuntime
 	}
 	if startupCtx.Err() != nil {
+		logger.logStartupFailure(startup, LogStagePersistence, startupCtx.Err(), nil)
 		return ErrStartup
 	}
 	startupComplete = true
@@ -237,19 +278,19 @@ func shutdownRuntime(server runtimeServer, gate *readyGate, testMode *TestMode, 
 	if forceCloseFailed || !gate.wait(exitCtx) || !waitServeDone(serveDone, exitCtx) {
 		return ErrShutdown
 	}
+	testModeFailed := false
 	if testMode != nil {
 		if _, err := testMode.Seal(exitCtx); err != nil {
+			testModeFailed = true
 			_ = testMode.Close()
-			return ErrShutdown
-		}
-		if err := testMode.Close(); err != nil {
-			return ErrShutdown
+		} else if err := testMode.Close(); err != nil {
+			testModeFailed = true
 		}
 	}
 	if !closeRuntimeDatabaseUntil(db, exitCtx) {
 		return ErrShutdown
 	}
-	if shutdownErr != nil || listenerCloseFailed {
+	if shutdownErr != nil || listenerCloseFailed || testModeFailed {
 		return ErrShutdown
 	}
 	return nil
@@ -354,6 +395,52 @@ func (logger *runtimeLogger) log(ctx context.Context, record LogRecord) error {
 		logger.blocked = true
 		logger.mu.Unlock()
 		return ErrRuntime
+	}
+}
+
+// logStartupFailure writes at most one best-effort startup failure event inside
+// the reserve carved from the original startup deadline. It uses a fresh
+// context that does not inherit external cancellation; the deadline is
+// min(original startup deadline, now+reserve). If the original deadline has
+// already passed, no new window is opened. The event carries only whitelisted
+// categories; Err is classified by Logger and never serialized. A blocked or
+// failed write latches runtimeLogger.blocked, so no second write is attempted.
+func (logger *runtimeLogger) logStartupFailure(budget startupBudget, stage LogStage, ctxErr, failure error) {
+	if logger == nil || budget.reserve <= 0 {
+		return
+	}
+	now := time.Now()
+	if !now.Before(budget.deadline) {
+		return
+	}
+	diagnosticDeadline := now.Add(budget.reserve)
+	if budget.deadline.Before(diagnosticDeadline) {
+		diagnosticDeadline = budget.deadline
+	}
+	diagnosticCtx, cancel := context.WithDeadline(context.Background(), diagnosticDeadline)
+	defer cancel()
+
+	classified := failure
+	if ctxErr != nil {
+		classified = ctxErr
+	}
+	_ = logger.log(diagnosticCtx, LogRecord{
+		Level:  LogLevelError,
+		Event:  LogEventDependency,
+		Stage:  stage,
+		Reason: startupFailureReason(ctxErr),
+		Err:    classified,
+	})
+}
+
+func startupFailureReason(ctxErr error) LogReason {
+	switch {
+	case errors.Is(ctxErr, context.Canceled):
+		return LogReasonCanceled
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+		return LogReasonTimeout
+	default:
+		return LogReasonDependency
 	}
 }
 

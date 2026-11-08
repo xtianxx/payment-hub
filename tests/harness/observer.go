@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,6 +33,16 @@ type ObserverConfig struct {
 type Counts struct {
 	Payment uint64
 	Query   uint64
+}
+
+// ObserverFinalSnapshot is the immutable final observation produced once a
+// successful Observer.Close has drained the listener and all connections.
+type ObserverFinalSnapshot struct {
+	RunID    string
+	Epoch    string
+	Counts   Counts
+	Receipts []testcontrol.Receipt
+	Trusted  bool
 }
 
 type observerGenerationStatus int
@@ -87,6 +98,9 @@ type Observer struct {
 	records     int
 	counts      Counts
 	uncertain   bool
+
+	finalSnapshot ObserverFinalSnapshot
+	finalReady    bool
 }
 
 type Barrier struct {
@@ -712,6 +726,28 @@ func (o *Observer) Seal(generation, expectedLastSeq uint64) (testcontrol.Receipt
 	return receipt, nil
 }
 
+func (o *Observer) Identity() (string, string) {
+	if o == nil {
+		return "", ""
+	}
+	return o.cfg.RunID, o.cfg.Epoch
+}
+
+func (o *Observer) FinalSnapshot() (ObserverFinalSnapshot, bool) {
+	if o == nil {
+		return ObserverFinalSnapshot{}, false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.finalReady {
+		return ObserverFinalSnapshot{}, false
+	}
+	snapshot := o.finalSnapshot
+	snapshot.Receipts = make([]testcontrol.Receipt, len(o.finalSnapshot.Receipts))
+	copy(snapshot.Receipts, o.finalSnapshot.Receipts)
+	return snapshot, true
+}
+
 func (o *Observer) Snapshot() (Counts, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -784,7 +820,37 @@ func (o *Observer) close(ctx context.Context) error {
 	if err := o.removeOwnSocket(); err != nil {
 		return err
 	}
+	o.mu.Lock()
+	o.finalSnapshot = o.buildFinalSnapshotLocked()
+	o.finalReady = true
+	o.mu.Unlock()
 	return nil
+}
+
+func (o *Observer) buildFinalSnapshotLocked() ObserverFinalSnapshot {
+	trusted := !o.uncertain && len(o.generations) > 0
+	receipts := make([]testcontrol.Receipt, 0, len(o.generations))
+	for generation, state := range o.generations {
+		if state.status != observerGenerationSealed {
+			trusted = false
+		}
+		receipts = append(receipts, testcontrol.Receipt{
+			RunID:      o.cfg.RunID,
+			Epoch:      o.cfg.Epoch,
+			Generation: generation,
+			LastSeq:    state.expectedLastSeq,
+		})
+	}
+	sort.Slice(receipts, func(i, j int) bool {
+		return receipts[i].Generation < receipts[j].Generation
+	})
+	return ObserverFinalSnapshot{
+		RunID:    o.cfg.RunID,
+		Epoch:    o.cfg.Epoch,
+		Counts:   o.counts,
+		Receipts: receipts,
+		Trusted:  trusted,
+	}
 }
 
 func (o *Observer) removeOwnSocket() error {

@@ -345,6 +345,22 @@ go test -mod=readonly -tags=integration -race -count=1 -p=1 -timeout=120s ./inte
 
 ## 9. 运行基础批：T018–T022（本机验收）
 
+### PR #3 后续审查修复（本机验收）
+
+独立审查发现旧提交 `0dcb835` 的三个反例：nil/empty显式环境实际继承宿主环境；leader回收后Stop/Wait忽略短截止且未准确记录原因；部分启动失败没有安全诊断。旧CI成功仍是旧场景事实，不能抵消反例或替代修复验证。
+
+本次修复保持nil/empty为真正空环境；leader回收后只缩短观察/排空窗口，不向可能复用的历史PGID发终止信号，观察协程join后才发布终态。启动诊断在原绝对启动截止内预留短窗口，区分dependency/timeout/canceled，不打印底层错误或连接串，不为日志额外增加启动预算。相应测试和行为red/green证据位于 `artifacts/pr3-review-fixes/`；该目录为本机忽略产物，不等于已提交或远端长期归档。
+
+用户进一步批准D1/D2：封口失败不应在已静止后阻断安全关池；最终归档必须使用观察器有界终结后的不可变快照。两项已完成，独立changed-risk源码复核无必修项。D1的旧行为red使用精确修复前源码overlay复现，不把它包装成原实现前的时间顺序证明。D2的旧API组合反例先复现误绿，新FinalSnapshot接口测试则在实现后验证，分别记录，不将缺方法的编译错误当red。
+
+最终所有writer停止后，48个实际Go文件格式检查、全仓vet/race通过：207个包限定根、766个子测试，均无失败或跳过；命令包为no-test-files构建结果。45项工具回归、shell/Python与工作流7个run块静态检查通过。现有两个只读CI job未增删；默认`./...`自动纳入新增回归，原必需`TestApplicationLifecycleIntegration`内同期增加真实二进制启动超时、启动期SIGTERM取消、占用HTTP端口的诊断断言，不仅依赖任意非零退出。
+
+fresh PG run `46181b785ac4429090ee59f5d861c061` 入口退出0，三个必需根均实际PASS。真实启动诊断三场景的执行证据来源为必需根实际PASS和无条件子测试/严格源码断言；启动器仅归档根结果，不声称另有持久化子场景JSON。默认30秒启动耗尽路径本次已实际等待并验证，其他默认写出/退出期限仍不能据此宣称全部等满。独立诊断报告临时读回后清理，外层安全报告保留。
+
+最终安全报告`artifacts/46181b785ac4429090ee59f5d861c061/db-foundation.json`的SHA-256为`bae77e83b37bbe0821c41ed3c3a20733888e581d1b09ea819162cb35cb767777`。61项源码/模块/CI输入摘要为`0762fa70244d9ed1d1cd17bf14b761cff19daaced3068357797acff47cecc6ad`，父逐项重算与工作树一致；模块未变，三表`[0,0,0]`，本次容器/network/volume清理后另行只读查询无残留。接受记录为`artifacts/pr3-review-fixes/final-validation/parent-acceptance.json`。
+
+限制：Seal失败后关池已动态覆盖，TestMode.Close-only失败分支仅源码核对，未另加注入seam。本节记录原功能分支修复的本机验收；本次仅本地提交，不推送，尚无修复后的远端CI结果，旧PR绿灯只证明旧提交。不自动合并或部署，US1继续暂停；D3–D6实现和P3解析重构不在本批范围。
+
 本批已另获实施、隔离验证及新分支 Draft PR 授权；仍不合并、发布或部署。T018–T022 已分两次完成本机合流验收；远端结论须以 Draft PR 精确提交的实际检查为准，不能沿用上一批 main 绿灯。
 
 ### 观察器的可信计数合同

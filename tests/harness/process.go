@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -31,6 +32,11 @@ type ProcessConfig struct {
 	Generation uint64
 	Grace      time.Duration
 	Artifacts  *Artifacts
+
+	// testWatchGroupJoined is a test-only seam invoked after the group watcher
+	// has been joined and before the terminal state is published. It is nil in
+	// normal use.
+	testWatchGroupJoined func()
 }
 
 type Exit struct {
@@ -84,6 +90,8 @@ type Process struct {
 	stdoutRead *os.File
 	stderrRead *os.File
 	collector  *outputCollector
+
+	leaderGone atomic.Bool
 
 	mu     sync.Mutex
 	exit   Exit
@@ -147,7 +155,10 @@ func StartProcess(lifetime context.Context, cfg ProcessConfig) (*Process, error)
 
 	cmd := exec.Command(cfg.Path, cfg.Args...)
 	cmd.Dir = cfg.Dir
-	cmd.Env = append([]string(nil), cfg.Env...)
+	// A nil exec.Cmd.Env inherits the complete host environment. Preserve an
+	// explicit nil/empty request as a non-nil zero-length environment so the
+	// child starts with no ambient variables at all.
+	cmd.Env = append([]string{}, cfg.Env...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 	cmd.Stdout = stdoutWrite
 	cmd.Stderr = stderrWrite
@@ -250,6 +261,9 @@ func (p *Process) waitLeader() {
 	waitErr := p.cmd.Wait()
 	code, signal, reaped := processStateExit(p.cmd.ProcessState)
 	_ = waitErr
+	// Publish the reap before the coordinator event is queued so a Stop that
+	// races with event delivery can never signal the historical PGID.
+	p.leaderGone.Store(true)
 	p.sendEvent(processEvent{kind: processEventLeader, code: code, signal: signal, reaped: reaped})
 }
 
@@ -295,12 +309,15 @@ func (p *Process) coordinator() {
 	leaderCode := 0
 	leaderSignal := 0
 	signalAllowed := true
+	forceNowPending := false
 	forced := false
 	canceled := false
 	timedOut := false
 	outputFault := false
 	groupGone := false
 	groupWatchStarted := false
+	var groupWatchStop chan struct{}
+	var groupWatchDone chan struct{}
 	stdoutEnded := false
 	stderrEnded := false
 	lifetimeC := p.lifetime.Done()
@@ -337,6 +354,14 @@ func (p *Process) coordinator() {
 		if forced || leaderReaped || !signalAllowed {
 			return
 		}
+		if p.leaderGone.Load() {
+			// The leader is reaped but its event has not been consumed yet.
+			// Never signal; the pending event will shorten the observation
+			// window for this already-expired request.
+			graceDeadline = time.Time{}
+			forceNowPending = true
+			return
+		}
 		forced = true
 		if safeProcessGroup(p.pgid) {
 			_ = syscall.Kill(-p.pgid, syscall.SIGKILL)
@@ -350,10 +375,9 @@ func (p *Process) coordinator() {
 			return
 		}
 		groupWatchStarted = true
-		if forceDeadline.IsZero() {
-			forceDeadline = time.Now().Add(processReapBudget)
-		}
-		go p.watchGroup(forceDeadline)
+		groupWatchStop = make(chan struct{})
+		groupWatchDone = make(chan struct{})
+		go p.watchGroup(groupWatchStop, groupWatchDone)
 	}
 	terminal := func() bool {
 		return leaderReaped && stdoutEnded && stderrEnded && groupGone
@@ -384,6 +408,15 @@ func (p *Process) coordinator() {
 		p.exit = exit
 		p.err = err
 		p.mu.Unlock()
+		if groupWatchStop != nil {
+			close(groupWatchStop)
+		}
+		if groupWatchDone != nil {
+			<-groupWatchDone
+		}
+		if p.cfg.testWatchGroupJoined != nil {
+			p.cfg.testWatchGroupJoined()
+		}
 		close(p.terminal)
 		p.cancel()
 	}
@@ -394,9 +427,6 @@ func (p *Process) coordinator() {
 		case event := <-p.events:
 			switch event.kind {
 			case processEventStop:
-				if leaderReaped && !stopRequested {
-					break
-				}
 				if event.canceled {
 					canceled = true
 				}
@@ -405,13 +435,33 @@ func (p *Process) coordinator() {
 				}
 				if !stopRequested {
 					stopRequested = true
-					if signalAllowed && safeProcessGroup(p.pgid) {
+					if signalAllowed && !p.leaderGone.Load() && safeProcessGroup(p.pgid) {
 						_ = syscall.Kill(-p.pgid, syscall.SIGTERM)
 					}
 					graceDeadline = time.Now().Add(p.grace)
 				}
 				if event.forceNow && (graceDeadline.IsZero() || time.Now().Before(graceDeadline)) {
 					graceDeadline = time.Now()
+				}
+				if leaderReaped {
+					// The leader is already reaped, so its PGID may have been
+					// reused by another process. Never signal it; a caller
+					// deadline or cancellation shortens the remaining
+					// observation window instead.
+					if event.forceNow {
+						forceDeadline = time.Now()
+					}
+					break
+				}
+				if p.leaderGone.Load() {
+					// The reap happened but the coordinator has not consumed the
+					// leader event yet. Never signal; remember an expired caller
+					// window so the event can shorten the observation deadline.
+					if event.forceNow {
+						forceNowPending = true
+						graceDeadline = time.Time{}
+					}
+					break
 				}
 				if !graceDeadline.IsZero() && !time.Now().Before(graceDeadline) {
 					enterForce()
@@ -422,7 +472,10 @@ func (p *Process) coordinator() {
 					leaderCode = event.code
 					leaderSignal = event.signal
 					signalAllowed = false
-					if forceDeadline.IsZero() {
+					if forceNowPending {
+						forceNowPending = false
+						forceDeadline = time.Now()
+					} else if forceDeadline.IsZero() {
 						forceDeadline = time.Now().Add(processReapBudget)
 					}
 					startGroupWatch()
@@ -441,29 +494,39 @@ func (p *Process) coordinator() {
 			outputFault = true
 			if !stopRequested && !leaderReaped {
 				stopRequested = true
-				if signalAllowed && safeProcessGroup(p.pgid) {
+				if signalAllowed && !p.leaderGone.Load() && safeProcessGroup(p.pgid) {
 					_ = syscall.Kill(-p.pgid, syscall.SIGTERM)
 				}
 				graceDeadline = time.Now().Add(p.grace)
 			}
 		case <-lifetimeC:
 			lifetimeC = nil
-			if !leaderReaped {
-				if errors.Is(p.lifetime.Err(), context.DeadlineExceeded) {
-					timedOut = true
-				} else if errors.Is(p.lifetime.Err(), context.Canceled) {
-					canceled = true
-				}
-				if !stopRequested {
-					stopRequested = true
-					if signalAllowed && safeProcessGroup(p.pgid) {
-						_ = syscall.Kill(-p.pgid, syscall.SIGTERM)
-					}
-					graceDeadline = time.Now().Add(p.grace)
+			if errors.Is(p.lifetime.Err(), context.DeadlineExceeded) {
+				timedOut = true
+			} else if errors.Is(p.lifetime.Err(), context.Canceled) {
+				canceled = true
+			}
+			if leaderReaped || p.leaderGone.Load() {
+				// No signal may be sent once the leader is reaped. Bound the
+				// remaining observation window immediately, or as soon as the
+				// pending leader event is consumed.
+				if leaderReaped {
+					forceDeadline = time.Now()
 				} else {
-					graceDeadline = time.Now()
-					enterForce()
+					forceNowPending = true
+					graceDeadline = time.Time{}
 				}
+				break
+			}
+			if !stopRequested {
+				stopRequested = true
+				if signalAllowed && !p.leaderGone.Load() && safeProcessGroup(p.pgid) {
+					_ = syscall.Kill(-p.pgid, syscall.SIGTERM)
+				}
+				graceDeadline = time.Now().Add(p.grace)
+			} else {
+				graceDeadline = time.Now()
+				enterForce()
 			}
 		case <-timerC:
 			if stopRequested && !forced && !leaderReaped && !graceDeadline.IsZero() &&
@@ -482,24 +545,37 @@ func (p *Process) coordinator() {
 	}
 }
 
-func (p *Process) watchGroup(deadline time.Time) {
+func (p *Process) watchGroup(stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	send := func(event processEvent) {
+		// The coordinator joins this watcher before publishing the terminal
+		// state, so a full event channel must not be able to deadlock the
+		// join. The stop notification is an independent exit path.
+		select {
+		case p.events <- event:
+		case <-stop:
+		case <-p.terminal:
+		}
+	}
 	pgid := p.pgid
 	if !safeProcessGroup(pgid) {
-		p.sendEvent(processEvent{kind: processEventGroupGone})
+		send(processEvent{kind: processEventGroupGone})
 		return
 	}
 	delay := 5 * time.Millisecond
 	for {
 		err := syscall.Kill(-pgid, 0)
 		if errors.Is(err, syscall.ESRCH) {
-			p.sendEvent(processEvent{kind: processEventGroupGone, gone: true})
+			send(processEvent{kind: processEventGroupGone, gone: true})
 			return
 		}
-		if !time.Now().Before(deadline) {
-			p.sendEvent(processEvent{kind: processEventGroupGone})
+		timer := time.NewTimer(delay)
+		select {
+		case <-stop:
+			timer.Stop()
 			return
+		case <-timer.C:
 		}
-		time.Sleep(delay)
 		if delay < 50*time.Millisecond {
 			delay *= 2
 		}

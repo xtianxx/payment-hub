@@ -155,6 +155,12 @@ func TestHarnessProcessPreservesParentStateIntegration(t *testing.T) {
 	if err := artifacts.RecordObserver(observer); err != nil {
 		t.Fatal("t020 integration record observer failed")
 	}
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), commitHookTestCleanupBudget)
+	closeErr := observer.Close(closeCtx)
+	cancelClose()
+	if closeErr != nil {
+		t.Fatal("t020 integration observer close failed")
+	}
 	path, err := artifacts.Finish()
 	if err != nil {
 		t.Fatal("t020 integration finish artifacts failed")

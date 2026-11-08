@@ -868,6 +868,9 @@ func TestArtifactsReportShapeAndValidRecords(t *testing.T) {
 	if err := artifacts.RecordObserver(h.obs); err != nil {
 		t.Fatal("record valid t020 observer failed")
 	}
+	if err := h.close(); err != nil {
+		t.Fatal("close valid t020 observer failed")
+	}
 
 	path, err := artifacts.Finish()
 	if err != nil {
@@ -1935,6 +1938,9 @@ func TestProcessObserverAcrossGenerations(t *testing.T) {
 
 	if err := artifacts.RecordObserver(h.obs); err != nil {
 		t.Fatal("record t020 parent observer failed")
+	}
+	if err := h.close(); err != nil {
+		t.Fatal("close t020 parent observer failed")
 	}
 	path, err := artifacts.Finish()
 	if err != nil {

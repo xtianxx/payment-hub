@@ -844,6 +844,9 @@ func TestLifecycleObserverBinding(t *testing.T) {
 		if err := h.obs.Expect(2); err != nil {
 			t.Fatal("expect later t020 observer generation failed")
 		}
+		if err := h.close(); err != nil {
+			t.Fatal("close unclosed t020 observer failed")
+		}
 		path, err := artifacts.Finish()
 		if !errors.Is(err, ErrArtifacts) {
 			t.Fatal("finish accepted an unclosed later observer generation")
