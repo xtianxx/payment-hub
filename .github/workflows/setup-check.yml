@@ -8,6 +8,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -30,11 +34,12 @@ jobs:
         run: |
           set -euo pipefail
           base="$RUNNER_TEMP/payment-hub-setup"
-          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp"
           export XDG_CONFIG_HOME="$base/config"
           export GOPATH="$base/gopath"
           export GOMODCACHE="$base/gomod"
           export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
 
           if ! command -v go >/dev/null 2>&1; then
             echo "::error::runner-provided Go is missing; setup check cannot continue"
@@ -50,6 +55,7 @@ jobs:
             echo "GOPATH=$GOPATH"
             echo "GOMODCACHE=$GOMODCACHE"
             echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
           } >> "$GITHUB_ENV"
 
       - name: Check out repository
@@ -103,45 +109,68 @@ jobs:
             exit 1
           fi
           go vet -mod=readonly -p=1 ./...
-          go test -mod=readonly -race -count=1 -p=1 -timeout=90s ./...
+          status=0
+          python3 -B scripts/ci_checks.py run-default --go "$(command -v go)" --report-dir "$RUNNER_TEMP/payment-hub-setup/reports" || status=$?
           {
             echo "## Foundation unit checks / 基础包单元检查"
             echo ""
-            echo "所有已跟踪 Go 文件已通过 gofmt；默认非 integration 包（./...）已通过 go vet 与带 race 的单元测试；Gin 使用内存路由，不启动监听服务。"
-            echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture 与迁移工具镜像由 database-foundation job 验收；完整支付/HTTP、应用进程重启或应用镜像不在本步骤，也不由该 job 验收，仍待后续 T072/T077。"
+            echo "所有已跟踪 Go 文件已通过 gofmt，默认非 integration 包（./...）已通过 go vet。scripts/ci_checks.py run-default 执行带 race、-count=1、-p=1、-timeout=90s 的 go test -json，覆盖真实私有 UDS、readyz/lifecycle 与短真实连接语义、显式空 Env 子进程隔离、leader 退出后的 Stop/Wait/lifetime 期限、有界且脱敏的启动诊断日志、Seal 失败后继续安全释放资源，以及只归档不可变终结 Observer 快照。"
+            echo "该 helper 只按完整 Package/Test/Action 判定：26 个显式 PR3 默认根必须全部 pass；缺失、skip、fail、重复或错包均不能为绿，cmd 包无测试文件单列为 no-test-files 而非静默通过。run-default-exit-code: $status（0 才表示该默认门禁通过）。"
+            echo "这些是 unit/默认包结果，不代表支付 HTTP、业务重启防重、应用镜像、默认全时长实测或完整 MVP 已验收。"
+            echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture、迁移工具镜像、必需 commit-hook 提交实验、工具 helper 两代父 Observer/真实 PG 保留，以及当前应用二进制 readyz/SIGTERM/坏配置/缺迁移启动失败与 startup 超时/取消/监听失败诊断，由 database-foundation job 在实际执行时逐项核对；完整支付 HTTP、业务重启防重、应用镜像、完整 MVP/T072/T077/CD 不在本步骤，也不由该 job 验收。"
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
       - name: Check launcher syntax and safety regressions
         shell: bash
         run: |
           set -euo pipefail
-          missing=0
           if [[ ! -f deploy/goose-entrypoint.sh ]]; then
             echo "::error::deploy/goose-entrypoint.sh is missing; static shell check cannot run"
-            missing=1
-          fi
-          if [[ ! -f scripts/check-db-foundation.py ]]; then
-            echo "::error::scripts/check-db-foundation.py is missing; AST syntax check cannot run"
-            missing=1
-          fi
-          if [[ ! -f scripts/test_check_db_foundation.py ]]; then
-            echo "::error::scripts/test_check_db_foundation.py is missing; launcher safety regressions cannot run"
-            missing=1
-          fi
-          if [[ "$missing" -ne 0 ]]; then
             exit 1
           fi
           sh -n deploy/goose-entrypoint.sh
           echo "deploy/goose-entrypoint.sh: sh -n passed"
-          python3 -B -c 'import ast, pathlib; path = pathlib.Path("scripts/check-db-foundation.py"); ast.parse(path.read_text(encoding="utf-8"), filename=str(path))'
-          echo "scripts/check-db-foundation.py: AST parse passed"
-          python3 -B -c 'import ast, pathlib; path = pathlib.Path("scripts/test_check_db_foundation.py"); ast.parse(path.read_text(encoding="utf-8"), filename=str(path))'
-          echo "scripts/test_check_db_foundation.py: AST parse passed"
+          python3 -B - <<'PY'
+          import ast
+          import pathlib
+          import sys
+
+          paths = sorted(pathlib.Path("scripts").glob("*.py"))
+          if not paths:
+              print("::error::no scripts/*.py files found; AST checks cannot run", file=sys.stderr)
+              raise SystemExit(1)
+          for path in paths:
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+              print(f"{path}: AST parse passed")
+          PY
           echo "launcher safety regressions: stdlib unittest/mock only; no real PostgreSQL, Docker, or network."
-          python3 -B scripts/test_check_db_foundation.py
+          python3 -B -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Export safe setup reports
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/ci_checks.py export-reports \
+            --report-dir "$RUNNER_TEMP/payment-hub-setup/reports" \
+            --db-artifact-root "$RUNNER_TEMP/payment-hub-setup/unused-db" \
+            --expect default
+
+      - name: Upload safe setup reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: setup-check-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/payment-hub-setup/reports/upload/go-default.safe.json
+            ${{ runner.temp }}/payment-hub-setup/reports/upload/provenance.json
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false
 
   database-foundation:
-    name: PostgreSQL migration and constraints (linux/amd64)
+    name: PostgreSQL migration, constraints, and runtime harness (linux/amd64)
     needs: setup-check
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -210,6 +239,18 @@ jobs:
           printf '%s\n' "$status" > "$status_file"
           exit "$status"
 
+      - name: Verify cancellation cleanup with real PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "cancellation-check: one SIGTERM to this run's healthy launcher; not a runner cancellation or hard-kill test"
+          python3 -B scripts/check-ci-cancellation.py \
+            --go "$(command -v go)" \
+            --cache-dir "$RUNNER_TEMP/payment-hub-db" \
+            --artifact-root "$RUNNER_TEMP/payment-hub-db/cancellation-artifacts" \
+            --report-dir "$RUNNER_TEMP/payment-hub-db/reports" \
+            --prepare-images
+
       - name: Summarize database foundation results
         if: always()
         shell: bash
@@ -221,7 +262,7 @@ jobs:
             echo "## Database foundation checks / 数据库基础检查"
             echo ""
             echo "本摘要来自安全启动器的固定前缀输出；launcher-exit-code 为 0 才表示启动器自身成功，非零失败不会被摘要掩盖。"
-            echo "本 job 仅覆盖 T012–T017 的真实 PostgreSQL 迁移与约束范围，不代表完整 MVP、T072、T077、发布或部署已完成。"
+            echo "本 job 覆盖数据库约束与已接线的 runtime harness integration；四个必需 integration 项为 TestCommitHookIntegrationHidesReplyAfterRealCommit、TestHarnessProcessPreservesParentStateIntegration、TestApplicationLifecycleIntegration 与显式子测试 TestApplicationLifecycleIntegration/startup_diagnostics，由启动器实际执行时逐项核对。不包含支付 HTTP、业务重启防重、应用镜像、完整 MVP、T072、T077、CD、发布或部署。"
             echo ""
             echo '```text'
             if [[ -f "$status_file" ]]; then
@@ -230,11 +271,192 @@ jobs:
               echo "launcher-exit-code: missing (launcher step did not complete)"
             fi
             if [[ -f "$log" ]]; then
-              grep -E '^(scope|run-id|result|go-version|postgres-version|goose-version|package-result|cleanup-result|artifact-report):' "$log" || true
+              grep -E '^(scope|run-id|result|go-version|postgres-version|goose-version|package-result|required-test-result|cleanup-result|artifact-report):' "$log" || true
             else
               echo "launcher-log: missing (launcher did not produce a tee log)"
             fi
             echo '```'
             echo ""
-            echo "完整白名单报告以 db-foundation-report 前缀保留在本次 run 日志中，供后续提取；本 job 不上传 artifact，也不声称 runner 临时文件或 30 天保留策略已完成。"
+            echo "取消清理验收由 scripts/check-ci-cancellation.py 在正常 PG 入口成功后运行，报告写入 $RUNNER_TEMP/payment-hub-db/reports/cancellation-report.json，artifact 根为独立的 $RUNNER_TEMP/payment-hub-db/cancellation-artifacts，与正常 PG 的 $RUNNER_TEMP/payment-hub-db/artifacts 分开。该步骤仅在本次 PostgreSQL 已 healthy、启动器存活且报告尚未完成时，向启动器 Python PID 发一次 SIGTERM，核对 interrupted/sigterm、cleanup 与本次容器/network/volume 消失及预存资源保留；它不是 runner 取消测试，不证明 runner 硬杀后的清理，也不证明 Go 测试孙应用进程独立进程组的取消清理。脚本的 run_check 预算为 ready 180s / exit 120s / total 360s；Docker preflight 最多 30s，final report 5s，仅作为调度余量，不把整个进程入口声称严格 360s。"
+            if [[ -f "$RUNNER_TEMP/payment-hub-db/reports/cancellation-report.json" ]]; then
+              echo "cancellation-report: present"
+            else
+              echo "cancellation-report: missing (normal PG failed, step skipped, or report not written)"
+            fi
+            echo "安全归档由 scripts/ci_checks.py export-reports 仅从白名单字段重建 db-foundation.safe.json、cancellation.safe.json 与 provenance.json，并上传这三个固定文件；不递归复制 artifacts 目录，不包含原始 launcher 日志、环境或任意报告内容。"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Export safe database reports
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/ci_checks.py export-reports \
+            --report-dir "$RUNNER_TEMP/payment-hub-db/reports" \
+            --db-artifact-root "$RUNNER_TEMP/payment-hub-db/artifacts" \
+            --expect db,cancellation
+
+      - name: Upload safe database reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: database-foundation-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/payment-hub-db/reports/upload/db-foundation.safe.json
+            ${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json
+            ${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false
+
+  vulnerability-check:
+    name: Vulnerability scan (linux/amd64, read-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Isolate vulnerability Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-vulnerability"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp" "$base/tools" "$base/reports"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; vulnerability scan cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.3
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          check-latest: false
+          cache: false
+
+      - name: Run pinned vulnerability scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "vulnerability-scan: source/symbol/integration/test; test participation does not equal production exposure"
+          python3 -B scripts/check-vulnerabilities.py \
+            --go "$(command -v go)" \
+            --cache-dir "$RUNNER_TEMP/payment-hub-vulnerability" \
+            --tool-dir "$RUNNER_TEMP/payment-hub-vulnerability/tools" \
+            --artifact-root "$RUNNER_TEMP/payment-hub-vulnerability/reports" \
+            --prepare-tool
+
+      - name: Summarize vulnerability scan results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/payment-hub-vulnerability/reports/vulnerability-report.json"
+          {
+            echo "## Vulnerability scan / 漏洞扫描"
+            echo ""
+            echo "本 job 为独立只读扫描，不依赖 setup-check/database-foundation，也不运行应用、PostgreSQL、Docker 或发布步骤；Go 配置/缓存/工具/报告均在 $RUNNER_TEMP/payment-hub-vulnerability。固定 govulncheck v1.9.0 由 scripts/check-vulnerabilities.py 控制，使用 source/symbol/integration/test 模式、CGO_ENABLED=1、linux/amd64，并通过 HTTPS 获取漏洞库；test 参与扫描不等同于 production exposure。"
+            echo "退出码语义：0=无 symbol 可达 GO-ID；1=存在可达 GO-ID（阻断）；2=工具、网络、协议或配置失败。是否阻断仅以本次实际报告与退出码为准；此前本机发现不替代本次结果。不会把 vulnerable 改成 warning，也不会自动升级依赖。"
+            echo "扫描报告只写入 $RUNNER_TEMP/payment-hub-vulnerability/reports/vulnerability-report.json；安全导出只保留白名单字段，不上传原始日志或任意报告内容。"
+            if [[ -f "$report" ]]; then
+              python3 -B - "$report" <<'PY' || echo "reportinvalid"
+          import ast
+          import json
+          import pathlib
+          import sys
+
+          try:
+              script = pathlib.Path("scripts/check-vulnerabilities.py")
+              tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+              allowed = None
+              for node in tree.body:
+                  if isinstance(node, ast.Assign) and any(
+                      isinstance(target, ast.Name) and target.id == "FAILURE_CLASSES"
+                      for target in node.targets
+                  ):
+                      allowed = ast.literal_eval(node.value)
+                      break
+              if not isinstance(allowed, set) or not all(
+                  isinstance(value, str) for value in allowed
+              ):
+                  raise SystemExit(2)
+
+              data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+              result = data.get("result")
+              reachable = data.get("reachable_count")
+              unreachable = data.get("unreachable_count")
+              failure = data.get("failure_class")
+
+              if result not in {"pass", "vulnerable", "failure"}:
+                  raise SystemExit(2)
+              if result == "failure" and failure is None:
+                  raise SystemExit(2)
+              if result in {"pass", "vulnerable"} and failure is not None:
+                  raise SystemExit(2)
+              if type(reachable) is not int or reachable < 0:
+                  raise SystemExit(2)
+              if type(unreachable) is not int or unreachable < 0:
+                  raise SystemExit(2)
+              if result == "pass" and reachable != 0:
+                  raise SystemExit(2)
+              if result == "vulnerable" and reachable == 0:
+                  raise SystemExit(2)
+              if failure is not None and failure not in allowed:
+                  raise SystemExit(2)
+
+              print(f"vulnerability-result: {result}")
+              print(f"reachable-count: {reachable}")
+              print(f"unreachable-count: {unreachable}")
+              print(f"error-class: {failure if failure is not None else 'none'}")
+          except Exception:
+              raise SystemExit(2)
+          PY
+            else
+              echo "vulnerability-report: missing (scan did not write a report)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Export safe vulnerability report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/ci_checks.py export-reports \
+            --report-dir "$RUNNER_TEMP/payment-hub-vulnerability/reports" \
+            --db-artifact-root "$RUNNER_TEMP/payment-hub-vulnerability/unused-db" \
+            --expect vulnerability
+
+      - name: Upload safe vulnerability reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vulnerability-check-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/payment-hub-vulnerability/reports/upload/vulnerability.safe.json
+            ${{ runner.temp }}/payment-hub-vulnerability/reports/upload/provenance.json
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false

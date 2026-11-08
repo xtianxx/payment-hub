@@ -26,3 +26,5 @@ vendor/
 Thumbs.db
 *.tmp
 *.swp
+
+.slim/deepwork/
