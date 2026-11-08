@@ -2,7 +2,7 @@
 
 **Status**: Partial — 准备态、基础包及T012–T017数据库基础已实现并通过本机验证；可执行的局部入口见0.1。完整应用/HTTP/重启/发布流程仍是草案，不可据此宣称MVP可运行。
 
-**Date**: 2026-11-07
+**Date**: 2026-11-08
 
 **依据**: [plan.md](plan.md)、[spec.md](spec.md)、[data-model.md](data-model.md)、[HTTP 合同](contracts/http-api.md)。
 
@@ -18,9 +18,9 @@
 - 配置、命令输出和归档都不得泄露密钥、`Authorization`、带凭据的连接串或全部环境变量。只使用已校验的关联标识，时间按计划统一 UTC。
 - 应用宿主访问默认仅为 `127.0.0.1:8080`；演示数据库不发布宿主端口。测试数据库确需供宿主访问时，仅使用隔离的回环地址测试端口。
 - 真实镜像部署须先取得已验证的一对应用、迁移镜像摘要，核实来源、平台与拉取权限；不得只凭标签或源码测试绿灯选用另一份产物。
-- 正式业务验收或故障实验开始前，建立独立 `artifacts/<run_id>/` 采集及必要观察器，记录本次源码或镜像身份、版本、环境和预算；采集跨应用重启保持。当前数据库基础入口已有独立白名单报告，但尚无观察器或应用重启采集。
+- 正式业务验收或故障实验开始前，建立独立 `artifacts/<run_id>/` 采集及必要观察器，记录本次源码或镜像身份、版本、环境和预算；采集跨应用重启保持。当前入口已有白名单报告、可信观察器与真实进程夹具；观察器附件须在 Seal 后显式有界 Close，再由 Finish 消费不可变最终快照。工具两代进程实验不等于支付业务重启防重验收。
 
-### 0.1 当前可执行：仅验证数据库基础
+### 0.1 当前可执行：数据库与运行基础验证
 
 已有Go1.27.3、C编译器、Python3、本地Docker unix daemon及Compose后，从仓库根运行。以下工具链/缓存路径对应已核实的本机准备，不授权在其他机器自动安装；其他机器传入已准备Go的绝对路径与仓库外缓存路径。`/tmp/opencode` 为本机已存在的临时目录，其他环境可使用其受控临时目录。
 
@@ -32,13 +32,19 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
   --artifact-root "$PWD/artifacts"
 ```
 
-- 范围：验证固定迁移工具镜像、安全入口、隔离PG16.15、两次显式迁移、三表约束与事务夹具；只运行显式integration三包的vet/race，不启动支付应用或HTTP服务。
+- 范围：验证固定迁移工具镜像、安全入口、隔离PG16.15、两次显式迁移、三表约束与事务夹具；显式integration三包的vet/race还实际运行私有观察器、helper和当前应用二进制，核对回环readyz/SIGTERM、坏配置/缺迁移及启动超时/取消/端口占用诊断。当前仅readyz，没有支付提交或查询HTTP入口。
 - `--prepare-images` 明确允许缺失的固定镜像下载/构建；上述命令不下载应用模块。确需补齐模块缓存且已取得许可时另加 `--download-modules`；Goose不进入应用module。工具缺失或版本不符直接失败，不降级工具链或数据库。
 - 每轮新建独立项目/测试数据库/卷，Docker分配仅回环的随机端口。只有显式清理开关且重新核对归属后才删除本次卷，不碰开发/演示资源；省略开关则普通停止保留卷，不使用 `down -v`。
 - stdout提供固定安全摘要，完整报告在 `artifacts/<run_id>/db-foundation.json`，默认保留且不入Git；连接值只注入子进程，原Goose输出在容器内丢弃。日志/报告不包含凭据、原SQL或业务整行。
-- 本机通过轮 `a5daed57a2ce449f81b19443b3d44555` 退出0，迁移版本1/2/3、三个integration包和夹具清理断言通过；前一轮Compose配置传递故障退出1并留证、补回归后修正，不把环境失败算SQL约束命中。远端本次CI须另行核对，不沿用旧run。
+- 审查修复后的本机通过轮 `46181b785ac4429090ee59f5d861c061` 退出0，迁移版本1/2/3、三个必需integration根及夹具/本次资源清理断言通过；该报告只适用于其61项输入快照，不替代后续CI脚本变更的验证。较早轮的Compose配置故障属于环境失败，不算SQL约束命中。远端须另核对精确提交和实际checkout，不沿用旧run。
 
-默认包gofmt/vet/race和21项启动器mock回归也已通过；mock回归会进入CI，但不代替真实数据库。完整T072/T077、应用镜像、付款流程和发布/CD尚未完成。
+默认包包含环境隔离、进程截止、启动诊断、安全释放和最终归档回归。六项CI加固最终本地验收：结构化默认入口207根/766子测试、26必需根通过；fresh PG run `a4c68b228dfe45d691b5f0f1ac8c57d2` 的4项必需integration结果通过，67项输入执行前后稳定。当前入口用`go test -json`绑定完整Package/Test/Action，不能以输出文本或错包同名替代。
+
+工具回归在CI由 `python3 -B -m unittest discover -s scripts -p 'test_*.py'` 执行，本轮234项通过；mock不代替真实数据库。真实取消验收仅证明PG健康阶段向仍运行launcher发单次SIGTERM后的本次资源清理，不证明Go孙进程或runner硬杀清理；并发仍为`cancel-in-progress: false`。
+
+升级前固定govulncheck v1.9.0扫描发现7个可达ID并退出1，旧红灯保留于`artifacts/ci-hardening/final-validation/`。另获授权后已最小升级quic-go/x/net/x/text及必要闭包，Go1.27.3、Gin、pgx不变；最终同配置source/symbol/integration/test、CGO1扫描退出0，可达0、不可达3。测试参与不等于生产暴露，扫描通过也不保证所有依赖绝对无漏洞。
+
+整改后重新执行默认207根/766子测试及fresh PG run `7c89aa039bcc4149834b1004774c6354` 的4项必需结果均通过，证据在`artifacts/dependency-remediation/final-validation/`。新模块未重跑取消，不能混用旧报告冒充完整远端job。只归档重建的白名单JSON与provenance，不上传原始日志；没有执行远端Actions/实际上传或提交、推送、合并。完整T072/T077、应用镜像、付款流程和发布/CD尚未完成，US1仍暂停。
 
 ## 1. 启动数据库
 
