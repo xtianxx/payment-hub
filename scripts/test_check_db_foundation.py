@@ -6,7 +6,10 @@ directories (TMPDIR when set); they are not database acceptance evidence.
 """
 
 import argparse
+import ast
 import json
+import math
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -15,6 +18,11 @@ from pathlib import Path
 from unittest import mock
 
 import importlib.util
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - the CI image provides PyYAML
+    yaml = None
 
 REPO = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location(
@@ -165,6 +173,25 @@ class FakeProcess:
 
     def wait(self, timeout=None):
         return 0
+
+
+class SuccessProcess:
+    """A successful process group whose communicate returns normally."""
+
+    def __init__(self, stdout="", stderr="", pid=34567, returncode=0):
+        self.pid = pid
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+
+    def communicate(self, timeout=None):
+        return self._stdout, self._stderr
+
+    def kill(self):
+        return None
+
+    def wait(self, timeout=None):
+        return self.returncode
 
 
 class PartialOutputProcess:
@@ -1040,22 +1067,68 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.assertEqual(fake.failure["stage"], "interrupted")
         self.assertEqual(fake.failure["kind"], "sigterm")
 
-    def test_go_test_external_budget_covers_cold_build_and_each_package(self):
+    def test_go_test_external_budget_is_one_shared_batch_constant(self):
         budget = MOD.BUDGETS["go_test_external_seconds"]
-        self.assertEqual(budget, 180 + len(MOD.PACKAGES) * 120 + 30)
+        self.assertEqual(budget, CI_MOD.GO_TEST_BATCH_TIMEOUT_SECONDS)
         self.assertEqual(budget, 570)
+        self.assertEqual(MOD.GO_TEST_PACKAGE_TIMEOUT_SECONDS, 120)
+        for removed in (
+            "GO_TEST_EXTERNAL_TIMEOUT_SECONDS",
+            "GO_TEST_COLD_BUILD_MARGIN_SECONDS",
+            "GO_TEST_FINALIZE_MARGIN_SECONDS",
+        ):
+            self.assertFalse(hasattr(MOD, removed), removed)
 
-    def test_go_test_external_budget_scales_per_package_without_drift(self):
+    def test_shared_batch_grants_no_per_package_exclusive_quota(self):
         budget = MOD.BUDGETS["go_test_external_seconds"]
-        per_package = 120
-        fixed_margin = budget - len(MOD.PACKAGES) * per_package
-        self.assertEqual(fixed_margin, 180 + 30)
-        self.assertEqual(
-            fixed_margin + (len(MOD.PACKAGES) + 1) * per_package,
-            budget + per_package,
-        )
+        inner = MOD.GO_TEST_PACKAGE_TIMEOUT_SECONDS
+        # The shared 570-second batch is not divided into per-package
+        # reservations: build, link, and serial test execution consume it
+        # together. 3 * 120 remains only a capacity-planning reference, not a
+        # guaranteed per-package quota or a fixed cold-build/finalize margin.
+        self.assertEqual(budget, 570)
+        self.assertEqual(inner, 120)
+        self.assertGreater(budget, inner)
 
-    def test_run_tests_keeps_package_timeout_and_derived_outer_budget(self):
+    def test_budget_source_uses_shared_constant_not_local_formula(self):
+        source_path = Path(MOD.__file__).resolve()
+        tree = ast.parse(
+            source_path.read_text(encoding="utf-8"), filename=str(source_path)
+        )
+        budgets_value = None
+        package_timeout_value = None
+        removed_assignments = set()
+        removed_names = {
+            "GO_TEST_EXTERNAL_TIMEOUT_SECONDS",
+            "GO_TEST_COLD_BUILD_MARGIN_SECONDS",
+            "GO_TEST_FINALIZE_MARGIN_SECONDS",
+        }
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if target.id == "BUDGETS":
+                    budgets_value = node.value
+                elif target.id == "GO_TEST_PACKAGE_TIMEOUT_SECONDS":
+                    package_timeout_value = node.value
+                elif target.id in removed_names:
+                    removed_assignments.add(target.id)
+        self.assertIsInstance(budgets_value, ast.Dict)
+        external_value = None
+        for key, value in zip(budgets_value.keys, budgets_value.values):
+            if isinstance(key, ast.Constant) and key.value == "go_test_external_seconds":
+                external_value = value
+        self.assertIsInstance(external_value, ast.Attribute)
+        self.assertIsInstance(external_value.value, ast.Name)
+        self.assertEqual(external_value.value.id, "ci_checks")
+        self.assertEqual(external_value.attr, "GO_TEST_BATCH_TIMEOUT_SECONDS")
+        self.assertIsNotNone(package_timeout_value)
+        self.assertEqual(ast.literal_eval(package_timeout_value), 120)
+        self.assertEqual(removed_assignments, set())
+
+    def test_run_tests_keeps_inner_timeout_and_shared_batch_outer_budget(self):
         self.launcher.published_port = 54321
         self.launcher._run_process_group = mock.Mock(
             side_effect=[
@@ -1070,17 +1143,125 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         )
         self.launcher.run_tests()
         test_call = self.launcher._run_process_group.call_args_list[1]
+        self.assertEqual(test_call.args[2], "go test integration")
         argv = test_call.args[3]
         outer_timeout = test_call.args[5]
         self.assertIn("-timeout=120s", argv)
+        self.assertNotIn("-timeout=570s", argv)
         for flag in ("-race", "-count=1", "-p=1", "-json"):
             self.assertIn(flag, argv)
-        self.assertEqual(
-            outer_timeout,
-            180 + len(MOD.PACKAGES) * 120 + 30,
-        )
+        self.assertEqual(outer_timeout, 570)
+        self.assertEqual(outer_timeout, CI_MOD.GO_TEST_BATCH_TIMEOUT_SECONDS)
         self.assertEqual(outer_timeout, MOD.BUDGETS["go_test_external_seconds"])
         self.assertEqual(self.launcher.tests["test_exit"], 0)
+
+    def test_successful_go_test_records_real_supervision_metadata(self):
+        stdout = PACKAGE_OK_OUTPUT + all_required_pass_output()
+        fake = SuccessProcess(stdout)
+        with mock.patch.object(MOD.subprocess, "Popen", return_value=fake):
+            result = self.launcher._run_process_group(
+                "test",
+                "test",
+                "go test integration",
+                ["go", "test"],
+                {},
+                570,
+            )
+        parsed = self.launcher._parse_go_test_results(
+            result.stdout or "", result.stderr or "", result.returncode
+        )
+        self.launcher._record_go_test_results(parsed, result.returncode)
+        supervision = self.launcher.tests.get("test_supervision")
+        self.assertIsInstance(supervision, dict)
+        self.assertEqual(
+            set(supervision),
+            {"timeout_seconds", "wait_elapsed_seconds", "timed_out"},
+        )
+        self.assertEqual(supervision["timeout_seconds"], 570)
+        self.assertIs(type(supervision["timeout_seconds"]), float)
+        self.assertIs(type(supervision["wait_elapsed_seconds"]), float)
+        self.assertTrue(math.isfinite(supervision["timeout_seconds"]))
+        self.assertTrue(math.isfinite(supervision["wait_elapsed_seconds"]))
+        self.assertGreaterEqual(supervision["wait_elapsed_seconds"], 0)
+        self.assertIs(supervision["timed_out"], False)
+        record = self.launcher.commands[-1]
+        self.assertEqual(record["name"], "go test integration")
+        self.assertEqual(
+            supervision["timeout_seconds"], record["timeout_seconds"]
+        )
+        self.assertEqual(
+            supervision["wait_elapsed_seconds"], record["duration_seconds"]
+        )
+        self.assertEqual(supervision["timed_out"], record["timed_out"])
+        encoded = json.dumps(supervision, sort_keys=True)
+        for forbidden in ("argv", "commands", "Output", "stderr"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_supervision_does_not_override_cleanup_gate(self):
+        stdout = PACKAGE_OK_OUTPUT + all_required_pass_output()
+        with mock.patch.object(
+            MOD.subprocess, "Popen", return_value=SuccessProcess(stdout)
+        ):
+            result = self.launcher._run_process_group(
+                "test",
+                "test",
+                "go test integration",
+                ["go", "test"],
+                {},
+                570,
+            )
+        parsed = self.launcher._parse_go_test_results(
+            result.stdout or "", result.stderr or "", result.returncode
+        )
+        self.launcher._record_go_test_results(parsed, result.returncode)
+        self.assertIn("test_supervision", self.launcher.tests)
+        self.launcher.cleanup_failures.append("test:reap")
+        self.assertEqual(self.launcher._build_report()["result"], "fail")
+
+    def test_no_measurement_omits_supervision_instead_of_fabricating_zero(self):
+        parsed = self.launcher._parse_go_test_results(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 0
+        )
+        self.launcher._record_go_test_results(parsed, 0)
+        self.assertNotIn("test_supervision", self.launcher.tests)
+        self.launcher.commands.append(
+            {
+                "name": "go vet integration",
+                "argv": ["go", "vet"],
+                "exit_code": 0,
+                "allow_failure": True,
+                "timeout_seconds": 120,
+                "duration_seconds": 1.5,
+                "timed_out": False,
+            }
+        )
+        self.launcher._record_go_test_results(parsed, 0)
+        self.assertNotIn("test_supervision", self.launcher.tests)
+        self.assertNotIn(
+            "test_supervision", self.launcher._build_report()["tests"]
+        )
+
+    def test_synthetic_timeout_records_actual_passed_timeout(self):
+        fake = PartialOutputProcess(PACKAGE_OK_OUTPUT)
+        with mock.patch.object(
+            MOD.subprocess, "Popen", return_value=fake
+        ), mock.patch.object(MOD.os, "killpg"):
+            with self.assertRaises(MOD.LauncherError) as raised:
+                self.launcher._run_process_group(
+                    "test",
+                    "test",
+                    "go test integration",
+                    ["go", "test"],
+                    {},
+                    0.5,
+                )
+        self.assertEqual(raised.exception.kind, "timeout")
+        supervision = self.launcher.tests.get("test_supervision")
+        self.assertIsInstance(supervision, dict)
+        self.assertEqual(supervision["timeout_seconds"], 0.5)
+        self.assertTrue(supervision["timed_out"])
+        self.assertTrue(math.isfinite(supervision["wait_elapsed_seconds"]))
+        self.assertGreaterEqual(supervision["wait_elapsed_seconds"], 0)
 
     def test_go_test_timeout_records_safe_partial_results(self):
         partial = (
@@ -1128,6 +1309,23 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.assertIn("test-incomplete", problems)
         self.assertNotIn("no-captured-test-events", problems)
         self.assertTrue(tests.get("failure_diagnostics"))
+        supervision = tests.get("test_supervision")
+        self.assertIsInstance(supervision, dict)
+        self.assertEqual(
+            set(supervision),
+            {"timeout_seconds", "wait_elapsed_seconds", "timed_out"},
+        )
+        self.assertEqual(supervision["timeout_seconds"], 570)
+        self.assertIs(type(supervision["wait_elapsed_seconds"]), float)
+        self.assertTrue(math.isfinite(supervision["wait_elapsed_seconds"]))
+        self.assertGreaterEqual(supervision["wait_elapsed_seconds"], 0)
+        self.assertIs(supervision["timed_out"], True)
+        record = self.launcher.commands[-1]
+        self.assertEqual(record["name"], "go test integration")
+        self.assertEqual(
+            supervision["wait_elapsed_seconds"], record["duration_seconds"]
+        )
+        self.assertEqual(supervision["timed_out"], record["timed_out"])
         self.assertEqual(self.launcher._build_report()["result"], "fail")
 
     def test_go_test_timeout_without_events_marks_no_captured_events(self):
@@ -1254,6 +1452,184 @@ class SharedSetupLauncherConfigurationTests(unittest.TestCase):
         for field, (launcher_value, setup_value) in shared.items():
             with self.subTest(field=field):
                 self.assertEqual(launcher_value, setup_value)
+
+
+class SetupWorkflowBatchBudgetTests(unittest.TestCase):
+    """Static PyYAML and bash -n checks for the frozen workflow contract."""
+
+    WORKFLOW = REPO / ".github" / "workflows" / "setup-check.yml"
+    CHECKOUT = (
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    )
+    SETUP_GO = (
+        "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e"
+    )
+    UPLOAD = (
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        if yaml is None:
+            raise unittest.SkipTest("PyYAML is unavailable")
+        cls.text = cls.WORKFLOW.read_text(encoding="utf-8")
+        cls.data = yaml.safe_load(cls.text)
+
+    def _job(self, name):
+        return self.data["jobs"][name]
+
+    def _steps(self, job_name):
+        return self._job(job_name)["steps"]
+
+    def _run(self, job_name, step_name):
+        for step in self._steps(job_name):
+            if step.get("name") == step_name:
+                return step.get("run", "")
+        self.fail(f"missing workflow step: {step_name}")
+
+    def _upload(self, job_name):
+        for step in self._steps(job_name):
+            if step.get("uses") == self.UPLOAD:
+                return step
+        self.fail(f"missing upload step in {job_name}")
+
+    def test_job_timeouts_are_20_20_10(self):
+        self.assertEqual(self._job("setup-check")["timeout-minutes"], 20)
+        self.assertEqual(
+            self._job("database-foundation")["timeout-minutes"], 20
+        )
+        self.assertEqual(
+            self._job("vulnerability-check")["timeout-minutes"], 10
+        )
+
+    def test_permissions_needs_concurrency_and_pins_unchanged(self):
+        self.assertEqual(self.data["permissions"], {"contents": "read"})
+        self.assertEqual(
+            self.data["concurrency"],
+            {
+                "group": (
+                    "${{ github.workflow }}-${{ github.event.pull_request.number "
+                    "|| github.ref }}"
+                ),
+                "cancel-in-progress": False,
+            },
+        )
+        self.assertEqual(self._job("database-foundation")["needs"], "setup-check")
+        self.assertNotIn("needs", self._job("setup-check"))
+        self.assertNotIn("needs", self._job("vulnerability-check"))
+        uses = [
+            step["uses"]
+            for job in self.data["jobs"].values()
+            for step in job.get("steps", [])
+            if "uses" in step
+        ]
+        self.assertEqual(set(uses), {self.CHECKOUT, self.SETUP_GO, self.UPLOAD})
+        self.assertEqual(uses.count(self.CHECKOUT), 3)
+        self.assertEqual(uses.count(self.SETUP_GO), 3)
+        self.assertEqual(uses.count(self.UPLOAD), 3)
+
+    def test_safe_upload_paths_and_exports_unchanged(self):
+        expected = {
+            "setup-check": (
+                "Upload safe setup reports",
+                "setup-check-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}",
+                [
+                    "${{ runner.temp }}/payment-hub-setup/reports/upload/go-default.safe.json",
+                    "${{ runner.temp }}/payment-hub-setup/reports/upload/provenance.json",
+                ],
+                "--expect default",
+            ),
+            "database-foundation": (
+                "Upload safe database reports",
+                "database-foundation-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}",
+                [
+                    "${{ runner.temp }}/payment-hub-db/reports/upload/db-foundation.safe.json",
+                    "${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json",
+                    "${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json",
+                ],
+                "--expect db,cancellation",
+            ),
+            "vulnerability-check": (
+                "Upload safe vulnerability reports",
+                "vulnerability-check-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}",
+                [
+                    "${{ runner.temp }}/payment-hub-vulnerability/reports/upload/vulnerability.safe.json",
+                    "${{ runner.temp }}/payment-hub-vulnerability/reports/upload/provenance.json",
+                ],
+                "--expect vulnerability",
+            ),
+        }
+        for job_name, (step_name, artifact, paths, expect) in expected.items():
+            with self.subTest(job=job_name):
+                step = self._upload(job_name)
+                self.assertEqual(step["name"], step_name)
+                self.assertEqual(step.get("if"), "always()")
+                self.assertEqual(step["with"]["name"], artifact)
+                actual_paths = [
+                    line.strip()
+                    for line in step["with"]["path"].splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(actual_paths, paths)
+                self.assertEqual(step["with"]["if-no-files-found"], "error")
+                self.assertEqual(step["with"]["retention-days"], 14)
+                self.assertIs(step["with"]["include-hidden-files"], False)
+                export_steps = [
+                    candidate
+                    for candidate in self._steps(job_name)
+                    if candidate.get("name", "").startswith("Export safe")
+                ]
+                self.assertEqual(len(export_steps), 1)
+                self.assertIn(expect, export_steps[0].get("run", ""))
+
+    def test_summaries_share_honest_570_batch_contract(self):
+        default = self._run("setup-check", "Run foundation unit checks")
+        database = self._run(
+            "database-foundation", "Summarize database foundation results"
+        )
+        for label, text in (("default", default), ("database", database)):
+            with self.subTest(summary=label):
+                self.assertIn("570", text)
+                self.assertIn("整批", text)
+                self.assertIn("构建", text)
+                self.assertIn("链接", text)
+                self.assertIn("串行", text)
+                self.assertIn("共享", text)
+                self.assertIn("20 分钟", text)
+        self.assertIn("-timeout=90s", default)
+        self.assertIn("120 秒", database)
+        self.assertIn("kill/reap", database)
+        self.assertIn("不包含超时后的 kill/reap", database)
+        self.assertIn("硬杀", database)
+        self.assertIn("ready 180s / exit 120s / total 360s", database)
+        for label, text in (("default", default), ("database", database)):
+            with self.subTest(summary=label):
+                for forbidden in ("3×120", "3 * 120", "3个120", "三个 120"):
+                    self.assertNotIn(forbidden, text)
+
+    def test_all_14_bash_blocks_parse_with_bash_n(self):
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        scripts = [
+            step.get("run", "")
+            for job in self.data["jobs"].values()
+            for step in job.get("steps", [])
+            if step.get("shell") == "bash"
+        ]
+        self.assertEqual(len(scripts), 14)
+        for index, script in enumerate(scripts):
+            result = subprocess.run(
+                [bash, "-n"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"bash -n block {index} failed: {result.stderr}",
+            )
 
 
 if __name__ == "__main__":

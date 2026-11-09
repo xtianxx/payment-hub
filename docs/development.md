@@ -429,7 +429,30 @@ PR #3 的最终 head `85c17f3` 在远端run `42482907670` 三个job及安全报�
 
 fresh PG run `b582a69fa71e4d349682b72c779ea7c7` 入口退出0、总286.32秒；三包、4项必需结果、106根/259子测试、两次迁移和三表`[0,0,0]`通过，清理正常。首次取消报告通过但采证脚本事后丢失实际退出码，未伪造该值；另一个独立取消run `ef9ede46ef50439eb6718d8fa6ead143` 实测checker退出0、launcher退出1/interrupted/sigterm、清理通过。新取消报告与原正常PG报告联合安全导出退出0，两个身份和source/export哈希均核对。旧证据未覆盖，补验证据见`final-validation/cancellation-exit-confirmation/`。
 
-父另行核对实际报告、哈希/provenance和Docker资源缺席。执行前后67项输入稳定，digest `c0faf6286055851e81f9ec0a30d97510c1719bf78f57fa9a53e1b0ab41c64bb8`；原US1未提交改动保持不变并暂停。Go业务及模块未改，复用main运行的默认/漏洞job通过证据，不重复无关扫描。当前修复只完成本地验证，未提交、推送或重跑远端CI；不新增Go孙进程或runner硬杀清理保证，20分钟job上限不变。
+父另行核对实际报告、哈希/provenance和Docker资源缺席。执行前后67项输入稳定，digest `c0faf6286055851e81f9ec0a30d97510c1719bf78f57fa9a53e1b0ab41c64bb8`；原US1未提交改动保持不变并暂停。Go业务及模块未改，复用当时main运行的默认/漏洞job通过证据，不重复无关扫描。该修复在当次本地验收时尚未提交、推送或重跑远端CI；不新增Go孙进程或runner硬杀清理保证，当时20分钟DB job上限不变。
+
+### PR4 合并后默认入口超时与共享批次预算（2026-11-09，本地验收）
+
+PR #4 head `37bc2f9` 的run `42494001384` 三个job及四份安全报告通过，父读回上传文件与provenance后，用户授权合并至main `56fc9b47b9d47317633d485dcdc58afd522e8dbf`。随后的push run `42495536802` 仍失败：此次是默认测试外层120秒超时，数据库job因needs被跳过，漏洞job通过。不能用PR4绿灯宣称main已恢复，也不能用早先DB修复替代默认入口核对。
+
+只读锁链审查未发现`TestLifecycleFinishIncludesOutputCompletedDuringSeal`的确定性死锁；但Wait/Finish及文件I/O不是统一硬返回上界，不能仅凭deadline排除挂起。经用户批准的一次空GOCACHE诊断，同样默认race参数下实际144.563秒退出0，harness直到123.265秒才启动，目标测试0.05秒通过，207根/766子测试及26必需根完整通过。本次没有观察到hang，不声称排除了远端偶发阻塞。无测试事件区间还包括链接/启动，不能整段称为纯编译。
+
+用户随后批准在`fix/ci-batch-budget`统一政策：现有`ci_checks.py`提供唯一`GO_TEST_BATCH_TIMEOUT_SECONDS=570`，默认与integration入口均引用。570秒是构建、链接、串行执行共用的整批监督等待限额；`180+360+30`只作容量规划，不是阶段计时器、独享额度或预留。不保证所有包各自90/120秒及Go备用强杀/输出等待时间均能叠加用满，也不包含超时后的kill/reap或报告时间。默认inner90、integrationinner120、race/count1/p1/json及26/4项必需结果不变，不拆编译/执行，不增加retry或skip。
+
+setup job由10改20分钟，DB20、漏洞10不变。job上限覆盖整个准备/检查/取消/清理/上传，不保证各阶段最大值叠加。默认go list60、DB vet120、取消D360（preflight和报告余量仍在D外）、扫描工具准备180/扫描180均不变；本轮不新增默认vet监督器。
+
+两类原始/安全报告新增可选`test_supervision`：`timeout_seconds`、`wait_elapsed_seconds`、`timed_out`。默认入口测量monotonic调用起点至communicate完成或超时瞬间；DB复用实际go test command的duration，均不含超时后的reap。旧报告或未执行保留unknown/null，不补造0。有限非负数、严格bool和字段白名单均校验，矛盾的timed_out不能导出通过；计时本身不授予通过资格，也不保存原事件/Output/stack。
+
+最终证据在隔离worktree `artifacts/ci-batch-budget/final-validation/`：
+
+- 279项Python工具回归、9脚本AST、14个shell块与20/20/10只读job配置检查通过；两个lane分别保留37项和10项实际AssertionError red及同测试hash green。旧DB预算数值本已570，不伪造其数值变化red。
+- 使用正式`ci_checks.py run-default`（非诊断脚本）和新空GOCACHE，实际CLI退出0，总156.794秒；报告监督等待156.371秒/限额570、timed_out=false。207根/766子测试、26必需根、7个测试包及明确cmd无测试文件结果通过。
+- 正常PG run `6c8ee7e93bee497598c67b299fa119af` 实际退出0；106根/259子测试、4项必需结果与三包、两次迁移、三表`[0,0,0]`及清理通过。监督等待62.847秒与实际命令duration一致。
+- 真实取消run `e8d291861aaa43adba084ab18b1c43d1` 实际checker退出0、launcher退出1/interrupted/sigterm；本次资源缺席、既有资源保留。因未到Go测试阶段，报告不造test_supervision。默认及DB+取消安全导出均实际退出0，source/export哈希及provenance核对通过。
+- 小型synthetic-emitter真实子进程1秒监督超时，退出124、reaped=true，计时不包含回收，partial解析保持非绿；它不是Go测试。
+- 67项输入前后稳定，digest `8f702bebb0172b8b0ce27a22b341e877c4066a1736663c19069799fac623e632`；父独立核对实际报告/时间/哈希及另作8个Docker资源缺席查询。Go/module未变，漏洞复用main run42495536802该独立job的通过证据。
+
+本轮真实CLI启动时的pid/starttime未持久化，只有结束后的命令/缓存扫描无匹配，故不宣称完整进程身份追踪证据闭合；容器/network/volume缺席另有查询。原US1改动保持原样并暂停。本轮仅本地验收，尚未提交、推送、合并或远端复验，不新增runner硬杀或Go孙进程清理保证。
 
 本批已另获实施、隔离验证及新分支 Draft PR 授权；仍不合并、发布或部署。T018–T022 已分两次完成本机合流验收；远端结论须以 Draft PR 精确提交的实际检查为准，不能沿用上一批 main 绿灯。
 
