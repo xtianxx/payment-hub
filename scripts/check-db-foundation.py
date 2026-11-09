@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -97,13 +98,6 @@ IMAGE_KEY_FILES = (
 )
 PACKAGES = ("internal/postgres", "internal/mock", "tests/harness")
 GO_TEST_PACKAGE_TIMEOUT_SECONDS = 120
-GO_TEST_COLD_BUILD_MARGIN_SECONDS = 180
-GO_TEST_FINALIZE_MARGIN_SECONDS = 30
-GO_TEST_EXTERNAL_TIMEOUT_SECONDS = (
-    GO_TEST_COLD_BUILD_MARGIN_SECONDS
-    + len(PACKAGES) * GO_TEST_PACKAGE_TIMEOUT_SECONDS
-    + GO_TEST_FINALIZE_MARGIN_SECONDS
-)
 REQUIRED_INTEGRATION_TESTS = (
     "TestCommitHookIntegrationHidesReplyAfterRealCommit",
     "TestHarnessProcessPreservesParentStateIntegration",
@@ -199,7 +193,7 @@ BUDGETS = {
     "migration_up_seconds": 60,
     "migration_up_again_seconds": 60,
     "go_vet_seconds": 120,
-    "go_test_external_seconds": GO_TEST_EXTERNAL_TIMEOUT_SECONDS,
+    "go_test_external_seconds": ci_checks.GO_TEST_BATCH_TIMEOUT_SECONDS,
     "compose_down_seconds": 60,
     "container_stop_seconds": 15,
     "container_remove_seconds": 15,
@@ -2412,6 +2406,33 @@ class Launcher:
             )
         return results, parsed["problems"]
 
+    def _go_test_supervision(self) -> dict[str, Any] | None:
+        """Reuse the actual go test command record; never fabricate timing."""
+        for command in reversed(self.commands):
+            if command.get("name") != "go test integration":
+                continue
+            timeout = command.get("timeout_seconds")
+            elapsed = command.get("duration_seconds")
+            timed_out = command.get("timed_out")
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                return None
+            if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+                return None
+            if not isinstance(timed_out, bool):
+                return None
+            timeout_value = float(timeout)
+            elapsed_value = float(elapsed)
+            if not math.isfinite(timeout_value) or timeout_value <= 0:
+                return None
+            if not math.isfinite(elapsed_value) or elapsed_value < 0:
+                return None
+            return {
+                "timeout_seconds": timeout_value,
+                "wait_elapsed_seconds": elapsed_value,
+                "timed_out": timed_out,
+            }
+        return None
+
     def _record_go_test_results(
         self, parsed: Mapping[str, Any], exit_code: int
     ) -> None:
@@ -2431,6 +2452,10 @@ class Launcher:
         if exit_code != 0 or problems:
             self.tests["failure_diagnostics"] = parsed["failure_diagnostics"]
             self.tests["problems"] = problems
+        self.tests.pop("test_supervision", None)
+        supervision = self._go_test_supervision()
+        if supervision is not None:
+            self.tests["test_supervision"] = supervision
 
     def run_tests(self) -> None:
         if self.published_port is None:

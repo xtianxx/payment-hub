@@ -188,12 +188,33 @@ def default_stream(expected_packages, required_tests):
     return "".join(parts)
 
 
-def proc(code, stdout, stderr="", timed_out=False):
+def proc(code, stdout, stderr="", timed_out=False, wait_elapsed_seconds=None):
     if isinstance(stdout, str):
         stdout = stdout.encode("utf-8")
     if isinstance(stderr, str):
         stderr = stderr.encode("utf-8")
-    return MOD.ProcResult(code, stdout, stderr, timed_out)
+    result = MOD.ProcResult(code, stdout, stderr, timed_out)
+    # Older ProcResult shapes have no timing field; keep the construction
+    # compatible so the red run fails on the report assertion, not a TypeError.
+    if wait_elapsed_seconds is not None and hasattr(
+        result, "wait_elapsed_seconds"
+    ):
+        result = result._replace(
+            wait_elapsed_seconds=wait_elapsed_seconds
+        )
+    return result
+
+
+@contextlib.contextmanager
+def monotonic_clock(*values):
+    """Patch the module clock when present; old code simply never calls it."""
+    clock = mock.Mock(side_effect=list(values))
+    module_time = getattr(MOD, "time", None)
+    if module_time is None:
+        yield clock
+        return
+    with mock.patch.object(module_time, "monotonic", clock):
+        yield clock
 
 
 def json_bytes(value):
@@ -919,6 +940,26 @@ class DefaultInventoryTests(unittest.TestCase):
             ),
         )
 
+    def test_shared_batch_timeout_constant_is_570(self):
+        # One shared whole-batch budget; the 180+360+30 split is capacity
+        # planning only and must not become staged reservations.
+        self.assertEqual(
+            getattr(MOD, "GO_TEST_BATCH_TIMEOUT_SECONDS", None), 570
+        )
+
+    def test_proc_result_has_optional_trailing_wait_elapsed(self):
+        self.assertIn("wait_elapsed_seconds", MOD.ProcResult._fields)
+        self.assertEqual(
+            MOD.ProcResult._fields[-1], "wait_elapsed_seconds"
+        )
+        self.assertIsNone(
+            getattr(
+                MOD.ProcResult(0, b"", b""),
+                "wait_elapsed_seconds",
+                None,
+            )
+        )
+
 
 class RunDefaultTests(unittest.TestCase):
     def setUp(self):
@@ -1275,6 +1316,127 @@ class RunDefaultTests(unittest.TestCase):
             (self.report_dir / "go-default.json").read_text(),
         )
 
+    def test_run_default_uses_shared_batch_budget_not_legacy_120(self):
+        test_stdout = default_stream(
+            self.packages, MOD.DEFAULT_REQUIRED_TESTS
+        )
+        code, runner = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 0)
+        call = runner.call_args_list[1].args
+        timeout = call[2] if len(call) > 2 else None
+        self.assertEqual(timeout, 570)
+        self.assertNotEqual(timeout, 120)
+        self.assertEqual(runner.call_args_list[0].args[2], 60)
+        self.assertEqual(
+            call[0],
+            [
+                self.fake_go(),
+                "test",
+                "-mod=readonly",
+                "-race",
+                "-count=1",
+                "-p=1",
+                "-timeout=90s",
+                "-json",
+                "./...",
+            ],
+        )
+
+    def test_run_default_reports_test_supervision(self):
+        test_stdout = default_stream(
+            self.packages, MOD.DEFAULT_REQUIRED_TESTS
+        )
+        code, _ = self.run_default(
+            [
+                proc(0, self.list_stdout),
+                proc(0, test_stdout, wait_elapsed_seconds=144.563),
+            ]
+        )
+        self.assertEqual(code, 0)
+        report = self.read_report()
+        supervision = report.get("test_supervision")
+        self.assertEqual(
+            supervision,
+            {
+                "timeout_seconds": 570,
+                "wait_elapsed_seconds": 144.563,
+                "timed_out": False,
+            },
+        )
+        self.assertEqual(
+            set(supervision or {}),
+            {"timeout_seconds", "wait_elapsed_seconds", "timed_out"},
+        )
+
+    def test_run_default_unknown_elapsed_is_none_not_zero(self):
+        test_stdout = default_stream(
+            self.packages, MOD.DEFAULT_REQUIRED_TESTS
+        )
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 0)
+        supervision = self.read_report().get("test_supervision") or {}
+        self.assertIn("wait_elapsed_seconds", supervision)
+        self.assertIsNone(supervision["wait_elapsed_seconds"])
+
+    def test_run_default_timeout_reports_timed_out_supervision(self):
+        code, _ = self.run_default(
+            [
+                proc(0, self.list_stdout),
+                proc(
+                    124,
+                    "",
+                    "",
+                    timed_out=True,
+                    wait_elapsed_seconds=570.001,
+                ),
+            ]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertIn("timeout", report["problems"])
+        self.assertEqual(
+            report.get("test_supervision"),
+            {
+                "timeout_seconds": 570,
+                "wait_elapsed_seconds": 570.001,
+                "timed_out": True,
+            },
+        )
+
+    def test_run_default_reap_unknown_keeps_non_green_and_unknown_elapsed(self):
+        class ReapResult:
+            exit_code = 124
+            stdout = b""
+            stderr = b""
+            timed_out = True
+            reaped = False
+
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), ReapResult()]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertIn("process-reap-unconfirmed", report["problems"])
+        supervision = report.get("test_supervision") or {}
+        self.assertTrue(supervision.get("timed_out"))
+        self.assertIsNone(supervision.get("wait_elapsed_seconds"))
+
+    def test_run_default_io_failure_omits_test_supervision(self):
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), MOD.CiError("process-io-failed")]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertIn("go-test-process-io-failed", report["problems"])
+        self.assertNotIn("test_supervision", report)
+
 
 class ProcessGroupTests(unittest.TestCase):
     class FakeProcess:
@@ -1371,6 +1533,40 @@ class ProcessGroupTests(unittest.TestCase):
                 self.fail("CiError not raised")
         self.assertEqual(category, "process-interrupted")
         killpg.assert_called_once_with(fake.pid, signal.SIGKILL)
+
+    def test_success_records_wait_elapsed_from_supervision_clock(self):
+        fake = self.FakeProcess([(b"out", b"err")])
+        with mock.patch.object(MOD.subprocess, "Popen", return_value=fake):
+            with monotonic_clock(100.0, 101.25) as clock:
+                result = MOD._run_process_group(
+                    ["go", "test"], {"PATH": "/bin"}, 570
+                )
+        self.assertEqual(
+            getattr(result, "wait_elapsed_seconds", None), 1.25
+        )
+        self.assertEqual(clock.call_count, 2)
+
+    def test_timeout_records_wait_elapsed_before_reap(self):
+        fake = self.FakeProcess(
+            [
+                subprocess.TimeoutExpired(["go", "test"], 570),
+                (b"out", b"err"),
+            ]
+        )
+        with mock.patch.object(
+            MOD.subprocess, "Popen", return_value=fake
+        ), mock.patch.object(MOD.os, "killpg"):
+            with monotonic_clock(200.0, 770.5, 1070.5) as clock:
+                result = MOD._run_process_group(
+                    ["go", "test"], {"PATH": "/bin"}, 570
+                )
+        self.assertTrue(result.timed_out)
+        self.assertEqual(
+            getattr(result, "wait_elapsed_seconds", None), 570.5
+        )
+        # The third fake clock value is the fake kill/reap cost and must not
+        # be included in the supervision measurement.
+        self.assertEqual(clock.call_count, 2)
 
 
 class ExportReportsTests(unittest.TestCase):
@@ -1765,6 +1961,13 @@ class ExportReportsTests(unittest.TestCase):
         return json.loads(
             (
                 self.report_dir / "upload" / "db-foundation.safe.json"
+            ).read_text()
+        )
+
+    def read_safe_default(self):
+        return json.loads(
+            (
+                self.report_dir / "upload" / "go-default.safe.json"
             ).read_text()
         )
 
@@ -2538,6 +2741,242 @@ class ExportReportsTests(unittest.TestCase):
                         ).read_bytes()
                     ).hexdigest(),
                 )
+
+    def test_export_default_accepts_test_supervision(self):
+        for timeout_seconds in (570, 0.05):
+            with self.subTest(timeout_seconds=timeout_seconds):
+                value = self.go_default()
+                value["test_supervision"] = {
+                    "timeout_seconds": timeout_seconds,
+                    "wait_elapsed_seconds": 0.01,
+                    "timed_out": False,
+                }
+                self.write(self.report_dir / "go-default.json", value)
+                code, _ = self.export()
+                self.assertEqual(code, 0)
+                safe = self.read_safe_default()
+                self.assertEqual(safe["result"], "pass")
+                self.assertEqual(
+                    safe.get("test_supervision"),
+                    {
+                        "timeout_seconds": float(timeout_seconds),
+                        "wait_elapsed_seconds": 0.01,
+                        "timed_out": False,
+                    },
+                )
+
+    def test_export_default_timeout_supervision_is_exported_not_green(self):
+        value = self.go_default(result="fail")
+        value["exit_code"] = 124
+        value["timed_out"] = True
+        value["problems"] = ["timeout"]
+        value["test_supervision"] = {
+            "timeout_seconds": 570,
+            "wait_elapsed_seconds": 570.25,
+            "timed_out": True,
+        }
+        self.write(self.report_dir / "go-default.json", value)
+        code, _ = self.export()
+        self.assertEqual(code, 1)
+        safe = self.read_safe_default()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertEqual(
+            safe.get("test_supervision"),
+            {
+                "timeout_seconds": 570.0,
+                "wait_elapsed_seconds": 570.25,
+                "timed_out": True,
+            },
+        )
+
+    def test_export_default_historical_supervision_is_unknown(self):
+        for mode in ("missing", "none"):
+            with self.subTest(mode=mode):
+                value = self.go_default()
+                if mode == "none":
+                    value["test_supervision"] = None
+                self.write(self.report_dir / "go-default.json", value)
+                code, _ = self.export()
+                self.assertEqual(code, 0)
+                safe = self.read_safe_default()
+                self.assertEqual(safe["result"], "pass")
+                self.assertIsNone(safe.get("test_supervision"))
+
+    def test_export_default_rejects_malicious_test_supervision(self):
+        base = {
+            "timeout_seconds": 570,
+            "wait_elapsed_seconds": 1.0,
+            "timed_out": False,
+        }
+        cases = {
+            "nan-timeout": {**base, "timeout_seconds": float("nan")},
+            "inf-wait": {**base, "wait_elapsed_seconds": float("inf")},
+            "negative-wait": {**base, "wait_elapsed_seconds": -1.0},
+            "zero-timeout": {**base, "timeout_seconds": 0},
+            "bool-timeout": {**base, "timeout_seconds": True},
+            "bool-wait": {**base, "wait_elapsed_seconds": True},
+            "int-timed-out": {**base, "timed_out": 1},
+            "extra-raw-key": {**base, "events": ["SECRET_RAW_TIMING"]},
+            "non-dict": ["SECRET_RAW_TIMING"],
+        }
+        for name, supervision in cases.items():
+            with self.subTest(case=name):
+                value = self.go_default()
+                value["test_supervision"] = supervision
+                self.write(self.report_dir / "go-default.json", value)
+                code, _ = self.export()
+                self.assertEqual(code, 1)
+                text = (
+                    self.report_dir / "upload" / "go-default.safe.json"
+                ).read_text()
+                safe = json.loads(text)
+                self.assertEqual(safe["status"], "error")
+                self.assertNotIn("SECRET_RAW_TIMING", text)
+
+    def test_export_default_timed_out_supervision_cannot_override_result(self):
+        cases = {
+            "pass-with-timeout": {
+                "result": "pass",
+                "exit_code": 0,
+                "timed_out": False,
+            },
+            "exit-zero-with-timeout": {
+                "result": "fail",
+                "exit_code": 0,
+                "timed_out": False,
+            },
+        }
+        for name, overrides in cases.items():
+            with self.subTest(case=name):
+                value = self.go_default()
+                value.update(overrides)
+                value["test_supervision"] = {
+                    "timeout_seconds": 570,
+                    "wait_elapsed_seconds": 570.0,
+                    "timed_out": True,
+                }
+                self.write(self.report_dir / "go-default.json", value)
+                code, _ = self.export()
+                self.assertEqual(code, 1)
+                safe = self.read_safe_default()
+                self.assertEqual(safe["status"], "exported")
+                self.assertEqual(safe["result"], "fail")
+                self.assertTrue(
+                    safe.get("test_supervision", {}).get("timed_out")
+                )
+
+    def test_export_default_test_supervision_does_not_grant_pass(self):
+        value = self.go_default(result="fail")
+        value["exit_code"] = 1
+        value["problems"] = ["test-exit"]
+        value["test_supervision"] = {
+            "timeout_seconds": 570,
+            "wait_elapsed_seconds": 1.0,
+            "timed_out": False,
+        }
+        self.write(self.report_dir / "go-default.json", value)
+        code, _ = self.export()
+        self.assertEqual(code, 1)
+        safe = self.read_safe_default()
+        self.assertEqual(safe["result"], "fail")
+        self.assertEqual(
+            safe.get("test_supervision"),
+            {
+                "timeout_seconds": 570.0,
+                "wait_elapsed_seconds": 1.0,
+                "timed_out": False,
+            },
+        )
+
+    def test_export_db_accepts_test_supervision(self):
+        for timeout_seconds in (570, 0.05):
+            with self.subTest(timeout_seconds=timeout_seconds):
+                value = self.db_report()
+                value["tests"]["test_supervision"] = {
+                    "timeout_seconds": timeout_seconds,
+                    "wait_elapsed_seconds": 0.01,
+                    "timed_out": False,
+                }
+                self.write_db(value)
+                code, _ = self.export(["db"])
+                self.assertEqual(code, 0)
+                safe = self.read_safe_db()
+                self.assertEqual(safe["result"], "pass")
+                self.assertEqual(
+                    safe.get("test_supervision"),
+                    {
+                        "timeout_seconds": float(timeout_seconds),
+                        "wait_elapsed_seconds": 0.01,
+                        "timed_out": False,
+                    },
+                )
+
+    def test_export_db_timeout_supervision_cannot_be_green(self):
+        for test_exit in (0, 124):
+            with self.subTest(test_exit=test_exit):
+                value = self.db_report()
+                value["tests"]["test_exit"] = test_exit
+                value["tests"]["test_supervision"] = {
+                    "timeout_seconds": 570,
+                    "wait_elapsed_seconds": 570.0,
+                    "timed_out": True,
+                }
+                self.write_db(value)
+                code, _ = self.export(["db"])
+                self.assertEqual(code, 1)
+                safe = self.read_safe_db()
+                self.assertEqual(safe["status"], "exported")
+                self.assertEqual(safe["result"], "fail")
+                self.assertTrue(
+                    safe.get("test_supervision", {}).get("timed_out")
+                )
+
+    def test_export_db_historical_supervision_is_unknown(self):
+        for mode in ("missing", "none"):
+            with self.subTest(mode=mode):
+                value = self.db_report()
+                if mode == "none":
+                    value["tests"]["test_supervision"] = None
+                self.write_db(value)
+                code, _ = self.export(["db"])
+                self.assertEqual(code, 0)
+                safe = self.read_safe_db()
+                self.assertEqual(safe["result"], "pass")
+                self.assertIsNone(safe.get("test_supervision"))
+
+    def test_export_db_rejects_malicious_test_supervision(self):
+        base = {
+            "timeout_seconds": 570,
+            "wait_elapsed_seconds": 1.0,
+            "timed_out": False,
+        }
+        cases = {
+            "nan-timeout": {**base, "timeout_seconds": float("nan")},
+            "inf-wait": {**base, "wait_elapsed_seconds": float("inf")},
+            "negative-wait": {**base, "wait_elapsed_seconds": -1.0},
+            "zero-timeout": {**base, "timeout_seconds": 0},
+            "bool-timeout": {**base, "timeout_seconds": True},
+            "bool-wait": {**base, "wait_elapsed_seconds": True},
+            "int-timed-out": {**base, "timed_out": 1},
+            "extra-raw-key": {**base, "events": ["SECRET_RAW_TIMING"]},
+            "non-dict": ["SECRET_RAW_TIMING"],
+        }
+        for name, supervision in cases.items():
+            with self.subTest(case=name):
+                value = self.db_report()
+                value["tests"]["test_supervision"] = supervision
+                self.write_db(value)
+                code, _ = self.export(["db"])
+                self.assertEqual(code, 1)
+                text = (
+                    self.report_dir
+                    / "upload"
+                    / "db-foundation.safe.json"
+                ).read_text()
+                safe = json.loads(text)
+                self.assertEqual(safe["status"], "error")
+                self.assertNotIn("SECRET_RAW_TIMING", text)
 
 
 class CliTests(unittest.TestCase):

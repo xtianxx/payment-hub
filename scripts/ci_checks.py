@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, NamedTuple, Sequence
@@ -64,6 +65,12 @@ SAFE_FILENAMES = {
 EXPECT_NAMES = ("default", "db", "vulnerability", "cancellation")
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 MAX_OUTPUT_LINE_BYTES = 1024 * 1024
+
+# One shared whole-batch supervision budget for the default and integration
+# Go test entry points. The 180s cold build + 360s execution + 30s headroom
+# split is capacity planning only, not staged reservations. Kill/reap and
+# report time after a supervision timeout are outside this wait.
+GO_TEST_BATCH_TIMEOUT_SECONDS = 570
 
 PACKAGE_STATUSES = frozenset(
     {"pass", "fail", "skip", "missing", "invalid", "no-test-files"}
@@ -185,6 +192,7 @@ class ProcResult(NamedTuple):
     stderr: bytes
     timed_out: bool = False
     reaped: bool = True
+    wait_elapsed_seconds: float | None = None
 
 
 class CiError(RuntimeError):
@@ -897,6 +905,7 @@ def _terminate_owned_group(process: Any) -> tuple[bool, bytes, bytes]:
 def _run_process_group(
     argv: Sequence[str], env: Mapping[str, str], timeout: int
 ) -> ProcResult:
+    started = time.monotonic()
     try:
         process = subprocess.Popen(
             list(argv),
@@ -912,8 +921,10 @@ def _run_process_group(
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        # Measure at the timeout instant, before kill/reap cleanup.
+        wait_elapsed = time.monotonic() - started
         reaped, stdout, stderr = _terminate_owned_group(process)
-        return ProcResult(124, stdout, stderr, True, reaped)
+        return ProcResult(124, stdout, stderr, True, reaped, wait_elapsed)
     except OSError as exc:
         reaped, _, _ = _terminate_owned_group(process)
         category = (
@@ -930,12 +941,14 @@ def _run_process_group(
             else "process-interrupted-reap-unconfirmed"
         )
         raise CiError(category) from exc
+    wait_elapsed = time.monotonic() - started
     return ProcResult(
         process.returncode,
         stdout,
         stderr,
         False,
         process.poll() is not None,
+        wait_elapsed,
     )
 
 
@@ -1164,11 +1177,28 @@ def run_default(go: str, report_dir: str) -> int:
     )
 
     try:
-        tested = _run_process_group(test_argv, env, 120)
+        tested = _run_process_group(
+            test_argv, env, GO_TEST_BATCH_TIMEOUT_SECONDS
+        )
     except CiError as exc:
         problems.append("go-test-" + exc.category)
         report["problems"] = problems
         return _finish_go_report(report_dir_path, report)
+    wait_elapsed = getattr(tested, "wait_elapsed_seconds", None)
+    if wait_elapsed is not None and (
+        isinstance(wait_elapsed, bool)
+        or not isinstance(wait_elapsed, (int, float))
+        or not math.isfinite(float(wait_elapsed))
+        or wait_elapsed < 0
+    ):
+        wait_elapsed = None
+    report["test_supervision"] = {
+        "timeout_seconds": GO_TEST_BATCH_TIMEOUT_SECONDS,
+        "wait_elapsed_seconds": (
+            None if wait_elapsed is None else float(wait_elapsed)
+        ),
+        "timed_out": tested.timed_out,
+    }
     test_exit = 124 if tested.timed_out else tested.exit_code
     report["exit_code"] = test_exit
     report["timed_out"] = tested.timed_out
@@ -1315,6 +1345,41 @@ def _safe_float_or_none(value: Any, name: str) -> float | None:
     if value is None:
         return None
     return round(_require_number(value, name), 3)
+
+
+TEST_SUPERVISION_KEYS = frozenset(
+    {"timeout_seconds", "wait_elapsed_seconds", "timed_out"}
+)
+
+
+def _safe_test_supervision(value: Any) -> dict[str, Any] | None:
+    """Rebuild the optional timing object; None means not measured.
+
+    Timing is informational only. It never grants pass status, and a
+    contradictory timed_out value is handled by the caller as non-green.
+    """
+    if value is None:
+        return None
+    entry = _require_dict(value, "test_supervision")
+    if set(entry) != TEST_SUPERVISION_KEYS:
+        raise CiError("unsafe-field-test_supervision")
+    timeout_seconds = _require_number(
+        entry["timeout_seconds"], "test_supervision.timeout_seconds"
+    )
+    if timeout_seconds <= 0:
+        raise CiError("unsafe-field-test_supervision.timeout_seconds")
+    wait_elapsed = _safe_float_or_none(
+        entry["wait_elapsed_seconds"],
+        "test_supervision.wait_elapsed_seconds",
+    )
+    timed_out = _require_bool(
+        entry["timed_out"], "test_supervision.timed_out"
+    )
+    return {
+        "timeout_seconds": timeout_seconds,
+        "wait_elapsed_seconds": wait_elapsed,
+        "timed_out": timed_out,
+    }
 
 
 def _safe_int_or_none(value: Any, name: str) -> int | None:
@@ -1479,6 +1544,9 @@ def _safe_default_report(
         source.get("list_exit_code"), "list_exit_code"
     )
     timed_out = _require_bool(source.get("timed_out"), "timed_out")
+    test_supervision = _safe_test_supervision(
+        source.get("test_supervision")
+    )
     root_count = _require_int(source.get("root_count"), "root_count")
     subtest_count = _require_int(
         source.get("subtest_count"), "subtest_count"
@@ -1510,6 +1578,13 @@ def _safe_default_report(
         for package in expected
     ):
         safe_result = "fail"
+    if test_supervision is not None:
+        if test_supervision["timed_out"] != timed_out:
+            safe_result = "fail"
+        if test_supervision["timed_out"] and (
+            source.get("result") == "pass" or exit_code == 0
+        ):
+            safe_result = "fail"
     return {
         "schema": "payment-hub.ci-safe.go-default.v1",
         "status": "exported",
@@ -1526,6 +1601,7 @@ def _safe_default_report(
         "exit_code": exit_code,
         "list_exit_code": list_exit_code,
         "timed_out": timed_out,
+        "test_supervision": test_supervision,
         "input_hash": input_hash,
     }
 
@@ -1639,6 +1715,9 @@ def _safe_db_report(source: dict[str, Any]) -> dict[str, Any]:
     test_exit = _safe_int_or_none(
         tests_value.get("test_exit"), "tests.test_exit"
     )
+    test_supervision = _safe_test_supervision(
+        tests_value.get("test_supervision")
+    )
     problems_value = tests_value.get("problems")
     if problems_value is None:
         test_problems: list[str] = []
@@ -1726,6 +1805,11 @@ def _safe_db_report(source: dict[str, Any]) -> dict[str, Any]:
         safe_result = "fail"
     if not source_safe["manifest_unchanged"]:
         safe_result = "fail"
+    if test_supervision is not None:
+        if test_supervision["timed_out"] and (
+            source.get("result") == "pass" or test_exit == 0
+        ):
+            safe_result = "fail"
 
     return {
         "schema": "payment-hub.ci-safe.db-foundation.v1",
@@ -1742,6 +1826,7 @@ def _safe_db_report(source: dict[str, Any]) -> dict[str, Any]:
         "source": source_safe,
         "vet_exit": vet_exit,
         "test_exit": test_exit,
+        "test_supervision": test_supervision,
         "problems": test_problems,
         "required_test_results": required_results,
         "package_results": package_results,
