@@ -397,12 +397,11 @@ func parsePaymentSubmitJSON(body []byte) (paymentSubmitRequest, int) {
 	if payment.ValidateBusinessOrderNo(input.businessOrderNo) != nil {
 		return zero, http.StatusBadRequest
 	}
-	if payment.ValidateAmount(input.amount) != nil {
-		return zero, http.StatusBadRequest
-	}
-	if payment.ValidateCurrency(input.currency) != nil {
-		return zero, http.StatusBadRequest
-	}
+	// Amount range and currency value are payment business decisions. The HTTP
+	// layer has already enforced the strict JSON syntax and integer
+	// representation; valid business values follow the normal registration
+	// path, while invalid ones are delegated to the limited conflict-priority
+	// read in payment.
 	return input, 0
 }
 

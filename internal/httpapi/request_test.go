@@ -83,12 +83,12 @@ func (f *contractSubmitFake) Submit(ctx context.Context, requestID payment.Reque
 		if payment.ValidateBusinessOrderNo(input.BusinessOrderNo) != nil {
 			contractFail(f.t, "fixture_submit_business_order_no", "Submit received an invalid business order number")
 		}
-		if payment.ValidateAmount(input.Amount) != nil {
-			contractFail(f.t, "fixture_submit_amount", "Submit received an invalid amount")
-		}
-		if payment.ValidateCurrency(input.Currency) != nil {
-			contractFail(f.t, "fixture_submit_currency", "Submit received an invalid currency")
-		}
+	}
+	// HTTP delegates business-value decisions to payment. The fake must behave
+	// like that boundary: it accepts the syntax, records the call, and returns
+	// a sanitized invalid-input classification instead of turning it into 201.
+	if payment.ValidateAmount(input.Amount) != nil || payment.ValidateCurrency(input.Currency) != nil {
+		return payment.SubmitResult{}, payment.ErrInvalidInput
 	}
 	return f.result, f.err
 }
@@ -814,9 +814,9 @@ func TestPaymentRequestBoundary(t *testing.T) {
 			{name: "minimum", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "1", `"CNY"`), wantStatus: http.StatusCreated, wantSubmit: 1, check: contractCheckSubmitInput("M100", 1, "CNY")},
 			{name: "typical", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"CNY"`), wantStatus: http.StatusCreated, wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, "CNY")},
 			{name: "maximum", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "1000000", `"CNY"`), wantStatus: http.StatusCreated, wantSubmit: 1, check: contractCheckSubmitInput("M100", 1000000, "CNY")},
-			{name: "zero", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "0", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
-			{name: "negative", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "-1", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
-			{name: "above_maximum", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "1000001", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
+			{name: "zero", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "0", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 0, "CNY")},
+			{name: "negative", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "-1", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", -1, "CNY")},
+			{name: "above_maximum", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "1000001", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 1000001, "CNY")},
 			{name: "string", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, `"100"`, `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
 			{name: "decimal", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100.0", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
 			{name: "exponent", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "1e2", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
@@ -849,13 +849,33 @@ func TestPaymentRequestBoundary(t *testing.T) {
 	t.Run("POST currency", func(t *testing.T) {
 		cases := []contractBoundaryCase{
 			{name: "CNY", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"CNY"`), wantStatus: http.StatusCreated, wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, "CNY")},
-			{name: "lowercase", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"cny"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
-			{name: "mixed_case", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"Cny"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
-			{name: "trailing_space", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"CNY "`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
-			{name: "leading_space", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `" CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
-			{name: "USD", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"USD"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
-			{name: "empty", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `""`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
-			{name: "newline", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"CNY\n"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST"},
+			{name: "lowercase", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"cny"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, "cny")},
+			{name: "mixed_case", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"Cny"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, "Cny")},
+			{name: "trailing_space", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"CNY "`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, "CNY ")},
+			{name: "leading_space", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `" CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, " CNY")},
+			{name: "USD", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"USD"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, "USD")},
+			{name: "empty", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `""`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, "")},
+			{name: "newline", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"CNY\n"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, "CNY\n")},
+		}
+		for _, tc := range cases {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) { contractRunBoundaryCase(t, tc) })
+		}
+	})
+
+	t.Run("POST business value delegation", func(t *testing.T) {
+		cases := []contractBoundaryCase{
+			{name: "amount_below_range_reaches_submit", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "0", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 0, "CNY")},
+			{name: "amount_negative_reaches_submit", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "-1", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", -1, "CNY")},
+			{name: "amount_above_range_reaches_submit", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "1000001", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 1000001, "CNY")},
+			{name: "currency_non_cny_reaches_submit", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100", `"USD"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 1, check: contractCheckSubmitInput("M100", 100, "USD")},
+			{name: "amount_decimal_rejected_before_submit", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "100.0", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 0},
+			{name: "amount_exponent_rejected_before_submit", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "1e2", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 0},
+			{name: "amount_negative_zero_rejected_before_submit", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "-0", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 0},
+			{name: "amount_overflow_rejected_before_submit", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(`"M100"`, "9223372036854775808", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 0},
+			{name: "business_order_no_format_rejected_before_submit", method: http.MethodPost, target: contractPostPath, body: contractBodyWith(contractJSONString("M 100"), "100", `"CNY"`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 0},
+			{name: "unknown_field_rejected_before_submit", method: http.MethodPost, target: contractPostPath, body: []byte(`{"business_order_no":"M100","amount":100,"currency":"CNY","client_id":"other"}`), wantStatus: http.StatusBadRequest, wantCode: "INVALID_REQUEST", wantSubmit: 0},
+			{name: "valid_values_reach_submit_once", method: http.MethodPost, target: contractPostPath, body: contractValidBody(), wantStatus: http.StatusCreated, wantSubmit: 1, check: contractCheckSubmitInput(contractBusinessNo, 100, "CNY")},
 		}
 		for _, tc := range cases {
 			tc := tc
