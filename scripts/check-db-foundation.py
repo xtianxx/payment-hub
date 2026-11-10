@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """One-shot T017 database foundation launcher.
 
-This script is the narrow T017 entry point: it prepares the fixed-input
-migration image, starts one isolated PostgreSQL Compose project, runs the real
-Goose migrations twice, runs the integration vet/test commands, and cleans up
-only the resources it created. Its integration roots cover the trusted private
-UDS observer and helper lifecycle, and the current real application binary's
-readyz/SIGTERM, bad-config, missing-migration, startup-timeout, startup-cancel,
-and startup-listen diagnostics. It is not the T072 full check and does not
-claim payment HTTP, business restart/idempotency, application image, full MVP,
-T077, or CD.
+This script is the narrow T017 database foundation entry point: it prepares
+the fixed-input migration image, starts one isolated PostgreSQL Compose
+project, runs the real Goose migrations twice, runs the integration vet/test
+commands, and cleans up only the resources it created. Its integration roots
+cover the trusted private UDS observer and helper lifecycle, the current real
+application binary's readyz/SIGTERM, bad-config, missing-migration,
+startup-timeout, startup-cancel, and startup-listen diagnostics, and the
+first-batch storage/mock core (order registration, observation atomic save,
+and mock transaction) paths, the next-batch order-lookup path, and the US1
+real payment HTTP/byte-boundary/restart integration lane. It is not the T072
+full check and does not claim payment HTTP beyond US1, business
+restart/idempotency beyond US1, application image, full MVP, T077, or CD.
 
 Only Python's standard library is used. No tool is installed automatically.
 The script never prints raw Docker/build/Goose/Go output; all tool output is
@@ -96,7 +99,7 @@ IMAGE_KEY_FILES = (
     "migrations/00002_create_mock_transactions.sql",
     "migrations/00003_create_result_handling_records.sql",
 )
-PACKAGES = ("internal/postgres", "internal/mock", "tests/harness")
+PACKAGES = ("internal/postgres", "internal/mock", "tests/harness", "tests")
 GO_TEST_PACKAGE_TIMEOUT_SECONDS = 120
 REQUIRED_INTEGRATION_TESTS = (
     "TestCommitHookIntegrationHidesReplyAfterRealCommit",
@@ -109,6 +112,29 @@ REQUIRED_TEST_PACKAGES = {
 REQUIRED_TEST_PACKAGES[
     "TestApplicationLifecycleIntegration/startup_diagnostics"
 ] = f"{EXPECTED_MODULE}/tests/harness"
+# First-batch storage/mock core roots and the next-batch order-lookup root are
+# bound to their own packages; they must not inherit the harness root above.
+REQUIRED_TEST_PACKAGES[
+    "TestOrderRegistrationIntegration"
+] = f"{EXPECTED_MODULE}/internal/postgres"
+REQUIRED_TEST_PACKAGES[
+    "TestObservationAtomicSaveIntegration"
+] = f"{EXPECTED_MODULE}/internal/postgres"
+REQUIRED_TEST_PACKAGES[
+    "TestMockTransactionIntegration"
+] = f"{EXPECTED_MODULE}/internal/mock"
+REQUIRED_TEST_PACKAGES[
+    "TestOrderLookupIntegration"
+] = f"{EXPECTED_MODULE}/internal/postgres"
+REQUIRED_TEST_PACKAGES[
+    "TestUS1Payment"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS1Restart"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS1HTTPBoundary"
+] = f"{EXPECTED_MODULE}/tests"
 EXPECTED_PACKAGE_PATHS = tuple(
     f"{EXPECTED_MODULE}/{name}" for name in PACKAGES
 )
@@ -155,8 +181,10 @@ SOURCE_MANIFEST_EXPLICIT = (
 )
 SOURCE_MANIFEST_GLOBS = (
     "internal/**/*.go",
-    "tests/harness/*.go",
+    "tests/**/*.go",
     "cmd/**/*.go",
+    "scripts/*.py",
+    "migrations/*.sql",
     ".github/workflows/*.yml",
     ".github/workflows/*.yaml",
 )
@@ -292,9 +320,11 @@ class Launcher:
             "readyz/lifecycle short real-connection semantics, explicit empty-Env "
             "child isolation, post-leader-exit cleanup deadlines, bounded startup "
             "diagnostic logs, safe release after failed Seal, immutable final "
-            "snapshot archiving, and helper self-tests; owned cleanup only; not "
-            "payment HTTP, business restart/idempotency, application image, full "
-            "MVP, T072, T077, or CD"
+            "snapshot archiving, helper self-tests, first-batch storage/mock "
+            "core paths, order lookup, and US1 real payment HTTP/byte-boundary/"
+            "restart integration; owned cleanup only; not payment HTTP beyond "
+            "US1, business restart/idempotency beyond US1, application image, "
+            "full MVP, T072, T077, or CD"
         )
         self.started_at = utc_now()
 
@@ -2470,6 +2500,9 @@ class Launcher:
         test_env = dict(self.offline_go_env)
         test_env["PAYMENT_HUB_TEST_DATABASE_URL"] = host_dsn
         test_env["PAYMENT_HUB_TEST_RUN_ID"] = self.run_id
+        test_env["PAYMENT_HUB_TEST_ARTIFACT_ROOT"] = str(
+            self.artifact_root
+        )
 
         package_args = [f"./{name}" for name in PACKAGES]
         vet = self._run_process_group(
@@ -3027,9 +3060,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "cover private UDS, readyz/lifecycle short real-connection semantics, "
             "explicit empty-Env child isolation, post-leader-exit cleanup deadlines, "
             "bounded startup diagnostic logs, safe release after failed Seal, "
-            "immutable final snapshot archiving, and helper self-tests. Not payment "
-            "HTTP, business restart/idempotency, application image, the T072 full "
-            "check, T077, or CD."
+            "immutable final snapshot archiving, helper self-tests, first-batch "
+            "storage/mock core paths, order lookup, and US1 real payment HTTP/"
+            "byte-boundary/restart integration. Not payment HTTP beyond US1, "
+            "business restart/idempotency beyond US1, application image, the T072 "
+            "full check, T077, or CD."
         )
     )
     parser.add_argument(

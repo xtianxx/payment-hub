@@ -88,6 +88,17 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Check CI contract metadata
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOMAXPROCS: "2"
+          GOPROXY: "off"
+          GOSUMDB: "off"
+        run: |
+          set -euo pipefail
+          python3 -B scripts/check-ci-contract.py --go "$(command -v go)"
+
       - name: Run foundation unit checks
         shell: bash
         env:
@@ -115,10 +126,14 @@ jobs:
             echo "## Foundation unit checks / 基础包单元检查"
             echo ""
             echo "所有已跟踪 Go 文件已通过 gofmt，默认非 integration 包（./...）已通过 go vet。scripts/ci_checks.py run-default 执行带 race、-count=1、-p=1、-timeout=90s 的 go test -json，覆盖真实私有 UDS、readyz/lifecycle 与短真实连接语义、显式空 Env 子进程隔离、leader 退出后的 Stop/Wait/lifetime 期限、有界且脱敏的启动诊断日志、Seal 失败后继续安全释放资源，以及只归档不可变终结 Observer 快照。整批外部监督预算为 ci_checks.GO_TEST_BATCH_TIMEOUT_SECONDS=570 秒，由构建、链接与串行测试共同消耗；这是共享整批预算，不保证每个包都拿满 90 秒，也不保证额外的 Go 强杀/输出等待时间，超时后的 kill/reap 与报告时间在 570 秒之外。"
-            echo "该 helper 只按完整 Package/Test/Action 判定：26 个显式 PR3 默认根必须全部 pass；缺失、skip、fail、重复或错包均不能为绿，cmd 包无测试文件单列为 no-test-files 而非静默通过。run-default-exit-code: $status（0 才表示该默认门禁通过）。"
+            echo "该 helper 只按完整 Package/Test/Action 判定；下列默认必需项由 scripts/check-ci-contract.py --summary default 从 ci_checks.DEFAULT_REQUIRED_TESTS 动态生成（包含焦点子测试的完整名字），必须全部 pass；缺失、skip、fail、重复或错包均不能为绿，cmd 包无测试文件单列为 no-test-files 而非静默通过。run-default-exit-code: $status（0 才表示该默认门禁通过）。"
+            echo ""
+            python3 -B scripts/check-ci-contract.py --summary default
+            echo ""
+            echo "其中 US1 默认根覆盖 core/查询/HTTP 合同与私有结果指令协议/客户端/observer/mock/app 消费封口及 app/router wiring unit，不代表真实失败 POST 或应用重启已完成。"
             echo "setup job 的 20 分钟是整个 job 上限，由准备、检查与上传共用，不保证各步骤最大值叠加，也不是对 570 秒整批预算的替代或额外预留。"
             echo "这些是 unit/默认包结果，不代表支付 HTTP、业务重启防重、应用镜像、默认全时长实测或完整 MVP 已验收。"
-            echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture、迁移工具镜像、必需 commit-hook 提交实验、工具 helper 两代父 Observer/真实 PG 保留，以及当前应用二进制 readyz/SIGTERM/坏配置/缺迁移启动失败与 startup 超时/取消/监听失败诊断，由 database-foundation job 在实际执行时逐项核对；完整支付 HTTP、业务重启防重、应用镜像、完整 MVP/T072/T077/CD 不在本步骤，也不由该 job 验收。"
+            echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture、迁移工具镜像、必需 commit-hook 提交实验、工具 helper 两代父 Observer/真实 PG 保留、当前应用二进制 readyz/SIGTERM/坏配置/缺迁移启动失败与 startup 超时/取消/监听失败诊断，以及 US1 真实支付 HTTP/字节边界/成功与失败/两代重启，由 database-foundation job 在实际执行时逐项核对；US1 范围外的完整支付流程、扩展业务重启、应用镜像、完整 MVP/T072/T077/CD 不在本步骤，也不由该 job 验收。"
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
@@ -263,7 +278,10 @@ jobs:
             echo "## Database foundation checks / 数据库基础检查"
             echo ""
             echo "本摘要来自安全启动器的固定前缀输出；launcher-exit-code 为 0 才表示启动器自身成功，非零失败不会被摘要掩盖。"
-            echo "本 job 覆盖数据库约束与已接线的 runtime harness integration；四个必需 integration 项为 TestCommitHookIntegrationHidesReplyAfterRealCommit、TestHarnessProcessPreservesParentStateIntegration、TestApplicationLifecycleIntegration 与显式子测试 TestApplicationLifecycleIntegration/startup_diagnostics，由启动器实际执行时逐项核对。不包含支付 HTTP、业务重启防重、应用镜像、完整 MVP、T072、T077、CD、发布或部署。"
+            echo "本 job 覆盖数据库约束、已接线的 runtime harness integration、首批存储/mock core integration、订单查询 integration 与 US1 真实 payment HTTP/字节边界/成功与失败/重启 integration；下列必需 integration 项（含显式子测试）及包绑定由 scripts/check-ci-contract.py --summary db 从 ci_checks.DB_REQUIRED_TEST_KEYS 与启动器绑定动态生成，由启动器实际执行时逐项核对；其中 US1 三项绑定 payment-hub/tests 包并配套安全 us1 报告导出。不包含应用镜像、完整 MVP、T072、T077、CD、发布或部署。"
+            echo ""
+            python3 -B scripts/check-ci-contract.py --summary db
+            echo ""
             echo "正常 PG 入口的 integration go test 使用与默认入口共享的整批监督预算 570 秒（ci_checks.GO_TEST_BATCH_TIMEOUT_SECONDS）：构建、链接与串行测试共同消耗，不保证每个包都获得完整的 120 秒测试额度，也没有独立的冷构建或收尾预留。该 570 秒不包含超时后的 kill/reap 及安全报告/文件系统收尾时间，也不构成 runner 硬杀或全部收尾在 570 秒内完成的保证。job 的 20 分钟是整个 job 上限，由准备、检查、取消清理与上传共用，不保证各阶段最大值叠加。"
             echo ""
             echo '```text'
@@ -285,7 +303,7 @@ jobs:
             else
               echo "cancellation-report: missing (normal PG failed, step skipped, or report not written)"
             fi
-            echo "安全归档由 scripts/ci_checks.py export-reports 仅从白名单字段重建 db-foundation.safe.json、cancellation.safe.json 与 provenance.json，并上传这三个固定文件；不递归复制 artifacts 目录，不包含原始 launcher 日志、环境或任意报告内容。"
+            echo "安全归档由 scripts/ci_checks.py export-reports 仅从白名单字段重建 db-foundation.safe.json、cancellation.safe.json、us1.safe.json 与 provenance.json，并上传这四个固定文件；不递归复制 artifacts 目录，不包含原始 launcher 日志、环境、原始 us1 报告或任意报告内容。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Export safe database reports
@@ -296,7 +314,7 @@ jobs:
           python3 -B scripts/ci_checks.py export-reports \
             --report-dir "$RUNNER_TEMP/payment-hub-db/reports" \
             --db-artifact-root "$RUNNER_TEMP/payment-hub-db/artifacts" \
-            --expect db,cancellation
+            --expect db,cancellation,us1
 
       - name: Upload safe database reports
         if: always()
@@ -306,6 +324,7 @@ jobs:
           path: |
             ${{ runner.temp }}/payment-hub-db/reports/upload/db-foundation.safe.json
             ${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json
+            ${{ runner.temp }}/payment-hub-db/reports/upload/us1.safe.json
             ${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json
           if-no-files-found: error
           retention-days: 14
@@ -462,3 +481,25 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           include-hidden-files: false
+
+  ci-gate:
+    name: CI gate
+    if: ${{ always() }}
+    needs: [setup-check, database-foundation, vulnerability-check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    env:
+      SETUP_RESULT: ${{ needs.setup-check.result }}
+      DATABASE_RESULT: ${{ needs.database-foundation.result }}
+      VULNERABILITY_RESULT: ${{ needs.vulnerability-check.result }}
+    steps:
+      - name: Require all CI jobs to succeed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${SETUP_RESULT:-}" != "success" || "${DATABASE_RESULT:-}" != "success" || "${VULNERABILITY_RESULT:-}" != "success" ]]; then
+            echo "ci-gate: one or more required jobs did not succeed"
+            exit 1
+          fi
+          echo "ci-gate: all required jobs succeeded"
+          exit 0

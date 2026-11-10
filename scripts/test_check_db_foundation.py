@@ -49,9 +49,31 @@ REQUIRED_INTEGRATION_TEST = "TestCommitHookIntegrationHidesReplyAfterRealCommit"
 T020_REQUIRED_INTEGRATION_TEST = "TestHarnessProcessPreservesParentStateIntegration"
 T022_REQUIRED_INTEGRATION_TEST = "TestApplicationLifecycleIntegration"
 REQUIRED_SUBTEST = "TestApplicationLifecycleIntegration/startup_diagnostics"
+T023_REQUIRED_INTEGRATION_TEST = "TestOrderRegistrationIntegration"
+T024_REQUIRED_INTEGRATION_TEST = "TestObservationAtomicSaveIntegration"
+T025_REQUIRED_INTEGRATION_TEST = "TestMockTransactionIntegration"
+ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST = "TestOrderLookupIntegration"
+TEST_US1_PAYMENT = "TestUS1Payment"
+TEST_US1_RESTART = "TestUS1Restart"
+TEST_US1_HTTP_BOUNDARY = "TestUS1HTTPBoundary"
 HARNESS_PACKAGE = "payment-hub/tests/harness"
+TESTS_PACKAGE = "payment-hub/tests"
 POSTGRES_PACKAGE = "payment-hub/internal/postgres"
 MOCK_PACKAGE = "payment-hub/internal/mock"
+
+REQUIRED_TEST_PACKAGE = {
+    REQUIRED_INTEGRATION_TEST: HARNESS_PACKAGE,
+    T020_REQUIRED_INTEGRATION_TEST: HARNESS_PACKAGE,
+    T022_REQUIRED_INTEGRATION_TEST: HARNESS_PACKAGE,
+    REQUIRED_SUBTEST: HARNESS_PACKAGE,
+    T023_REQUIRED_INTEGRATION_TEST: POSTGRES_PACKAGE,
+    T024_REQUIRED_INTEGRATION_TEST: POSTGRES_PACKAGE,
+    T025_REQUIRED_INTEGRATION_TEST: MOCK_PACKAGE,
+    ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST: POSTGRES_PACKAGE,
+    TEST_US1_PAYMENT: TESTS_PACKAGE,
+    TEST_US1_RESTART: TESTS_PACKAGE,
+    TEST_US1_HTTP_BOUNDARY: TESTS_PACKAGE,
+}
 
 
 def json_event(action, package, test=None, elapsed=None, output=None):
@@ -79,38 +101,46 @@ PACKAGE_OK_OUTPUT = (
     + json_event("run", HARNESS_PACKAGE, "TestPackageHealth")
     + json_event("pass", HARNESS_PACKAGE, "TestPackageHealth", elapsed=0.01)
     + json_event("pass", HARNESS_PACKAGE, elapsed=0.3)
+    + json_event("start", TESTS_PACKAGE)
+    + json_event("run", TESTS_PACKAGE, "TestPackageHealth")
+    + json_event("pass", TESTS_PACKAGE, "TestPackageHealth", elapsed=0.01)
+    + json_event("pass", TESTS_PACKAGE, elapsed=0.4)
 )
 
 
 def required_root_pass_output(name=REQUIRED_INTEGRATION_TEST):
+    package = REQUIRED_TEST_PACKAGE[name]
     return (
-        json_event("run", HARNESS_PACKAGE, name)
-        + json_event("pass", HARNESS_PACKAGE, name, elapsed=0.01)
+        json_event("run", package, name)
+        + json_event("pass", package, name, elapsed=0.01)
     )
 
 
 def required_pass_output(name=REQUIRED_INTEGRATION_TEST):
     if name == T022_REQUIRED_INTEGRATION_TEST:
+        package = REQUIRED_TEST_PACKAGE[name]
         return (
-            json_event("run", HARNESS_PACKAGE, name)
-            + json_event("run", HARNESS_PACKAGE, REQUIRED_SUBTEST)
-            + json_event("pass", HARNESS_PACKAGE, REQUIRED_SUBTEST, elapsed=0.01)
-            + json_event("pass", HARNESS_PACKAGE, name, elapsed=0.02)
+            json_event("run", package, name)
+            + json_event("run", package, REQUIRED_SUBTEST)
+            + json_event("pass", package, REQUIRED_SUBTEST, elapsed=0.01)
+            + json_event("pass", package, name, elapsed=0.02)
         )
     return required_root_pass_output(name)
 
 
 def required_skip_output(name=REQUIRED_INTEGRATION_TEST):
+    package = REQUIRED_TEST_PACKAGE[name]
     return (
-        json_event("run", HARNESS_PACKAGE, name)
-        + json_event("skip", HARNESS_PACKAGE, name)
+        json_event("run", package, name)
+        + json_event("skip", package, name)
     )
 
 
 def required_fail_output(name=REQUIRED_INTEGRATION_TEST):
+    package = REQUIRED_TEST_PACKAGE[name]
     return (
-        json_event("run", HARNESS_PACKAGE, name)
-        + json_event("fail", HARNESS_PACKAGE, name)
+        json_event("run", package, name)
+        + json_event("fail", package, name)
     )
 
 
@@ -138,10 +168,26 @@ def both_required_pass_output():
     )
 
 
-def all_required_pass_output():
+def pr3_required_pass_output():
     return both_required_pass_output() + required_pass_output(
         T022_REQUIRED_INTEGRATION_TEST
     )
+
+
+def us1_required_pass_output():
+    return (
+        required_pass_output(T023_REQUIRED_INTEGRATION_TEST)
+        + required_pass_output(T024_REQUIRED_INTEGRATION_TEST)
+        + required_pass_output(T025_REQUIRED_INTEGRATION_TEST)
+        + required_pass_output(ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST)
+        + required_pass_output(TEST_US1_PAYMENT)
+        + required_pass_output(TEST_US1_RESTART)
+        + required_pass_output(TEST_US1_HTTP_BOUNDARY)
+    )
+
+
+def all_required_pass_output():
+    return pr3_required_pass_output() + us1_required_pass_output()
 
 
 def roots_only_required_pass_output():
@@ -149,7 +195,43 @@ def roots_only_required_pass_output():
         required_root_pass_output(REQUIRED_INTEGRATION_TEST)
         + required_root_pass_output(T020_REQUIRED_INTEGRATION_TEST)
         + required_root_pass_output(T022_REQUIRED_INTEGRATION_TEST)
+        + required_root_pass_output(T023_REQUIRED_INTEGRATION_TEST)
+        + required_root_pass_output(T024_REQUIRED_INTEGRATION_TEST)
+        + required_root_pass_output(T025_REQUIRED_INTEGRATION_TEST)
+        + required_root_pass_output(ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST)
+        + required_root_pass_output(TEST_US1_PAYMENT)
+        + required_root_pass_output(TEST_US1_RESTART)
+        + required_root_pass_output(TEST_US1_HTTP_BOUNDARY)
     )
+
+
+def without_test_events(text, test_name):
+    kept = []
+    for line in text.splitlines():
+        if not line:
+            continue
+        value = json.loads(line)
+        if value.get("Test") == test_name:
+            continue
+        kept.append(line)
+    return "\n".join(kept) + "\n"
+
+
+def replace_test_terminal(text, package, test_name, action):
+    replaced = []
+    for line in text.splitlines():
+        if not line:
+            continue
+        value = json.loads(line)
+        if (
+            value.get("Package") == package
+            and value.get("Test") == test_name
+            and value.get("Action") == "pass"
+        ):
+            value["Action"] = action
+            value.pop("Elapsed", None)
+        replaced.append(json.dumps(value, separators=(",", ":")))
+    return "\n".join(replaced) + "\n"
 
 
 def completed(argv, code=0, stdout="", stderr=""):
@@ -318,6 +400,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 ),
             ]
         )
+        self.assertIn("tests", MOD.PACKAGES)
         self.launcher.run_tests()
         test_argv = self.launcher._run_process_group.call_args_list[1].args[3]
         self.assertIn("-json", test_argv)
@@ -342,6 +425,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 completed(["go", "test"], 0, PACKAGE_OK_OUTPUT, ""),
             ]
         )
+        self.assertIn("tests", MOD.PACKAGES)
         with self.assertRaises(MOD.LauncherError) as raised:
             self.launcher.run_tests()
         self.assertEqual(raised.exception.stage, "test")
@@ -419,16 +503,12 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 ),
             ]
         )
+        self.assertIn("tests", MOD.PACKAGES)
         self.launcher.run_tests()
         test_argv = self.launcher._run_process_group.call_args_list[1].args[3]
         self.assertIn("-json", test_argv)
         self.assertNotIn("-v", test_argv)
-        expected = {
-            REQUIRED_INTEGRATION_TEST: "pass",
-            T020_REQUIRED_INTEGRATION_TEST: "pass",
-            T022_REQUIRED_INTEGRATION_TEST: "pass",
-            REQUIRED_SUBTEST: "pass",
-        }
+        expected = {name: "pass" for name in REQUIRED_TEST_PACKAGE}
         self.assertEqual(self.launcher.tests["required_test_results"], expected)
         self.assertEqual(
             self.launcher._build_report()["tests"]["required_test_results"],
@@ -449,17 +529,15 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 ),
             ]
         )
+        self.assertIn("tests", MOD.PACKAGES)
         with self.assertRaises(MOD.LauncherError) as raised:
             self.launcher.run_tests()
         self.assertEqual(raised.exception.stage, "test")
+        expected = {name: "missing" for name in REQUIRED_TEST_PACKAGE}
+        expected[REQUIRED_INTEGRATION_TEST] = "pass"
         self.assertEqual(
             self.launcher.tests["required_test_results"],
-            {
-                REQUIRED_INTEGRATION_TEST: "pass",
-                T020_REQUIRED_INTEGRATION_TEST: "missing",
-                T022_REQUIRED_INTEGRATION_TEST: "missing",
-                REQUIRED_SUBTEST: "missing",
-            },
+            expected,
         )
 
     def test_t022_parser_requires_third_required_root(self):
@@ -536,16 +614,12 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 ),
             ]
         )
+        self.assertIn("tests", MOD.PACKAGES)
         self.launcher.run_tests()
         test_argv = self.launcher._run_process_group.call_args_list[1].args[3]
         self.assertIn("-json", test_argv)
         self.assertNotIn("-v", test_argv)
-        expected = {
-            REQUIRED_INTEGRATION_TEST: "pass",
-            T020_REQUIRED_INTEGRATION_TEST: "pass",
-            T022_REQUIRED_INTEGRATION_TEST: "pass",
-            REQUIRED_SUBTEST: "pass",
-        }
+        expected = {name: "pass" for name in REQUIRED_TEST_PACKAGE}
         self.assertEqual(self.launcher.tests["required_test_results"], expected)
         self.assertEqual(
             self.launcher._build_report()["tests"]["required_test_results"],
@@ -565,17 +639,16 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 ),
             ]
         )
+        self.assertIn("tests", MOD.PACKAGES)
         with self.assertRaises(MOD.LauncherError) as raised:
             self.launcher.run_tests()
         self.assertEqual(raised.exception.stage, "test")
+        expected = {name: "missing" for name in REQUIRED_TEST_PACKAGE}
+        expected[REQUIRED_INTEGRATION_TEST] = "pass"
+        expected[T020_REQUIRED_INTEGRATION_TEST] = "pass"
         self.assertEqual(
             self.launcher.tests["required_test_results"],
-            {
-                REQUIRED_INTEGRATION_TEST: "pass",
-                T020_REQUIRED_INTEGRATION_TEST: "pass",
-                T022_REQUIRED_INTEGRATION_TEST: "missing",
-                REQUIRED_SUBTEST: "missing",
-            },
+            expected,
         )
 
     def test_runtime_parser_rejects_missing_required_subtest(self):
@@ -660,10 +733,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.assertIn("test-exit", problems)
 
     def test_required_package_bindings_are_centralized(self):
-        expected = {
-            name: HARNESS_PACKAGE for name in MOD.REQUIRED_INTEGRATION_TESTS
-        }
-        expected[REQUIRED_SUBTEST] = HARNESS_PACKAGE
+        expected = dict(REQUIRED_TEST_PACKAGE)
         self.assertEqual(MOD.REQUIRED_TEST_PACKAGES, expected)
         self.assertEqual(
             tuple(MOD.REQUIRED_TEST_PACKAGES),
@@ -674,6 +744,296 @@ class CheckDBFoundationMockTests(unittest.TestCase):
             tuple("payment-hub/" + name for name in MOD.PACKAGES),
         )
 
+    def test_us1_required_bindings_use_storage_and_mock_roots(self):
+        self.assertEqual(
+            MOD.REQUIRED_TEST_PACKAGES.get(T023_REQUIRED_INTEGRATION_TEST),
+            POSTGRES_PACKAGE,
+        )
+        self.assertEqual(
+            MOD.REQUIRED_TEST_PACKAGES.get(T024_REQUIRED_INTEGRATION_TEST),
+            POSTGRES_PACKAGE,
+        )
+        self.assertEqual(
+            MOD.REQUIRED_TEST_PACKAGES.get(T025_REQUIRED_INTEGRATION_TEST),
+            MOCK_PACKAGE,
+        )
+        self.assertEqual(
+            MOD.REQUIRED_TEST_PACKAGES.get(
+                ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST
+            ),
+            POSTGRES_PACKAGE,
+        )
+        for name in (TEST_US1_PAYMENT, TEST_US1_RESTART, TEST_US1_HTTP_BOUNDARY):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    MOD.REQUIRED_TEST_PACKAGES.get(name), TESTS_PACKAGE
+                )
+                self.assertNotEqual(
+                    MOD.REQUIRED_TEST_PACKAGES.get(name), HARNESS_PACKAGE
+                )
+        for name in (
+            T023_REQUIRED_INTEGRATION_TEST,
+            T024_REQUIRED_INTEGRATION_TEST,
+            T025_REQUIRED_INTEGRATION_TEST,
+            ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST,
+            TEST_US1_PAYMENT,
+            TEST_US1_RESTART,
+            TEST_US1_HTTP_BOUNDARY,
+        ):
+            with self.subTest(name=name):
+                self.assertNotEqual(
+                    MOD.REQUIRED_TEST_PACKAGES.get(name), HARNESS_PACKAGE
+                )
+                self.assertIn(name, CI_MOD.DB_REQUIRED_TEST_KEYS)
+
+    def test_us1_parser_requires_new_storage_and_mock_roots(self):
+        required, problems = self.launcher._parse_required_test_results(
+            PACKAGE_OK_OUTPUT + pr3_required_pass_output()
+        )
+        for name in (
+            T023_REQUIRED_INTEGRATION_TEST,
+            T024_REQUIRED_INTEGRATION_TEST,
+            T025_REQUIRED_INTEGRATION_TEST,
+            ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST,
+            TEST_US1_PAYMENT,
+            TEST_US1_RESTART,
+            TEST_US1_HTTP_BOUNDARY,
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(required.get(name), "missing")
+        self.assertIn("required-test-missing", problems)
+
+    def test_us1_parser_accepts_all_eleven_required_roots(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 0
+        )
+        self.assertEqual(problems, [])
+
+    def test_us1_parser_requires_each_new_root_individually(self):
+        stdout = PACKAGE_OK_OUTPUT + all_required_pass_output()
+        for name in (
+            T023_REQUIRED_INTEGRATION_TEST,
+            T024_REQUIRED_INTEGRATION_TEST,
+            T025_REQUIRED_INTEGRATION_TEST,
+            ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST,
+            TEST_US1_PAYMENT,
+            TEST_US1_RESTART,
+            TEST_US1_HTTP_BOUNDARY,
+        ):
+            with self.subTest(name=name):
+                required, problems = self.launcher._parse_required_test_results(
+                    without_test_events(stdout, name)
+                )
+                self.assertEqual(required.get(name), "missing")
+                self.assertIn("required-test-missing", problems)
+
+    def test_us1_parser_rejects_new_root_skip(self):
+        stdout = replace_test_terminal(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(),
+            POSTGRES_PACKAGE,
+            T023_REQUIRED_INTEGRATION_TEST,
+            "skip",
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(
+            required.get(T023_REQUIRED_INTEGRATION_TEST), "skip"
+        )
+        self.assertIn("required-test-skip", problems)
+
+    def test_us1_parser_rejects_new_root_wrong_package(self):
+        stdout = without_test_events(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(),
+            T025_REQUIRED_INTEGRATION_TEST,
+        )
+        stdout += json_event("run", POSTGRES_PACKAGE, T025_REQUIRED_INTEGRATION_TEST)
+        stdout += json_event(
+            "pass", POSTGRES_PACKAGE, T025_REQUIRED_INTEGRATION_TEST, elapsed=0.01
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(
+            required.get(T025_REQUIRED_INTEGRATION_TEST), "wrong-package"
+        )
+        self.assertIn("required-test-wrong-package", problems)
+
+    def test_us1_parser_rejects_new_root_output_spoof(self):
+        stdout = without_test_events(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(),
+            T024_REQUIRED_INTEGRATION_TEST,
+        )
+        stdout += json_event(
+            "output",
+            POSTGRES_PACKAGE,
+            output=(
+                "--- PASS: "
+                + T024_REQUIRED_INTEGRATION_TEST
+                + " (0.00s)\n"
+            ),
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(
+            required.get(T024_REQUIRED_INTEGRATION_TEST), "missing"
+        )
+        self.assertIn("required-test-missing", problems)
+
+    def test_us1_parser_rejects_lookup_root_skip(self):
+        stdout = replace_test_terminal(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(),
+            POSTGRES_PACKAGE,
+            ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST,
+            "skip",
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(
+            required.get(ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST), "skip"
+        )
+        self.assertIn("required-test-skip", problems)
+
+    def test_us1_parser_rejects_lookup_root_wrong_package(self):
+        stdout = without_test_events(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(),
+            ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST,
+        )
+        stdout += json_event(
+            "run", HARNESS_PACKAGE, ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST
+        )
+        stdout += json_event(
+            "pass",
+            HARNESS_PACKAGE,
+            ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST,
+            elapsed=0.01,
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(
+            required.get(ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST),
+            "wrong-package",
+        )
+        self.assertIn("required-test-wrong-package", problems)
+
+    def test_us1_parser_rejects_lookup_root_output_spoof(self):
+        stdout = without_test_events(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(),
+            ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST,
+        )
+        stdout += json_event(
+            "output",
+            POSTGRES_PACKAGE,
+            output=(
+                "--- PASS: "
+                + ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST
+                + " (0.00s)\n"
+            ),
+        )
+        required, problems = self.launcher._parse_required_test_results(stdout)
+        self.assertEqual(
+            required.get(ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST), "missing"
+        )
+        self.assertIn("required-test-missing", problems)
+
+    def test_us1_parser_rejects_tests_package_roots_skip_wrong_and_output(self):
+        for target in (
+            TEST_US1_PAYMENT,
+            TEST_US1_RESTART,
+            TEST_US1_HTTP_BOUNDARY,
+        ):
+            with self.subTest(target=target, case="skip"):
+                stdout = replace_test_terminal(
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(),
+                    TESTS_PACKAGE,
+                    target,
+                    "skip",
+                )
+                required, problems = (
+                    self.launcher._parse_required_test_results(stdout)
+                )
+                self.assertEqual(required.get(target), "skip")
+                self.assertIn("required-test-skip", problems)
+            with self.subTest(target=target, case="wrong-package"):
+                stdout = without_test_events(
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(),
+                    target,
+                )
+                stdout += json_event("run", HARNESS_PACKAGE, target)
+                stdout += json_event(
+                    "pass", HARNESS_PACKAGE, target, elapsed=0.01
+                )
+                required, problems = (
+                    self.launcher._parse_required_test_results(stdout)
+                )
+                self.assertEqual(required.get(target), "wrong-package")
+                self.assertIn("required-test-wrong-package", problems)
+            with self.subTest(target=target, case="output-spoof"):
+                stdout = without_test_events(
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(),
+                    target,
+                )
+                stdout += json_event(
+                    "output",
+                    TESTS_PACKAGE,
+                    output="--- PASS: " + target + " (0.00s)\n",
+                )
+                required, problems = (
+                    self.launcher._parse_required_test_results(stdout)
+                )
+                self.assertEqual(required.get(target), "missing")
+                self.assertIn("required-test-missing", problems)
+
+    def test_source_manifest_globs_cover_us1_go_files(self):
+        fixture = self._write_manifest_fixture(
+            Path(self.temp.name) / "manifest-us1-fixture"
+        )
+        self.launcher.repo = fixture
+        new_files = (
+            "internal/payment/errors.go",
+            "internal/payment/query_types.go",
+            "internal/httpapi/query_handler.go",
+            "internal/postgres/order_registration.go",
+            "internal/postgres/order_lookup.go",
+            "internal/mock/transaction.go",
+            "tests/harness/committed_postgres.go",
+            "tests/us1_report_test.go",
+            "tests/us1_report.go",
+        )
+        for relative in new_files:
+            path = fixture / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("package fixture\n", encoding="utf-8")
+        self.launcher.collect_source_manifest()
+        manifest_paths = {
+            entry["path"] for entry in self.launcher.source["manifest"]
+        }
+        for relative in new_files:
+            with self.subTest(relative=relative):
+                self.assertIn(relative, manifest_paths)
+
+    def test_source_manifest_globs_cover_nested_tests_scripts_migrations(self):
+        fixture = self._write_manifest_fixture(
+            Path(self.temp.name) / "manifest-nested-fixture"
+        )
+        self.launcher.repo = fixture
+        new_files = (
+            "tests/us1/nested_test.go",
+            "scripts/newhelper.py",
+            "migrations/new.sql",
+        )
+        for relative in new_files:
+            path = fixture / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n", encoding="utf-8")
+        for pattern in (
+            "tests/**/*.go",
+            "scripts/*.py",
+            "migrations/*.sql",
+        ):
+            with self.subTest(pattern=pattern):
+                self.assertIn(pattern, MOD.SOURCE_MANIFEST_GLOBS)
+        self.launcher.collect_source_manifest()
+        manifest_paths = {
+            entry["path"] for entry in self.launcher.source["manifest"]
+        }
+        for relative in new_files:
+            with self.subTest(relative=relative):
+                self.assertIn(relative, manifest_paths)
+
     def test_go_environment_cgo_gomax_and_offline_test_env(self):
         self.args.download_modules = True
         online = MOD.Launcher(self.args)
@@ -682,6 +1042,29 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.assertTrue(online.go_env["GOPROXY"].startswith("https://"))
         self.assertEqual(online.offline_go_env["GOPROXY"], "off")
         self.assertEqual(online.offline_go_env["GOSUMDB"], "off")
+
+    def test_run_tests_exports_trusted_artifact_root_env(self):
+        self.launcher.published_port = 54321
+        self.launcher._run_process_group = mock.Mock(
+            side_effect=[
+                completed(["go", "vet"], 0, "", ""),
+                completed(
+                    ["go", "test"],
+                    0,
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(),
+                    "",
+                ),
+            ]
+        )
+        self.assertIn("tests", MOD.PACKAGES)
+        self.launcher.run_tests()
+        env = self.launcher._run_process_group.call_args_list[1].args[4]
+        artifact_root = env.get("PAYMENT_HUB_TEST_ARTIFACT_ROOT")
+        self.assertIsInstance(artifact_root, str)
+        self.assertTrue(Path(artifact_root).is_absolute())
+        self.assertEqual(artifact_root, str(self.launcher.artifact_root))
+        self.assertIn("PAYMENT_HUB_TEST_DATABASE_URL", env)
+        self.assertIn("PAYMENT_HUB_TEST_RUN_ID", env)
 
     def test_run_timeout_records_124_and_timed_out(self):
         with mock.patch.object(
@@ -1141,6 +1524,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 ),
             ]
         )
+        self.assertIn("tests", MOD.PACKAGES)
         self.launcher.run_tests()
         test_call = self.launcher._run_process_group.call_args_list[1]
         self.assertEqual(test_call.args[2], "go test integration")
@@ -1405,7 +1789,14 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         for entry in diagnostics:
             self.assertIn(
                 entry["package"],
-                ("", "unknown", POSTGRES_PACKAGE, MOCK_PACKAGE, HARNESS_PACKAGE),
+                (
+                    "",
+                    "unknown",
+                    POSTGRES_PACKAGE,
+                    MOCK_PACKAGE,
+                    HARNESS_PACKAGE,
+                    TESTS_PACKAGE,
+                ),
             )
             self.assertNotIn(canary, entry["test"])
             self.assertNotIn(canary, entry["location"])
@@ -1502,6 +1893,9 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
             self._job("vulnerability-check")["timeout-minutes"], 10
         )
 
+    def test_ci_gate_timeout_is_one_minute_separate_from_original_three(self):
+        self.assertEqual(self._job("ci-gate")["timeout-minutes"], 1)
+
     def test_permissions_needs_concurrency_and_pins_unchanged(self):
         self.assertEqual(self.data["permissions"], {"contents": "read"})
         self.assertEqual(
@@ -1545,9 +1939,10 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
                 [
                     "${{ runner.temp }}/payment-hub-db/reports/upload/db-foundation.safe.json",
                     "${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json",
+                    "${{ runner.temp }}/payment-hub-db/reports/upload/us1.safe.json",
                     "${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json",
                 ],
-                "--expect db,cancellation",
+                "--expect db,cancellation,us1",
             ),
             "vulnerability-check": (
                 "Upload safe vulnerability reports",
@@ -1607,7 +2002,7 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
                 for forbidden in ("3×120", "3 * 120", "3个120", "三个 120"):
                     self.assertNotIn(forbidden, text)
 
-    def test_all_14_bash_blocks_parse_with_bash_n(self):
+    def test_all_16_bash_blocks_parse_with_bash_n(self):
         bash = shutil.which("bash")
         self.assertIsNotNone(bash)
         scripts = [
@@ -1616,7 +2011,7 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
             for step in job.get("steps", [])
             if step.get("shell") == "bash"
         ]
-        self.assertEqual(len(scripts), 14)
+        self.assertEqual(len(scripts), 16)
         for index, script in enumerate(scripts):
             result = subprocess.run(
                 [bash, "-n"],
