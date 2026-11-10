@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"payment-hub/internal/httpapi"
 )
 
 const (
@@ -59,6 +61,15 @@ type runtimeDeps struct {
 	openDatabase func(context.Context, string) (runtimeDatabase, error)
 	listen       func(context.Context, string) (net.Listener, error)
 	newServer    func(*http.Server) runtimeServer
+	// newBusiness builds the narrow business ports from the already-open
+	// runtime database and the optional test-mode adapters. The context is the
+	// application work context shared with the HTTP base context, so business
+	// work and request handlers observe the same lifecycle.
+	newBusiness func(context.Context, runtimeDatabase, *TestMode) (httpapi.PaymentSubmitter, httpapi.PaymentQuerier, error)
+	// businessRequired makes a missing or failing business factory a startup
+	// failure. Old test dependency literals leave it false to keep their
+	// explicit readyz-only scope.
+	businessRequired bool
 }
 
 type runtimeLimits struct {
@@ -96,6 +107,8 @@ func realRuntimeDeps() runtimeDeps {
 		newServer: func(server *http.Server) runtimeServer {
 			return &httpRuntimeServer{server: server}
 		},
+		newBusiness:      productionNewBusiness,
+		businessRequired: true,
 	}
 }
 
@@ -192,6 +205,16 @@ func (db *pgxpoolRuntimeDatabase) CheckMigrations(ctx context.Context) error {
 
 func (db *pgxpoolRuntimeDatabase) Close() {
 	db.pool.Close()
+}
+
+// BusinessPool returns the same production pool used for readiness and
+// migrations. It is intentionally a narrow private seam: the business factory
+// must not open a second pool or accept a test-only pool injection path.
+func (db *pgxpoolRuntimeDatabase) BusinessPool() *pgxpool.Pool {
+	if db == nil {
+		return nil
+	}
+	return db.pool
 }
 
 func parseRuntimeDatabaseConfig(databaseURL string) (*pgxpool.Config, error) {

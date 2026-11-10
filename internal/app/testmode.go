@@ -161,6 +161,69 @@ func (control *testModeMockControl) PaymentEntry(ctx context.Context, order paym
 	return mapTestModeMockError(control.client.Enter(ctx, testcontrol.KindPayment, string(order)), false)
 }
 
+// PaymentEntryResult records one payment entry through the new client API,
+// copies the optional result directive into the closed payment.Result type, and
+// returns a callback that sends the actual committed result back through the
+// same single-use token. No directive still sends the bare legacy reach.
+func (control *testModeMockControl) PaymentEntryResult(ctx context.Context, order payment.PaymentOrderID) (mock.PaymentEntryOutcome, error) {
+	if control == nil || control.client == nil {
+		return mock.PaymentEntryOutcome{}, mock.ErrControlFault
+	}
+	client := control.client
+	token, err := client.PaymentEntry(ctx, string(order))
+	if err != nil {
+		return mock.PaymentEntryOutcome{}, mock.ErrControlFault
+	}
+
+	var result *payment.Result
+	if directive, ok := token.Directive(); ok {
+		mapped, valid := testModePaymentResult(directive)
+		if !valid {
+			return mock.PaymentEntryOutcome{}, mock.ErrControlFault
+		}
+		result = &mapped
+	}
+
+	return mock.PaymentEntryOutcome{
+		Result: result,
+		OnCommitted: func(ctx context.Context, actual payment.Result) error {
+			applied, valid := testModeAppliedDirective(actual)
+			if !valid {
+				return mock.ErrControlFault
+			}
+			if err := client.MockCommitted(ctx, token, applied); err != nil {
+				if errors.Is(err, testcontrol.ErrReplyHidden) {
+					return mock.ErrReplyHidden
+				}
+				return mock.ErrControlFault
+			}
+			return nil
+		},
+	}, nil
+}
+
+func testModePaymentResult(directive testcontrol.Directive) (payment.Result, bool) {
+	switch directive {
+	case testcontrol.DirectiveSucceeded:
+		return payment.ResultSucceeded, true
+	case testcontrol.DirectiveFailed:
+		return payment.ResultFailed, true
+	default:
+		return "", false
+	}
+}
+
+func testModeAppliedDirective(result payment.Result) (testcontrol.Directive, bool) {
+	switch result {
+	case payment.ResultSucceeded:
+		return testcontrol.DirectiveSucceeded, true
+	case payment.ResultFailed:
+		return testcontrol.DirectiveFailed, true
+	default:
+		return "", false
+	}
+}
+
 func (control *testModeMockControl) QueryEntry(ctx context.Context, order payment.PaymentOrderID) error {
 	if control == nil || control.client == nil {
 		return nil
