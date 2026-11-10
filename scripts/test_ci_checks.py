@@ -30,17 +30,24 @@ MOD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MOD)
 
 APP = "payment-hub/internal/app"
+PAYMENT = "payment-hub/internal/payment"
+HTTPAPI = "payment-hub/internal/httpapi"
+TESTCONTROL = "payment-hub/internal/testcontrol"
+POSTGRES = "payment-hub/internal/postgres"
+MOCK = "payment-hub/internal/mock"
+TESTS = "payment-hub/tests"
 HARNESS = "payment-hub/tests/harness"
 CMD = "payment-hub/cmd/payment-hub"
+FOCUS_SUBTEST = "TestPaymentRequestBoundary/POST_rejection_priority"
 EXPECTED = (APP, HARNESS, CMD)
 REQUIRED = {
     "TestRequiredRoot": HARNESS,
     "TestRequiredRoot/sub_case": HARNESS,
 }
 
-# Frozen 26 PR3 roots read from the four review/regression test files, plus the
-# three original integration roots and the explicitly required lifecycle
-# subtest. This literal is deliberately not derived from the source tree.
+# Frozen 26 PR3 roots read from the four review/regression test files. This
+# literal is deliberately not derived from the source tree and is kept intact
+# as the historical PR3 inventory; the US1 core roots are listed separately.
 EXPECTED_DEFAULT_REQUIRED = {
     "TestStartupDiagnosticsDatabaseOpenFailure": APP,
     "TestStartupDiagnosticsPingRetryExhaustion": APP,
@@ -68,6 +75,65 @@ EXPECTED_DEFAULT_REQUIRED = {
     "TestProcessReviewTerminalPublishedAfterGroupWatchJoined": HARNESS,
     "TestProcessReviewWatchGroupStopUnblocksFullEventChannel": HARNESS,
     "TestProcessReviewHelper": HARNESS,
+}
+
+# First-batch US1 core default roots, next-batch query and HTTP contract
+# roots, and the payment-directive protocol/client/consumer roots. Kept
+# separate so the historical PR3 26-root assertion above is not silently
+# deleted when the inventory grows.
+EXPECTED_US1_DEFAULT_REQUIRED = {
+    "TestSubmitPayment": PAYMENT,
+    "TestEvidenceDecision": PAYMENT,
+    "TestQueryPayment": PAYMENT,
+    "TestPaymentRequestBoundary": HTTPAPI,
+    "TestPaymentResponseContract": HTTPAPI,
+    "TestPaymentRequestBoundary/POST_rejection_priority": HTTPAPI,
+    "TestPaymentDirectiveProtocol": TESTCONTROL,
+    "TestPaymentDirectiveClient": TESTCONTROL,
+    "TestObserverPaymentDirective": HARNESS,
+    "TestMockPaymentDirective": MOCK,
+    "TestAppPaymentDirective": APP,
+    "TestPaymentRuntimeWiring": APP,
+    "TestPaymentRouterWiring": HTTPAPI,
+}
+EXPECTED_DEFAULT_REQUIRED_TOTAL = {
+    **EXPECTED_DEFAULT_REQUIRED,
+    **EXPECTED_US1_DEFAULT_REQUIRED,
+}
+
+PAYMENT_DIRECTIVE_DEFAULT_ROOTS = (
+    "TestPaymentDirectiveProtocol",
+    "TestPaymentDirectiveClient",
+    "TestObserverPaymentDirective",
+    "TestMockPaymentDirective",
+    "TestAppPaymentDirective",
+)
+
+# Eight explicit DB-launcher integration bindings: the original four harness
+# roots, the first-batch storage/mock core roots, and the order-lookup root.
+EXPECTED_DB_REQUIRED = {
+    "TestCommitHookIntegrationHidesReplyAfterRealCommit": HARNESS,
+    "TestHarnessProcessPreservesParentStateIntegration": HARNESS,
+    "TestApplicationLifecycleIntegration": HARNESS,
+    "TestApplicationLifecycleIntegration/startup_diagnostics": HARNESS,
+    "TestOrderRegistrationIntegration": POSTGRES,
+    "TestObservationAtomicSaveIntegration": POSTGRES,
+    "TestMockTransactionIntegration": MOCK,
+    "TestOrderLookupIntegration": POSTGRES,
+    "TestUS1Payment": TESTS,
+    "TestUS1Restart": TESTS,
+    "TestUS1HTTPBoundary": TESTS,
+}
+EXPECTED_PR3_DB_REQUIRED = {
+    name: package
+    for name, package in EXPECTED_DB_REQUIRED.items()
+    if name
+    in {
+        "TestCommitHookIntegrationHidesReplyAfterRealCommit",
+        "TestHarnessProcessPreservesParentStateIntegration",
+        "TestApplicationLifecycleIntegration",
+        "TestApplicationLifecycleIntegration/startup_diagnostics",
+    }
 }
 
 
@@ -186,6 +252,37 @@ def default_stream(expected_packages, required_tests):
             parts.append(event("pass", package, root, elapsed=0.02))
         parts.append(event("pass", package, elapsed=0.5))
     return "".join(parts)
+
+
+def without_test_events(text, test_name):
+    """Drop every event for one test; package terminal events are preserved."""
+    kept = []
+    for line in text.splitlines():
+        if not line:
+            continue
+        value = json.loads(line)
+        if value.get("Test") == test_name:
+            continue
+        kept.append(line)
+    return "\n".join(kept) + "\n"
+
+
+def replace_test_terminal(text, package, test_name, action):
+    """Replace one test's pass terminal with another terminal action."""
+    replaced = []
+    for line in text.splitlines():
+        if not line:
+            continue
+        value = json.loads(line)
+        if (
+            value.get("Package") == package
+            and value.get("Test") == test_name
+            and value.get("Action") == "pass"
+        ):
+            value["Action"] = action
+            value.pop("Elapsed", None)
+        replaced.append(json.dumps(value, separators=(",", ":")))
+    return "\n".join(replaced) + "\n"
 
 
 def proc(code, stdout, stderr="", timed_out=False, wait_elapsed_seconds=None):
@@ -905,14 +1002,41 @@ class ParseGoTestJSONTests(unittest.TestCase):
 
 class DefaultInventoryTests(unittest.TestCase):
     def test_default_required_mapping_is_frozen(self):
-        self.assertEqual(MOD.DEFAULT_REQUIRED_TESTS, EXPECTED_DEFAULT_REQUIRED)
-        self.assertEqual(len(MOD.DEFAULT_REQUIRED_TESTS), 26)
+        # Historical PR3 26-root inventory remains asserted as its own set.
+        self.assertEqual(len(EXPECTED_DEFAULT_REQUIRED), 26)
+        self.assertEqual(
+            {
+                name: MOD.DEFAULT_REQUIRED_TESTS.get(name)
+                for name in EXPECTED_DEFAULT_REQUIRED
+            },
+            EXPECTED_DEFAULT_REQUIRED,
+        )
+        self.assertEqual(
+            {
+                name: MOD.DEFAULT_REQUIRED_TESTS.get(name)
+                for name in EXPECTED_US1_DEFAULT_REQUIRED
+            },
+            EXPECTED_US1_DEFAULT_REQUIRED,
+        )
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS, EXPECTED_DEFAULT_REQUIRED_TOTAL
+        )
+        self.assertEqual(len(MOD.DEFAULT_REQUIRED_TESTS), 39)
         roots = [
             name
             for name in MOD.DEFAULT_REQUIRED_TESTS
             if "/" not in name
         ]
-        self.assertEqual(len(roots), 26)
+        self.assertEqual(len(roots), 38)
+        subtests = [
+            name
+            for name in MOD.DEFAULT_REQUIRED_TESTS
+            if "/" in name
+        ]
+        self.assertEqual(subtests, [FOCUS_SUBTEST])
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get(FOCUS_SUBTEST), HTTPAPI
+        )
 
     def test_default_required_covers_d1_d2_and_helper(self):
         for name in (
@@ -923,13 +1047,63 @@ class DefaultInventoryTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, MOD.DEFAULT_REQUIRED_TESTS)
 
+    def test_us1_default_roots_bind_to_payment_and_http_core(self):
+        self.assertEqual(
+            tuple(EXPECTED_US1_DEFAULT_REQUIRED),
+            (
+                "TestSubmitPayment",
+                "TestEvidenceDecision",
+                "TestQueryPayment",
+                "TestPaymentRequestBoundary",
+                "TestPaymentResponseContract",
+                FOCUS_SUBTEST,
+                "TestPaymentDirectiveProtocol",
+                "TestPaymentDirectiveClient",
+                "TestObserverPaymentDirective",
+                "TestMockPaymentDirective",
+                "TestAppPaymentDirective",
+                "TestPaymentRuntimeWiring",
+                "TestPaymentRouterWiring",
+            ),
+        )
+        for name, package in EXPECTED_US1_DEFAULT_REQUIRED.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    MOD.DEFAULT_REQUIRED_TESTS.get(name), package
+                )
+        for name in (
+            "TestPaymentRequestBoundary",
+            "TestPaymentResponseContract",
+            FOCUS_SUBTEST,
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    MOD.DEFAULT_REQUIRED_TESTS.get(name), HTTPAPI
+                )
+                self.assertNotEqual(
+                    MOD.DEFAULT_REQUIRED_TESTS.get(name), PAYMENT
+                )
+        for name, package in (
+            ("TestPaymentDirectiveProtocol", TESTCONTROL),
+            ("TestPaymentDirectiveClient", TESTCONTROL),
+            ("TestObserverPaymentDirective", HARNESS),
+            ("TestMockPaymentDirective", MOCK),
+            ("TestAppPaymentDirective", APP),
+            ("TestPaymentRuntimeWiring", APP),
+            ("TestPaymentRouterWiring", HTTPAPI),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    MOD.DEFAULT_REQUIRED_TESTS.get(name), package
+                )
+
     def test_integration_roots_are_db_required_not_default(self):
         for name in MOD.DB_REQUIRED_TEST_KEYS:
             with self.subTest(name=name):
                 self.assertIn(name, MOD.DB_REQUIRED_TEST_KEYS)
                 self.assertNotIn(name, MOD.DEFAULT_REQUIRED_TESTS)
 
-    def test_db_required_keys_are_the_four_explicit_bindings(self):
+    def test_db_required_keys_are_the_eleven_explicit_bindings(self):
         self.assertEqual(
             MOD.DB_REQUIRED_TEST_KEYS,
             (
@@ -937,7 +1111,24 @@ class DefaultInventoryTests(unittest.TestCase):
                 "TestHarnessProcessPreservesParentStateIntegration",
                 "TestApplicationLifecycleIntegration",
                 "TestApplicationLifecycleIntegration/startup_diagnostics",
+                "TestOrderRegistrationIntegration",
+                "TestObservationAtomicSaveIntegration",
+                "TestMockTransactionIntegration",
+                "TestOrderLookupIntegration",
+                "TestUS1Payment",
+                "TestUS1Restart",
+                "TestUS1HTTPBoundary",
             ),
+        )
+        self.assertEqual(
+            tuple(MOD.DB_REQUIRED_TEST_KEYS), tuple(EXPECTED_DB_REQUIRED)
+        )
+
+    def test_us1_safe_report_kind_is_registered(self):
+        self.assertIn("us1", MOD.EXPECT_NAMES)
+        self.assertEqual(MOD.REPORT_FILENAMES.get("us1"), "us1.json")
+        self.assertEqual(
+            MOD.SAFE_FILENAMES.get("us1"), "us1.safe.json"
         )
 
     def test_shared_batch_timeout_constant_is_570(self):
@@ -960,6 +1151,163 @@ class DefaultInventoryTests(unittest.TestCase):
             )
         )
 
+    def test_db_required_binds_storage_mock_and_tests_packages(self):
+        self.assertEqual(
+            MOD.DB_PACKAGE_KEYS,
+            ("internal/postgres", "internal/mock", "tests/harness", "tests"),
+        )
+        for name in (
+            "TestOrderRegistrationIntegration",
+            "TestObservationAtomicSaveIntegration",
+            "TestOrderLookupIntegration",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(EXPECTED_DB_REQUIRED[name], POSTGRES)
+                self.assertNotEqual(EXPECTED_DB_REQUIRED[name], HARNESS)
+        self.assertEqual(
+            EXPECTED_DB_REQUIRED["TestMockTransactionIntegration"], MOCK
+        )
+        for name in (
+            "TestUS1Payment",
+            "TestUS1Restart",
+            "TestUS1HTTPBoundary",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(EXPECTED_DB_REQUIRED[name], TESTS)
+                self.assertNotEqual(EXPECTED_DB_REQUIRED[name], HARNESS)
+
+
+class DbRequiredParserTests(unittest.TestCase):
+    """Parser-level DB launcher inventory for the eleven explicit bindings."""
+
+    def parse(self, stdout, required=None):
+        mapping = {
+            name: EXPECTED_DB_REQUIRED[name]
+            for name in MOD.DB_REQUIRED_TEST_KEYS
+        }
+        return MOD.parse_go_test_json(
+            stdout,
+            "",
+            0,
+            (POSTGRES, MOCK, HARNESS, TESTS),
+            mapping if required is None else required,
+            allowed_no_test_files=(),
+        )
+
+    def full_stream(self):
+        return default_stream(
+            (POSTGRES, MOCK, HARNESS, TESTS), EXPECTED_DB_REQUIRED
+        )
+
+    def test_full_eleven_binding_stream_is_green(self):
+        result = self.parse(self.full_stream())
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(
+            set(result["required_test_results"]),
+            set(EXPECTED_DB_REQUIRED),
+        )
+        self.assertTrue(
+            all(
+                value == "pass"
+                for value in result["required_test_results"].values()
+            )
+        )
+
+    def test_each_new_db_root_is_required(self):
+        for target in (
+            "TestOrderRegistrationIntegration",
+            "TestObservationAtomicSaveIntegration",
+            "TestMockTransactionIntegration",
+            "TestOrderLookupIntegration",
+            "TestUS1Payment",
+            "TestUS1Restart",
+            "TestUS1HTTPBoundary",
+        ):
+            with self.subTest(target=target):
+                result = self.parse(
+                    without_test_events(self.full_stream(), target)
+                )
+                self.assertEqual(
+                    result["required_test_results"].get(target), "missing"
+                )
+                self.assertIn("required-test-missing", result["problems"])
+
+    def test_new_db_root_skip_is_not_green(self):
+        target = "TestOrderRegistrationIntegration"
+        result = self.parse(
+            replace_test_terminal(
+                self.full_stream(), POSTGRES, target, "skip"
+            )
+        )
+        self.assertEqual(
+            result["required_test_results"].get(target), "skip"
+        )
+        self.assertIn("required-test-skip", result["problems"])
+
+    def test_new_db_root_wrong_package_is_not_green(self):
+        target = "TestMockTransactionIntegration"
+        stdout = without_test_events(self.full_stream(), target)
+        stdout += event("run", POSTGRES, target)
+        stdout += event("pass", POSTGRES, target, elapsed=0.01)
+        result = self.parse(stdout)
+        self.assertEqual(
+            result["required_test_results"].get(target), "wrong-package"
+        )
+        self.assertIn("required-test-wrong-package", result["problems"])
+
+    def test_new_db_root_output_is_not_a_pass(self):
+        target = "TestObservationAtomicSaveIntegration"
+        stdout = without_test_events(self.full_stream(), target)
+        stdout += event(
+            "output",
+            POSTGRES,
+            test=target,
+            output="--- PASS: " + target + " (0.00s)\n",
+        )
+        result = self.parse(stdout)
+        self.assertEqual(
+            result["required_test_results"].get(target), "missing"
+        )
+        self.assertIn("required-test-missing", result["problems"])
+
+    def test_new_lookup_root_skip_is_not_green(self):
+        target = "TestOrderLookupIntegration"
+        result = self.parse(
+            replace_test_terminal(
+                self.full_stream(), POSTGRES, target, "skip"
+            )
+        )
+        self.assertEqual(
+            result["required_test_results"].get(target), "skip"
+        )
+        self.assertIn("required-test-skip", result["problems"])
+
+    def test_new_lookup_root_wrong_package_is_not_green(self):
+        target = "TestOrderLookupIntegration"
+        stdout = without_test_events(self.full_stream(), target)
+        stdout += event("run", HARNESS, target)
+        stdout += event("pass", HARNESS, target, elapsed=0.01)
+        result = self.parse(stdout)
+        self.assertEqual(
+            result["required_test_results"].get(target), "wrong-package"
+        )
+        self.assertIn("required-test-wrong-package", result["problems"])
+
+    def test_new_lookup_root_output_is_not_a_pass(self):
+        target = "TestOrderLookupIntegration"
+        stdout = without_test_events(self.full_stream(), target)
+        stdout += event(
+            "output",
+            POSTGRES,
+            test=target,
+            output="--- PASS: " + target + " (0.00s)\n",
+        )
+        result = self.parse(stdout)
+        self.assertEqual(
+            result["required_test_results"].get(target), "missing"
+        )
+        self.assertIn("required-test-missing", result["problems"])
+
 
 class RunDefaultTests(unittest.TestCase):
     def setUp(self):
@@ -968,7 +1316,15 @@ class RunDefaultTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.report_dir = self.root / "report"
         self.report_dir.mkdir()
-        self.packages = [CMD, APP, HARNESS]
+        self.packages = [
+            CMD,
+            APP,
+            HTTPAPI,
+            MOCK,
+            PAYMENT,
+            TESTCONTROL,
+            HARNESS,
+        ]
         self.list_stdout = "\n".join(self.packages) + "\n"
         self.xdg_config = str(self.root / "xdg-config")
         self.controlled_env = {
@@ -1207,6 +1563,345 @@ class RunDefaultTests(unittest.TestCase):
         self.assertEqual(
             report["required_test_results"].get(missing), "missing"
         )
+
+    def test_run_default_requires_each_new_us1_default_root(self):
+        for target in EXPECTED_US1_DEFAULT_REQUIRED:
+            with self.subTest(target=target):
+                test_stdout = without_test_events(
+                    default_stream(
+                        self.packages, MOD.DEFAULT_REQUIRED_TESTS
+                    ),
+                    target,
+                )
+                code, _ = self.run_default(
+                    [proc(0, self.list_stdout), proc(0, test_stdout)]
+                )
+                self.assertEqual(code, 1)
+                report = self.read_report()
+                self.assertEqual(report["result"], "fail")
+                self.assertEqual(
+                    report["required_test_results"].get(target), "missing"
+                )
+
+    def test_run_default_focus_subtest_missing_fails_even_root_passes(self):
+        test_stdout = without_test_events(
+            default_stream(self.packages, MOD.DEFAULT_REQUIRED_TESTS),
+            FOCUS_SUBTEST,
+        )
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(FOCUS_SUBTEST), "missing"
+        )
+        self.assertEqual(
+            report["required_test_results"].get(
+                "TestPaymentRequestBoundary"
+            ),
+            "pass",
+        )
+        self.assertIn("required-test-missing", report["problems"])
+
+    def test_run_default_focus_subtest_skip_and_fail_cannot_pass(self):
+        for action, problem in (
+            ("skip", "required-test-skip"),
+            ("fail", "required-test-fail"),
+        ):
+            with self.subTest(action=action):
+                test_stdout = replace_test_terminal(
+                    default_stream(
+                        self.packages, MOD.DEFAULT_REQUIRED_TESTS
+                    ),
+                    HTTPAPI,
+                    FOCUS_SUBTEST,
+                    action,
+                )
+                code, _ = self.run_default(
+                    [proc(0, self.list_stdout), proc(0, test_stdout)]
+                )
+                self.assertEqual(code, 1)
+                report = self.read_report()
+                self.assertEqual(report["result"], "fail")
+                self.assertEqual(
+                    report["required_test_results"].get(FOCUS_SUBTEST),
+                    action,
+                )
+                self.assertIn(problem, report["problems"])
+
+    def test_run_default_focus_subtest_wrong_package_cannot_pass(self):
+        test_stdout = without_test_events(
+            default_stream(self.packages, MOD.DEFAULT_REQUIRED_TESTS),
+            FOCUS_SUBTEST,
+        )
+        test_stdout += event("run", APP, FOCUS_SUBTEST)
+        test_stdout += event("pass", APP, FOCUS_SUBTEST, elapsed=0.01)
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(FOCUS_SUBTEST),
+            "wrong-package",
+        )
+        self.assertIn("required-test-wrong-package", report["problems"])
+
+    def test_run_default_focus_subtest_duplicate_cannot_pass(self):
+        test_stdout = default_stream(
+            self.packages, MOD.DEFAULT_REQUIRED_TESTS
+        )
+        test_stdout += event("run", HTTPAPI, FOCUS_SUBTEST)
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(FOCUS_SUBTEST),
+            "duplicate",
+        )
+        self.assertIn("test-run-duplicate", report["problems"])
+
+    def test_run_default_focus_subtest_output_spoof_cannot_pass(self):
+        test_stdout = without_test_events(
+            default_stream(self.packages, MOD.DEFAULT_REQUIRED_TESTS),
+            FOCUS_SUBTEST,
+        )
+        test_stdout += event(
+            "output",
+            HTTPAPI,
+            output="--- PASS: " + FOCUS_SUBTEST + " (0.00s)\n",
+        )
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(FOCUS_SUBTEST), "missing"
+        )
+
+    def test_run_default_focus_subtest_present_is_green(self):
+        test_stdout = default_stream(
+            self.packages, MOD.DEFAULT_REQUIRED_TESTS
+        )
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 0)
+        report = self.read_report()
+        self.assertEqual(report["result"], "pass")
+        self.assertEqual(
+            report["required_test_results"].get(FOCUS_SUBTEST), "pass"
+        )
+        self.assertEqual(
+            report["required_test_results"].get(
+                "TestPaymentRequestBoundary"
+            ),
+            "pass",
+        )
+
+    def test_run_default_rejects_new_us1_default_root_skip(self):
+        target = "TestSubmitPayment"
+        test_stdout = replace_test_terminal(
+            default_stream(self.packages, MOD.DEFAULT_REQUIRED_TESTS),
+            PAYMENT,
+            target,
+            "skip",
+        )
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(target), "skip"
+        )
+        self.assertIn("required-test-skip", report["problems"])
+
+    def test_run_default_rejects_new_us1_default_root_wrong_package(self):
+        target = "TestEvidenceDecision"
+        test_stdout = without_test_events(
+            default_stream(self.packages, MOD.DEFAULT_REQUIRED_TESTS),
+            target,
+        )
+        test_stdout += event("run", APP, target)
+        test_stdout += event("pass", APP, target, elapsed=0.01)
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(target), "wrong-package"
+        )
+        self.assertIn("required-test-wrong-package", report["problems"])
+
+    def test_run_default_new_us1_default_output_is_not_pass(self):
+        target = "TestSubmitPayment"
+        test_stdout = without_test_events(
+            default_stream(self.packages, MOD.DEFAULT_REQUIRED_TESTS),
+            target,
+        )
+        test_stdout += event(
+            "output",
+            PAYMENT,
+            test=target,
+            output="--- PASS: " + target + " (0.00s)\n",
+        )
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(target), "missing"
+        )
+
+    def test_run_default_rejects_new_http_root_skip(self):
+        target = "TestPaymentRequestBoundary"
+        test_stdout = replace_test_terminal(
+            default_stream(self.packages, MOD.DEFAULT_REQUIRED_TESTS),
+            HTTPAPI,
+            target,
+            "skip",
+        )
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(target), "skip"
+        )
+        self.assertIn("required-test-skip", report["problems"])
+
+    def test_run_default_rejects_new_http_root_wrong_package(self):
+        target = "TestPaymentResponseContract"
+        test_stdout = without_test_events(
+            default_stream(self.packages, MOD.DEFAULT_REQUIRED_TESTS),
+            target,
+        )
+        test_stdout += event("run", PAYMENT, target)
+        test_stdout += event("pass", PAYMENT, target, elapsed=0.01)
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(target), "wrong-package"
+        )
+        self.assertIn("required-test-wrong-package", report["problems"])
+
+    def test_run_default_new_query_root_output_is_not_pass(self):
+        target = "TestQueryPayment"
+        test_stdout = without_test_events(
+            default_stream(self.packages, MOD.DEFAULT_REQUIRED_TESTS),
+            target,
+        )
+        test_stdout += event(
+            "output",
+            PAYMENT,
+            test=target,
+            output="--- PASS: " + target + " (0.00s)\n",
+        )
+        code, _ = self.run_default(
+            [proc(0, self.list_stdout), proc(0, test_stdout)]
+        )
+        self.assertEqual(code, 1)
+        report = self.read_report()
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(
+            report["required_test_results"].get(target), "missing"
+        )
+
+    def test_run_default_rejects_directive_roots_skip(self):
+        for target in PAYMENT_DIRECTIVE_DEFAULT_ROOTS:
+            with self.subTest(target=target):
+                package = EXPECTED_US1_DEFAULT_REQUIRED[target]
+                test_stdout = replace_test_terminal(
+                    default_stream(
+                        self.packages, MOD.DEFAULT_REQUIRED_TESTS
+                    ),
+                    package,
+                    target,
+                    "skip",
+                )
+                code, _ = self.run_default(
+                    [proc(0, self.list_stdout), proc(0, test_stdout)]
+                )
+                self.assertEqual(code, 1)
+                report = self.read_report()
+                self.assertEqual(report["result"], "fail")
+                self.assertEqual(
+                    report["required_test_results"].get(target), "skip"
+                )
+                self.assertIn("required-test-skip", report["problems"])
+
+    def test_run_default_rejects_directive_roots_wrong_package(self):
+        for target in PAYMENT_DIRECTIVE_DEFAULT_ROOTS:
+            with self.subTest(target=target):
+                package = EXPECTED_US1_DEFAULT_REQUIRED[target]
+                wrong = HARNESS if package != HARNESS else PAYMENT
+                test_stdout = without_test_events(
+                    default_stream(
+                        self.packages, MOD.DEFAULT_REQUIRED_TESTS
+                    ),
+                    target,
+                )
+                test_stdout += event("run", wrong, target)
+                test_stdout += event("pass", wrong, target, elapsed=0.01)
+                code, _ = self.run_default(
+                    [proc(0, self.list_stdout), proc(0, test_stdout)]
+                )
+                self.assertEqual(code, 1)
+                report = self.read_report()
+                self.assertEqual(report["result"], "fail")
+                self.assertEqual(
+                    report["required_test_results"].get(target),
+                    "wrong-package",
+                )
+                self.assertIn(
+                    "required-test-wrong-package", report["problems"]
+                )
+
+    def test_run_default_directive_roots_output_is_not_pass(self):
+        for target in PAYMENT_DIRECTIVE_DEFAULT_ROOTS:
+            with self.subTest(target=target):
+                package = EXPECTED_US1_DEFAULT_REQUIRED[target]
+                test_stdout = without_test_events(
+                    default_stream(
+                        self.packages, MOD.DEFAULT_REQUIRED_TESTS
+                    ),
+                    target,
+                )
+                test_stdout += event(
+                    "output",
+                    package,
+                    test=target,
+                    output="--- PASS: " + target + " (0.00s)\n",
+                )
+                code, _ = self.run_default(
+                    [proc(0, self.list_stdout), proc(0, test_stdout)]
+                )
+                self.assertEqual(code, 1)
+                report = self.read_report()
+                self.assertEqual(report["result"], "fail")
+                self.assertEqual(
+                    report["required_test_results"].get(target), "missing"
+                )
 
     def test_run_default_timeout_writes_fail_report(self):
         code, _ = self.run_default(
@@ -1589,9 +2284,21 @@ class ExportReportsTests(unittest.TestCase):
             "schema": "payment-hub.ci-go-default.v1",
             "generated_at": "2026-11-08T00:00:00+00:00",
             "result": result,
-            "expected_packages": [APP, HARNESS, CMD],
+            "expected_packages": [
+                CMD,
+                APP,
+                HTTPAPI,
+                MOCK,
+                PAYMENT,
+                TESTCONTROL,
+                HARNESS,
+            ],
             "package_results": {
                 APP: {"status": "pass", "duration": "0.1s"},
+                HTTPAPI: {"status": "pass", "duration": "0.12s"},
+                MOCK: {"status": "pass", "duration": "0.14s"},
+                PAYMENT: {"status": "pass", "duration": "0.15s"},
+                TESTCONTROL: {"status": "pass", "duration": "0.18s"},
                 HARNESS: {"status": "pass", "duration": "0.2s"},
                 CMD: {"status": "no-test-files"},
             },
@@ -1633,6 +2340,10 @@ class ExportReportsTests(unittest.TestCase):
             "tests/harness": {
                 "status": "pass" if result == "pass" else "fail",
                 "duration": "0.3s",
+            },
+            "tests": {
+                "status": "pass" if result == "pass" else "fail",
+                "duration": "0.4s",
             },
         }
         return {
@@ -1878,6 +2589,96 @@ class ExportReportsTests(unittest.TestCase):
         self.assertEqual(safe["expected_packages"], [])
         self.assertEqual(safe["package_results"], {})
         self.assertNotIn("SECRET_RAW_FIELD", json.dumps(safe))
+
+    def test_export_default_missing_new_us1_root_cannot_pass(self):
+        value = self.go_default()
+        value["required_test_results"] = {
+            name: "pass" for name in EXPECTED_DEFAULT_REQUIRED
+        }
+        self.write(self.report_dir / "go-default.json", value)
+        code, _ = self.export()
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "go-default.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "error")
+        self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_default_missing_new_http_root_cannot_pass(self):
+        target = "TestPaymentResponseContract"
+        value = self.go_default()
+        value["required_test_results"] = {
+            name: "pass"
+            for name in EXPECTED_DEFAULT_REQUIRED_TOTAL
+            if name != target
+        }
+        self.write(self.report_dir / "go-default.json", value)
+        code, _ = self.export()
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "go-default.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "error")
+        self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_default_requires_focus_subtest_entry(self):
+        value = self.go_default()
+        value["required_test_results"] = {
+            name: "pass" for name in EXPECTED_DEFAULT_REQUIRED_TOTAL
+        }
+        self.write(self.report_dir / "go-default.json", value)
+        code, _ = self.export()
+        self.assertEqual(code, 0)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "go-default.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "pass")
+        self.assertEqual(len(safe["required_test_results"]), 39)
+        self.assertEqual(
+            safe["required_test_results"].get(FOCUS_SUBTEST), "pass"
+        )
+        value["required_test_results"] = {
+            name: "pass"
+            for name in EXPECTED_DEFAULT_REQUIRED_TOTAL
+            if name != FOCUS_SUBTEST
+        }
+        self.write(self.report_dir / "go-default.json", value)
+        code, _ = self.export()
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "go-default.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "error")
+        self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_default_old_fail_report_stays_non_green(self):
+        value = self.go_default(result="fail")
+        value["required_test_results"] = {
+            name: "pass" for name in EXPECTED_DEFAULT_REQUIRED
+        }
+        self.write(self.report_dir / "go-default.json", value)
+        code, _ = self.export()
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "go-default.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertNotEqual(
+            set(safe["required_test_results"]),
+            set(MOD.DEFAULT_REQUIRED_TESTS),
+        )
 
     def test_export_db_failure_before_tests_is_safe(self):
         value = self.db_report(result="fail")
@@ -2273,6 +3074,58 @@ class ExportReportsTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, text)
 
+    def test_export_db_missing_new_roots_cannot_pass(self):
+        value = self.db_report()
+        value["tests"]["required_test_results"] = {
+            name: "pass" for name in EXPECTED_PR3_DB_REQUIRED
+        }
+        self.write_db(value)
+        code, _ = self.export(["db"])
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "db-foundation.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "error")
+        self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_db_old_fail_report_backfills_eleven_non_green(self):
+        value = self.db_report(result="fail")
+        value["tests"]["required_test_results"] = {
+            name: "pass" for name in EXPECTED_PR3_DB_REQUIRED
+        }
+        self.write_db(value)
+        code, _ = self.export(["db"])
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "db-foundation.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertEqual(len(safe["required_test_results"]), 11)
+        for name in (
+            "TestOrderRegistrationIntegration",
+            "TestObservationAtomicSaveIntegration",
+            "TestMockTransactionIntegration",
+            "TestOrderLookupIntegration",
+            "TestUS1Payment",
+            "TestUS1Restart",
+            "TestUS1HTTPBoundary",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    safe["required_test_results"].get(name), "missing"
+                )
+
+    def test_export_db_required_results_cover_eleven_bindings(self):
+        self.assertEqual(
+            set(self.db_report()["tests"]["required_test_results"]),
+            set(EXPECTED_DB_REQUIRED),
+        )
+
     def test_export_db_digest_mismatch_fails_without_raw_fields(self):
         value = self.db_report()
         value["source"]["manifest_digest"] = "e" * 64
@@ -2421,6 +3274,524 @@ class ExportReportsTests(unittest.TestCase):
         statuses = {entry["name"]: entry["status"] for entry in provenance["reports"]}
         self.assertEqual(statuses["default"], "exported")
         self.assertEqual(statuses["db"], "missing")
+
+    US1_ORDER_ID = "11111111-1111-4111-8111-111111111111"
+    US1_OTHER_ID = "44444444-4444-4444-8444-444444444444"
+    US1_EPOCH = "fedcba9876543210fedcba9876543210"
+    US1_BEGIN_ID = "0123456789abcdef0123456789abcdef"
+    US1_EVENT_ID = US1_BEGIN_ID + ":1"
+
+    def us1_request_id(self, index):
+        return "22222222-2222-4222-8222-" + format(index, "012x")
+
+    def us1_scenario(self, name):
+        payment = name.startswith("payment_") or name.startswith("restart_")
+        success = name.endswith("_success")
+        if name in ("payment_success", "payment_failed"):
+            generations = [1]
+            statuses = [201, 200, 200]
+        elif name in ("restart_success", "restart_failed"):
+            generations = [1, 2]
+            statuses = [201, 200, 200, 200, 200]
+        elif name == "invalid_requests":
+            generations = [1]
+            statuses = [400, 422]
+        else:
+            generations = []
+            statuses = [201, 400, 401, 413, 415]
+        if payment:
+            result = "SUCCEEDED" if success else "FAILED"
+            http = [
+                {
+                    "status": status,
+                    "request_id": self.us1_request_id(index + 1),
+                    "payment_id": self.US1_ORDER_ID,
+                    "result": result,
+                }
+                for index, status in enumerate(statuses)
+            ]
+            pg = [
+                {"state": state, "rows": 1}
+                for state in ("ORDER", "MOCK", "TRACE")
+            ]
+            receipts = []
+            for generation in generations:
+                receipts.append(
+                    {
+                        "run_id": self.run_id,
+                        "epoch": self.US1_EPOCH,
+                        "generation": generation,
+                        "last_seq": 2 if generation == 1 else 0,
+                    }
+                )
+            observer = {
+                "trusted": True,
+                "counts": {"payment": 1, "query": 0},
+                "receipts": receipts,
+            }
+            directive = {
+                "result": result,
+                "binding": {
+                    "run_id": self.run_id,
+                    "epoch": self.US1_EPOCH,
+                    "generation": 1,
+                    "call_seq": 1,
+                    "event_id": self.US1_EVENT_ID,
+                    "order_id": self.US1_ORDER_ID,
+                },
+            }
+            commands = [
+                {"kind": "build", "exit": 0, "not_run": False},
+                {"kind": "http_probe", "exit": 0, "not_run": False},
+            ]
+            if name.startswith("restart_"):
+                commands.append(
+                    {"kind": "process_stop", "exit": 0, "not_run": False}
+                )
+        else:
+            if name == "invalid_requests":
+                http = [
+                    {
+                        "status": status,
+                        "request_id": (
+                            "" if status == 400 else self.us1_request_id(10)
+                        ),
+                        "payment_id": "",
+                        "result": "",
+                    }
+                    for status in statuses
+                ]
+                pg = [
+                    {"state": state, "rows": 0}
+                    for state in ("ORDER", "MOCK", "TRACE")
+                ]
+                observer = {
+                    "trusted": True,
+                    "counts": {"payment": 0, "query": 0},
+                    "receipts": [
+                        {
+                            "run_id": self.run_id,
+                            "epoch": self.US1_EPOCH,
+                            "generation": 1,
+                            "last_seq": 0,
+                        }
+                    ],
+                }
+                commands = [
+                    {"kind": "build", "exit": 0, "not_run": False}
+                ]
+            else:
+                http = []
+                for index, status in enumerate(statuses):
+                    if status == 201:
+                        http.append(
+                            {
+                                "status": status,
+                                "request_id": self.us1_request_id(20),
+                                "payment_id": self.US1_OTHER_ID,
+                                "result": "SUCCEEDED",
+                            }
+                        )
+                    else:
+                        http.append(
+                            {
+                                "status": status,
+                                "request_id": (
+                                    "" if status == 400
+                                    else self.us1_request_id(21 + index)
+                                ),
+                                "payment_id": "",
+                                "result": "",
+                            }
+                        )
+                pg = []
+                observer = None
+                commands = [
+                    {"kind": "http_probe", "exit": 0, "not_run": False}
+                ]
+            directive = None
+        return {
+            "name": name,
+            "result": "PASS",
+            "generations": generations,
+            "http": http,
+            "pg": pg,
+            "observer": observer,
+            "directive": directive,
+            "commands": commands,
+        }
+
+    def us1_report(self):
+        return {
+            "schema": "payment-hub.us1.v1",
+            "run_id": self.run_id,
+            "scenarios": [
+                self.us1_scenario(name)
+                for name in (
+                    "payment_success",
+                    "payment_failed",
+                    "invalid_requests",
+                    "restart_success",
+                    "restart_failed",
+                    "http_boundary",
+                )
+            ],
+        }
+
+    def write_us1(self, value, run_id=None):
+        run_id = value.get("run_id", self.run_id) if run_id is None else run_id
+        path = self.db_root / run_id / "us1.json"
+        self.write(path, value)
+        return path
+
+    def export_db_us1(self):
+        return self.export(["db", "us1"])
+
+    def read_us1_safe(self):
+        path = self.report_dir / "upload" / "us1.safe.json"
+        self.assertTrue(path.is_file(), "us1 safe report is missing")
+        return json.loads(path.read_text())
+
+    def test_export_us1_complete_pass_rebuilds_safe_report(self):
+        self.write_db(self.db_report())
+        self.write_us1(self.us1_report())
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 0)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "pass")
+        self.assertEqual(len(safe["scenarios"]), 6)
+        self.assertEqual(safe["run_id"], self.run_id)
+        text = json.dumps(safe)
+        for forbidden in ("SECRET", "Authorization", "postgres://"):
+            self.assertNotIn(forbidden, text)
+        provenance = json.loads(
+            (self.report_dir / "upload" / "provenance.json").read_text()
+        )
+        record = next(
+            entry for entry in provenance["reports"] if entry["name"] == "us1"
+        )
+        self.assertEqual(record["source"], self.run_id + "/us1.json")
+        self.assertEqual(record["export"], "us1.safe.json")
+        self.assertRegex(record["source_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(record["export_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(record["source_manifest_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            record["source_manifest_verification"], "verified-unchanged"
+        )
+
+    def test_export_us1_partial_failure_exports_non_green(self):
+        value = self.us1_report()
+        value["scenarios"][1]["result"] = "FAIL"
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+
+    def test_export_us1_missing_scenario_is_non_green(self):
+        value = self.us1_report()
+        value["scenarios"] = value["scenarios"][:-1]
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertIn("http_boundary", safe["missing_scenarios"])
+
+    def test_export_us1_duplicate_scenario_rejected(self):
+        value = self.us1_report()
+        value["scenarios"].append(value["scenarios"][0])
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "error")
+        self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_us1_unknown_sensitive_field_rejected(self):
+        value = self.us1_report()
+        value["authorization"] = "Bearer SECRET_CANARY"
+        value["scenarios"][0]["raw_log"] = "SECRET_CANARY"
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        path = self.report_dir / "upload" / "us1.safe.json"
+        self.assertTrue(path.is_file(), "us1 safe report is missing")
+        text = path.read_text()
+        self.assertNotIn("SECRET_CANARY", text)
+        safe = json.loads(text)
+        self.assertEqual(safe["status"], "error")
+
+    def test_export_us1_invalid_identity_epoch_rejected(self):
+        value = self.us1_report()
+        value["scenarios"][0]["directive"]["binding"]["epoch"] = -1
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us1_safe()["status"], "error")
+
+    def test_export_us1_binding_miscompare_is_non_green(self):
+        value = self.us1_report()
+        value["scenarios"][0]["directive"]["binding"]["order_id"] = (
+            self.US1_OTHER_ID
+        )
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+
+    def test_export_us1_untrusted_receipts_is_non_green(self):
+        value = self.us1_report()
+        value["scenarios"][0]["observer"]["trusted"] = False
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+
+    def test_export_us1_wrong_result_count_is_non_green(self):
+        value = self.us1_report()
+        value["scenarios"][0]["http"] = value["scenarios"][0]["http"][:2]
+        value["scenarios"][1]["pg"][2]["rows"] = 2
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+
+    def test_export_us1_restart_identity_mismatch_is_non_green(self):
+        value = self.us1_report()
+        restart = value["scenarios"][3]
+        restart["http"][-1]["payment_id"] = self.US1_OTHER_ID
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+
+    def test_export_us1_run_id_mismatch_rejected(self):
+        value = self.us1_report()
+        value["run_id"] = "b" * 32
+        self.write_db(self.db_report())
+        self.write_us1(value, run_id=self.run_id)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us1_safe()["status"], "error")
+
+    def test_export_us1_db_test_failed_cannot_pass(self):
+        self.write_db(self.db_report(result="fail"))
+        self.write_us1(self.us1_report())
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+
+    def test_export_us1_missing_file_is_missing_nonzero(self):
+        self.write_db(self.db_report())
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "missing")
+
+    def test_export_us1_multiple_db_candidates_rejected(self):
+        self.write_db(self.db_report())
+        other = "f" * 32
+        value = self.db_report()
+        value["run_id"] = other
+        value["project"] = "payment-hub-test-db-" + other
+        self.write_db(value, run_id=other)
+        self.write_us1(self.us1_report())
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us1_safe()["status"], "error")
+
+    def test_export_us1_source_verification_three_states(self):
+        value = self.db_report(result="fail")
+        value["source"]["manifest_unchanged"] = None
+        self.write_db(value)
+        self.write_us1(self.us1_report())
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertEqual(
+            safe["source"]["manifest_verification"], "not-verified"
+        )
+
+    def test_export_us1_commands_reject_unobserved_kind(self):
+        value = self.us1_report()
+        value["scenarios"][0]["commands"].append(
+            {"kind": "go_test", "exit": 0, "not_run": False}
+        )
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        code, _ = self.export_db_us1()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us1_safe()["status"], "error")
+
+    def export_us1_case(self, value):
+        self.write_db(self.db_report())
+        self.write_us1(value)
+        return self.export_db_us1()
+
+    def assert_us1_error(self, value):
+        code, _ = self.export_us1_case(value)
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "error")
+
+    def assert_us1_non_green(self, value):
+        code, _ = self.export_us1_case(value)
+        self.assertEqual(code, 1)
+        safe = self.read_us1_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+
+    def test_export_us1_epoch_must_be_lowerhex32(self):
+        for mutation in ("receipt-upper", "receipt-int", "binding-int"):
+            with self.subTest(mutation=mutation):
+                value = self.us1_report()
+                if mutation == "receipt-upper":
+                    value["scenarios"][0]["observer"]["receipts"][0][
+                        "epoch"
+                    ] = self.US1_EPOCH.upper()
+                elif mutation == "receipt-int":
+                    value["scenarios"][0]["observer"]["receipts"][0][
+                        "epoch"
+                    ] = 1
+                else:
+                    value["scenarios"][0]["directive"]["binding"][
+                        "epoch"
+                    ] = 1
+                self.assert_us1_error(value)
+
+    def test_export_us1_event_id_must_match_call_seq(self):
+        for mutation in ("uuid", "suffix", "prefix", "too-large"):
+            with self.subTest(mutation=mutation):
+                value = self.us1_report()
+                binding = value["scenarios"][0]["directive"]["binding"]
+                if mutation == "uuid":
+                    binding["event_id"] = self.US1_OTHER_ID
+                elif mutation == "suffix":
+                    binding["event_id"] = self.US1_BEGIN_ID + ":2"
+                elif mutation == "prefix":
+                    binding["event_id"] = self.US1_BEGIN_ID.upper() + ":1"
+                else:
+                    binding["call_seq"] = 4097
+                    binding["event_id"] = self.US1_BEGIN_ID + ":4097"
+                self.assert_us1_error(value)
+
+    def test_export_us1_receipt_binding_epoch_mismatch_is_non_green(self):
+        value = self.us1_report()
+        value["scenarios"][0]["directive"]["binding"]["epoch"] = "a" * 32
+        self.assert_us1_non_green(value)
+
+    def test_export_us1_invalid_observer_requires_real_receipt(self):
+        for mutation in (
+            "empty-receipts",
+            "generation-two",
+            "untrusted",
+            "payment-count",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us1_report()
+                observer = value["scenarios"][2]["observer"]
+                if mutation == "empty-receipts":
+                    observer["receipts"] = []
+                elif mutation == "generation-two":
+                    observer["receipts"][0]["generation"] = 2
+                elif mutation == "untrusted":
+                    observer["trusted"] = False
+                else:
+                    observer["counts"]["payment"] = 1
+                self.assert_us1_non_green(value)
+
+    def test_export_us1_boundary_requires_legal_201_and_reject_matrix(self):
+        for mutation in (
+            "no-201",
+            "201-empty-payment",
+            "4xx-payment-id",
+            "missing-401",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us1_report()
+                http = value["scenarios"][5]["http"]
+                if mutation == "no-201":
+                    value["scenarios"][5]["http"] = [
+                        item for item in http if item["status"] != 201
+                    ]
+                elif mutation == "201-empty-payment":
+                    next(
+                        item for item in http if item["status"] == 201
+                    )["payment_id"] = ""
+                elif mutation == "4xx-payment-id":
+                    next(
+                        item for item in http if item["status"] == 413
+                    )["payment_id"] = self.US1_OTHER_ID
+                else:
+                    value["scenarios"][5]["http"] = [
+                        item for item in http if item["status"] != 401
+                    ]
+                self.assert_us1_non_green(value)
+
+    def test_export_us1_payment_http_identity_gaps_are_non_green(self):
+        for mutation in (
+            "empty-request-id",
+            "duplicate-request-id",
+            "empty-result",
+            "empty-payment-id",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us1_report()
+                http = value["scenarios"][0]["http"]
+                if mutation == "empty-request-id":
+                    http[1]["request_id"] = ""
+                elif mutation == "duplicate-request-id":
+                    http[1]["request_id"] = http[0]["request_id"]
+                elif mutation == "empty-result":
+                    http[1]["result"] = ""
+                else:
+                    http[1]["payment_id"] = ""
+                self.assert_us1_non_green(value)
+
+    def test_export_us1_commands_must_be_observed(self):
+        for mutation in ("empty", "nonzero"):
+            with self.subTest(mutation=mutation):
+                value = self.us1_report()
+                if mutation == "empty":
+                    value["scenarios"][0]["commands"] = []
+                else:
+                    value["scenarios"][0]["commands"][0]["exit"] = 1
+                self.assert_us1_non_green(value)
+
+    def test_export_us1_receipt_last_seq_must_cover_call_seq(self):
+        value = self.us1_report()
+        value["scenarios"][0]["observer"]["receipts"][0]["last_seq"] = 1
+        self.assert_us1_non_green(value)
+
+    def test_export_us1_future_binding_generation_is_non_green(self):
+        value = self.us1_report()
+        value["scenarios"][0]["directive"]["binding"]["generation"] = 2
+        self.assert_us1_non_green(value)
 
     def vulnerability_report(self, result="vulnerable"):
         if result == "pass":

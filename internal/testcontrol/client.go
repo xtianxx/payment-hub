@@ -42,6 +42,140 @@ type Client struct {
 	conns        map[net.Conn]struct{}
 }
 
+type paymentCallState struct {
+	client    *Client
+	seq       uint64
+	eventID   string
+	orderID   string
+	directive *Directive
+	committed bool
+}
+
+// PaymentCall is the private, single-use association between one payment entry
+// call and its later MockCommitted proof. Its state is owned by the issuing
+// Client; the zero value is not usable.
+type PaymentCall struct {
+	state *paymentCallState
+}
+
+// Directive returns the selected result directive as a value copy.
+func (p PaymentCall) Directive() (Directive, bool) {
+	if p.state == nil || p.state.directive == nil {
+		return "", false
+	}
+	return *p.state.directive, true
+}
+
+// PaymentEntry records one payment call and returns a token carrying the
+// observer-selected result directive, if any.
+func (c *Client) PaymentEntry(ctx context.Context, orderID string) (PaymentCall, error) {
+	op, err := c.startOperation(ctx, func() bool {
+		return validUUIDv4(orderID)
+	})
+	if err != nil {
+		return PaymentCall{}, err
+	}
+	failed := true
+	defer func() {
+		c.finishOperation(failed)
+	}()
+
+	opCtx, cancel, ok := newClientOperationContext(ctx)
+	if !ok {
+		return PaymentCall{}, ErrControlFault
+	}
+	defer cancel()
+
+	frame := Frame{
+		Version:    Version,
+		Type:       TypeCall,
+		RunID:      c.session.RunID,
+		Epoch:      c.session.Epoch,
+		Generation: c.session.Generation,
+		Seq:        op.seq,
+		EventID:    op.eventID,
+		Kind:       KindPayment,
+		OrderID:    orderID,
+	}
+	ack, err := exchangeFrame(opCtx, c.session.Socket, frame, validateClientAck, c.trackConn, c.untrackConn)
+	if err != nil {
+		return PaymentCall{}, ErrControlFault
+	}
+
+	var directive *Directive
+	if ack.Directive != nil {
+		value := *ack.Directive
+		directive = &value
+	}
+	failed = false
+	return PaymentCall{state: &paymentCallState{
+		client:    c,
+		seq:       op.seq,
+		eventID:   op.eventID,
+		orderID:   orderID,
+		directive: directive,
+	}}, nil
+}
+
+// MockCommitted records the mock commit proof for one PaymentEntry token.
+func (c *Client) MockCommitted(ctx context.Context, token PaymentCall, actual Directive) error {
+	op, err := c.startOperation(ctx, func() bool {
+		if !validDirective(actual) {
+			return false
+		}
+		state := token.state
+		if state == nil || state.client != c || state.committed {
+			return false
+		}
+		if state.seq < 1 || state.seq > MaxRecords || !validUUIDv4(state.orderID) {
+			return false
+		}
+		state.committed = true
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	failed := true
+	defer func() {
+		c.finishOperation(failed)
+	}()
+
+	opCtx, cancel, ok := newClientOperationContext(ctx)
+	if !ok {
+		return ErrControlFault
+	}
+	defer cancel()
+
+	frame := Frame{
+		Version:    Version,
+		Type:       TypeReach,
+		RunID:      c.session.RunID,
+		Epoch:      c.session.Epoch,
+		Generation: c.session.Generation,
+		Seq:        op.seq,
+		EventID:    op.eventID,
+		Point:      PointMockCommitted,
+		OrderID:    token.state.orderID,
+	}
+	if token.state.directive != nil {
+		callSeq := token.state.seq
+		applied := actual
+		frame.PaymentCallSeq = &callSeq
+		frame.AppliedResult = &applied
+	}
+	ack, err := exchangeFrame(opCtx, c.session.Socket, frame, validateClientAck, c.trackConn, c.untrackConn)
+	if err != nil {
+		return ErrControlFault
+	}
+	if ack.Action == ActionReplyHidden {
+		failed = false
+		return ErrReplyHidden
+	}
+	failed = false
+	return nil
+}
+
 // Dial creates one Client generation. The context bounds startup and Begin only;
 // it is not retained as the Client lifetime. Unsafe socket paths are rejected
 // before any dial.
@@ -98,53 +232,19 @@ func (c *Client) Reach(ctx context.Context, point Point, orderID string) error {
 }
 
 func (c *Client) call(ctx context.Context, typ Type, kind Kind, point Point, orderID string) error {
-	if c == nil || !c.valid {
-		return ErrControlFault
-	}
-	if ctx == nil || ctx.Err() != nil {
-		c.latchFault()
-		return ErrControlFault
-	}
-
-	c.mu.Lock()
-	if c.closed || c.fault {
-		c.mu.Unlock()
-		return ErrControlFault
-	}
-	if c.sealing || c.sealed {
-		// New work after Seal started breaks the trusted static boundary even
-		// when the caller ignores the returned error.
-		c.fault = true
-		c.mu.Unlock()
-		return ErrControlFault
-	}
-	switch typ {
-	case TypeCall:
-		if !validKind(kind) || !validUUIDv4(orderID) {
-			c.fault = true
-			c.mu.Unlock()
-			return ErrControlFault
+	op, err := c.startOperation(ctx, func() bool {
+		switch typ {
+		case TypeCall:
+			return validKind(kind) && validUUIDv4(orderID)
+		case TypeReach:
+			return validPoint(point) && validUUIDv4(orderID)
+		default:
+			return false
 		}
-	case TypeReach:
-		if !validPoint(point) || !validUUIDv4(orderID) {
-			c.fault = true
-			c.mu.Unlock()
-			return ErrControlFault
-		}
-	default:
-		c.fault = true
-		c.mu.Unlock()
-		return ErrControlFault
+	})
+	if err != nil {
+		return err
 	}
-	if c.nextSeq >= MaxRecords {
-		c.fault = true
-		c.mu.Unlock()
-		return ErrControlFault
-	}
-	c.nextSeq++
-	seq := c.nextSeq
-	c.inflight++
-	c.mu.Unlock()
 
 	failed := true
 	defer func() {
@@ -163,8 +263,8 @@ func (c *Client) call(ctx context.Context, typ Type, kind Kind, point Point, ord
 		RunID:      c.session.RunID,
 		Epoch:      c.session.Epoch,
 		Generation: c.session.Generation,
-		Seq:        seq,
-		EventID:    c.beginID + ":" + strconv.FormatUint(seq, 10),
+		Seq:        op.seq,
+		EventID:    op.eventID,
 	}
 	if typ == TypeCall {
 		frame.Kind = kind
@@ -178,12 +278,63 @@ func (c *Client) call(ctx context.Context, typ Type, kind Kind, point Point, ord
 	if err != nil {
 		return ErrControlFault
 	}
+	if typ == TypeCall && kind == KindPayment && ack.Directive != nil {
+		// The legacy Enter API cannot deliver a selected result directive to
+		// its caller, so accepting it would silently drop a control decision.
+		return ErrControlFault
+	}
 	if typ == TypeReach && ack.Action == ActionReplyHidden {
 		failed = false
 		return ErrReplyHidden
 	}
 	failed = false
 	return nil
+}
+
+type clientOperation struct {
+	seq     uint64
+	eventID string
+}
+
+func (c *Client) startOperation(ctx context.Context, validate func() bool) (clientOperation, error) {
+	if c == nil || !c.valid {
+		return clientOperation{}, ErrControlFault
+	}
+	if ctx == nil || ctx.Err() != nil {
+		c.latchFault()
+		return clientOperation{}, ErrControlFault
+	}
+
+	c.mu.Lock()
+	if c.closed || c.fault {
+		c.mu.Unlock()
+		return clientOperation{}, ErrControlFault
+	}
+	if c.sealing || c.sealed {
+		// New work after Seal started breaks the trusted static boundary even
+		// when the caller ignores the returned error.
+		c.fault = true
+		c.mu.Unlock()
+		return clientOperation{}, ErrControlFault
+	}
+	if validate == nil || !validate() {
+		c.fault = true
+		c.mu.Unlock()
+		return clientOperation{}, ErrControlFault
+	}
+	if c.nextSeq >= MaxRecords {
+		c.fault = true
+		c.mu.Unlock()
+		return clientOperation{}, ErrControlFault
+	}
+	c.nextSeq++
+	op := clientOperation{
+		seq:     c.nextSeq,
+		eventID: c.beginID + ":" + strconv.FormatUint(c.nextSeq, 10),
+	}
+	c.inflight++
+	c.mu.Unlock()
+	return op, nil
 }
 
 // Seal stops new work, drains already allocated operations, and closes the
@@ -503,6 +654,11 @@ func validateClientAck(request, ack Frame) error {
 	case TypeCall:
 		if ack.Seq != request.Seq {
 			return errClientKnown
+		}
+		if ack.Directive != nil {
+			if request.Kind != KindPayment || !validDirective(*ack.Directive) {
+				return errClientKnown
+			}
 		}
 	case TypeReach:
 		if ack.Seq != request.Seq || !validAction(ack.Action) {

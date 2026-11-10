@@ -36,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GO_DEFAULT_SCHEMA = "payment-hub.ci-go-default.v1"
 SAFE_EXPORT_SCHEMA = "payment-hub.ci-safe-export.v1"
 DB_SCHEMA = "payment-hub.db-foundation.v1"
+US1_SCHEMA = "payment-hub.us1.v1"
 VULNERABILITY_SCHEMA = "payment-hub.ci.vulnerability-report.v1"
 CANCELLATION_SCHEMA = "payment-hub.ci-cancellation.v1"
 MANIFEST_VERIFICATION_UNCHANGED = "verified-unchanged"
@@ -53,16 +54,18 @@ FAILURE_CLASS_RE = re.compile(r"^[a-z0-9_-]{1,80}$")
 REPORT_FILENAMES = {
     "default": "go-default.json",
     "db": "db-foundation.json",
+    "us1": "us1.json",
     "vulnerability": "vulnerability-report.json",
     "cancellation": "cancellation-report.json",
 }
 SAFE_FILENAMES = {
     "default": "go-default.safe.json",
     "db": "db-foundation.safe.json",
+    "us1": "us1.safe.json",
     "vulnerability": "vulnerability.safe.json",
     "cancellation": "cancellation.safe.json",
 }
-EXPECT_NAMES = ("default", "db", "vulnerability", "cancellation")
+EXPECT_NAMES = ("default", "db", "us1", "vulnerability", "cancellation")
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 MAX_OUTPUT_LINE_BYTES = 1024 * 1024
 
@@ -74,6 +77,24 @@ GO_TEST_BATCH_TIMEOUT_SECONDS = 570
 
 PACKAGE_STATUSES = frozenset(
     {"pass", "fail", "skip", "missing", "invalid", "no-test-files"}
+)
+US1_SCENARIO_NAMES = (
+    "payment_success",
+    "payment_failed",
+    "invalid_requests",
+    "restart_success",
+    "restart_failed",
+    "http_boundary",
+)
+US1_RESULTS = frozenset({"PASS", "FAIL", "NOT_RUN"})
+US1_HTTP_RESULTS = frozenset({"SUCCEEDED", "FAILED", "UNKNOWN"})
+US1_PG_STATES = ("ORDER", "MOCK", "TRACE")
+US1_COMMAND_KINDS = frozenset({"build", "process_stop", "http_probe"})
+US1_MAX_RECORDS = 4096
+US1_MAX_GENERATIONS = 64
+US1_EVENT_ID_RE = re.compile(r"^[0-9a-f]{32}:[1-9][0-9]*$")
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 REQUIRED_STATUSES = frozenset(
     {
@@ -149,13 +170,29 @@ DB_REQUIRED_TEST_KEYS = (
     "TestHarnessProcessPreservesParentStateIntegration",
     "TestApplicationLifecycleIntegration",
     "TestApplicationLifecycleIntegration/startup_diagnostics",
+    "TestOrderRegistrationIntegration",
+    "TestObservationAtomicSaveIntegration",
+    "TestMockTransactionIntegration",
+    "TestOrderLookupIntegration",
+    "TestUS1Payment",
+    "TestUS1Restart",
+    "TestUS1HTTPBoundary",
 )
-DB_PACKAGE_KEYS = ("internal/postgres", "internal/mock", "tests/harness")
+DB_PACKAGE_KEYS = (
+    "internal/postgres",
+    "internal/mock",
+    "tests/harness",
+    "tests",
+)
 
-# Frozen default PR3 inventory: the 26 roots in the four untagged review /
-# regression test files. The three original integration roots and the explicit
-# lifecycle subtest are build-tagged integration and remain required in the DB
-# launcher (REQUIRED_TEST_PACKAGES), not in the untagged default ./... gate.
+# Frozen default inventory: 38 required roots plus one focused subtest entry
+# (TestPaymentRequestBoundary/POST_rejection_priority), i.e. 39 required
+# mapping entries total. Roots cover the original 26 PR3 roots, first-batch
+# US1 core roots, query/HTTP contract roots, payment-directive
+# protocol/client/consumer roots, and runtime/router wiring. The eleven DB
+# integration checks (including the explicit lifecycle subtest) are build-tagged
+# integration and remain required in the DB launcher (REQUIRED_TEST_PACKAGES),
+# not in the untagged default ./... gate.
 DEFAULT_REQUIRED_TESTS = {
     "TestStartupDiagnosticsDatabaseOpenFailure": "payment-hub/internal/app",
     "TestStartupDiagnosticsPingRetryExhaustion": "payment-hub/internal/app",
@@ -183,6 +220,19 @@ DEFAULT_REQUIRED_TESTS = {
     "TestProcessReviewTerminalPublishedAfterGroupWatchJoined": "payment-hub/tests/harness",
     "TestProcessReviewWatchGroupStopUnblocksFullEventChannel": "payment-hub/tests/harness",
     "TestProcessReviewHelper": "payment-hub/tests/harness",
+    "TestSubmitPayment": "payment-hub/internal/payment",
+    "TestEvidenceDecision": "payment-hub/internal/payment",
+    "TestQueryPayment": "payment-hub/internal/payment",
+    "TestPaymentRequestBoundary": "payment-hub/internal/httpapi",
+    "TestPaymentRequestBoundary/POST_rejection_priority": "payment-hub/internal/httpapi",
+    "TestPaymentResponseContract": "payment-hub/internal/httpapi",
+    "TestPaymentDirectiveProtocol": "payment-hub/internal/testcontrol",
+    "TestPaymentDirectiveClient": "payment-hub/internal/testcontrol",
+    "TestObserverPaymentDirective": "payment-hub/tests/harness",
+    "TestMockPaymentDirective": "payment-hub/internal/mock",
+    "TestAppPaymentDirective": "payment-hub/internal/app",
+    "TestPaymentRuntimeWiring": "payment-hub/internal/app",
+    "TestPaymentRouterWiring": "payment-hub/internal/httpapi",
 }
 
 
@@ -1835,6 +1885,518 @@ def _safe_db_report(source: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _us1_exact_keys(value: Any, keys: Sequence[str], name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise CiError("unsafe-field-us1." + name)
+    return value
+
+
+def _us1_int(value: Any, name: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise CiError("unsafe-field-us1." + name)
+    return value
+
+
+def _us1_uuid(value: Any, name: str, nullable: bool = False) -> str | None:
+    if value in (None, "") and nullable:
+        return value
+    if not isinstance(value, str) or not UUID_RE.fullmatch(value):
+        raise CiError("unsafe-field-us1." + name)
+    return value
+
+
+def _us1_hex32(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise CiError("unsafe-field-us1." + name)
+    return value
+
+
+def _us1_event_id(value: Any, name: str, call_seq: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not US1_EVENT_ID_RE.fullmatch(value)
+        or call_seq > US1_MAX_RECORDS
+    ):
+        raise CiError("unsafe-field-us1." + name)
+    suffix = int(value.rsplit(":", 1)[1])
+    if suffix != call_seq:
+        raise CiError("unsafe-field-us1." + name)
+    return value
+
+
+def _us1_run_id(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise CiError("unsafe-field-us1." + name)
+    return value
+
+
+def _us1_scenario(value: Any) -> dict[str, Any]:
+    scenario = _us1_exact_keys(
+        value,
+        (
+            "name",
+            "result",
+            "generations",
+            "http",
+            "pg",
+            "observer",
+            "directive",
+            "commands",
+        ),
+        "scenario",
+    )
+    name = scenario["name"]
+    if name not in US1_SCENARIO_NAMES:
+        raise CiError("unsafe-field-us1.scenario.name")
+    result = scenario["result"]
+    if result not in US1_RESULTS:
+        raise CiError("unsafe-field-us1.scenario.result")
+    generations_value = _require_list(
+        scenario["generations"], "us1.scenario.generations"
+    )
+    if len(generations_value) > 2:
+        raise CiError("unsafe-field-us1.scenario.generations")
+    generations = [
+        _us1_int(item, "scenario.generations", minimum=1)
+        for item in generations_value
+    ]
+    if any(
+        item not in (1, 2) or item > US1_MAX_GENERATIONS
+        for item in generations
+    ):
+        raise CiError("unsafe-field-us1.scenario.generations")
+    if len(set(generations)) != len(generations):
+        raise CiError("unsafe-field-us1.scenario.generations")
+
+    http_value = _require_list(scenario["http"], "us1.scenario.http")
+    if len(http_value) > 32:
+        raise CiError("unsafe-field-us1.scenario.http")
+    http: list[dict[str, Any]] = []
+    for entry in http_value:
+        item = _us1_exact_keys(
+            entry,
+            ("status", "request_id", "payment_id", "result"),
+            "scenario.http",
+        )
+        status = _us1_int(item["status"], "scenario.http.status", minimum=100)
+        if status > 599:
+            raise CiError("unsafe-field-us1.scenario.http.status")
+        request_id = _us1_uuid(
+            item["request_id"], "scenario.http.request_id", nullable=True
+        )
+        payment_id = _us1_uuid(
+            item["payment_id"], "scenario.http.payment_id", nullable=True
+        )
+        http_result = item["result"]
+        if http_result not in (None, "") and http_result not in US1_HTTP_RESULTS:
+            raise CiError("unsafe-field-us1.scenario.http.result")
+        http.append(
+            {
+                "status": status,
+                "request_id": request_id,
+                "payment_id": payment_id,
+                "result": http_result,
+            }
+        )
+
+    pg_value = _require_list(scenario["pg"], "us1.scenario.pg")
+    if len(pg_value) > 16:
+        raise CiError("unsafe-field-us1.scenario.pg")
+    pg: list[dict[str, Any]] = []
+    for entry in pg_value:
+        item = _us1_exact_keys(
+            entry, ("state", "rows"), "scenario.pg"
+        )
+        state = item["state"]
+        if state not in US1_PG_STATES:
+            raise CiError("unsafe-field-us1.scenario.pg.state")
+        pg.append(
+            {
+                "state": state,
+                "rows": _us1_int(item["rows"], "scenario.pg.rows"),
+            }
+        )
+
+    observer_value = scenario["observer"]
+    observer: dict[str, Any] | None
+    if observer_value is None:
+        observer = None
+    else:
+        item = _us1_exact_keys(
+            observer_value,
+            ("trusted", "counts", "receipts"),
+            "scenario.observer",
+        )
+        if not isinstance(item["trusted"], bool):
+            raise CiError("unsafe-field-us1.scenario.observer.trusted")
+        counts = _us1_exact_keys(
+            item["counts"], ("payment", "query"), "scenario.observer.counts"
+        )
+        receipts_value = _require_list(
+            item["receipts"], "us1.scenario.observer.receipts"
+        )
+        if len(receipts_value) > 8:
+            raise CiError("unsafe-field-us1.scenario.observer.receipts")
+        receipts = []
+        for entry in receipts_value:
+            receipt = _us1_exact_keys(
+                entry,
+                ("run_id", "epoch", "generation", "last_seq"),
+                "scenario.observer.receipts",
+            )
+            receipts.append(
+                {
+                    "run_id": _us1_run_id(
+                        receipt["run_id"], "scenario.observer.receipts.run_id"
+                    ),
+                    "epoch": _us1_hex32(
+                        receipt["epoch"], "scenario.observer.receipts.epoch"
+                    ),
+                    "generation": _us1_int(
+                        receipt["generation"],
+                        "scenario.observer.receipts.generation",
+                        minimum=1,
+                    ),
+                    "last_seq": _us1_int(
+                        receipt["last_seq"],
+                        "scenario.observer.receipts.last_seq",
+                    ),
+                }
+            )
+        observer = {
+            "trusted": item["trusted"],
+            "counts": {
+                "payment": _us1_int(
+                    counts["payment"], "scenario.observer.counts.payment"
+                ),
+                "query": _us1_int(
+                    counts["query"], "scenario.observer.counts.query"
+                ),
+            },
+            "receipts": receipts,
+        }
+
+    directive_value = scenario["directive"]
+    directive: dict[str, Any] | None
+    if directive_value is None:
+        directive = None
+    else:
+        item = _us1_exact_keys(
+            directive_value,
+            ("result", "binding"),
+            "scenario.directive",
+        )
+        if item["result"] not in {"SUCCEEDED", "FAILED"}:
+            raise CiError("unsafe-field-us1.scenario.directive.result")
+        binding = _us1_exact_keys(
+            item["binding"],
+            (
+                "run_id",
+                "epoch",
+                "generation",
+                "call_seq",
+                "event_id",
+                "order_id",
+            ),
+            "scenario.directive.binding",
+        )
+        directive = {
+            "result": item["result"],
+            "binding": {
+                "run_id": _us1_run_id(
+                    binding["run_id"], "scenario.directive.binding.run_id"
+                ),
+                "epoch": _us1_hex32(
+                    binding["epoch"], "scenario.directive.binding.epoch"
+                ),
+                "generation": _us1_int(
+                    binding["generation"],
+                    "scenario.directive.binding.generation",
+                    minimum=1,
+                ),
+                "call_seq": _us1_int(
+                    binding["call_seq"],
+                    "scenario.directive.binding.call_seq",
+                    minimum=1,
+                ),
+                "event_id": _us1_event_id(
+                    binding["event_id"],
+                    "scenario.directive.binding.event_id",
+                    binding["call_seq"],
+                ),
+                "order_id": _us1_uuid(
+                    binding["order_id"],
+                    "scenario.directive.binding.order_id",
+                ),
+            },
+        }
+        if (
+            directive["binding"]["generation"] > US1_MAX_GENERATIONS
+            or directive["binding"]["call_seq"] > US1_MAX_RECORDS
+        ):
+            raise CiError("unsafe-field-us1.scenario.directive.binding")
+
+    commands_value = _require_list(
+        scenario["commands"], "us1.scenario.commands"
+    )
+    if len(commands_value) > 8:
+        raise CiError("unsafe-field-us1.scenario.commands")
+    commands = []
+    for entry in commands_value:
+        item = _us1_exact_keys(
+            entry, ("kind", "exit", "not_run"), "scenario.commands"
+        )
+        if item["kind"] not in US1_COMMAND_KINDS:
+            raise CiError("unsafe-field-us1.scenario.commands.kind")
+        if not isinstance(item["not_run"], bool):
+            raise CiError("unsafe-field-us1.scenario.commands.not_run")
+        exit_value = item["exit"]
+        if item["not_run"]:
+            if exit_value is not None:
+                raise CiError("unsafe-field-us1.scenario.commands.exit")
+        else:
+            exit_value = _us1_int(
+                exit_value, "scenario.commands.exit"
+            )
+        commands.append(
+            {
+                "kind": item["kind"],
+                "exit": exit_value,
+                "not_run": item["not_run"],
+            }
+        )
+
+    return {
+        "name": name,
+        "result": result,
+        "generations": generations,
+        "http": http,
+        "pg": pg,
+        "observer": observer,
+        "directive": directive,
+        "commands": commands,
+    }
+
+
+def _us1_scenario_problems(
+    scenario: Mapping[str, Any], run_id: str
+) -> list[str]:
+    if scenario["result"] != "PASS":
+        return []
+    name = scenario["name"]
+    generations = scenario["generations"]
+    http = scenario["http"]
+    pg = scenario["pg"]
+    observer = scenario["observer"]
+    directive = scenario["directive"]
+    commands = scenario["commands"]
+    problems: list[str] = []
+    payment = name.startswith("payment_") or name.startswith("restart_")
+    success = name.endswith("_success")
+    expected_generations = (
+        [1, 2]
+        if name.startswith("restart_")
+        else ([1] if name != "http_boundary" else [])
+    )
+    if generations != expected_generations:
+        problems.append("us1-generation")
+    if not commands:
+        problems.append("us1-commands")
+    elif any(
+        item["not_run"] or item["exit"] != 0 for item in commands
+    ):
+        problems.append("us1-commands")
+    request_ids = [
+        item["request_id"] for item in http if item["request_id"]
+    ]
+    if len(request_ids) != len(set(request_ids)):
+        problems.append("us1-http-request-id")
+
+    if payment:
+        if observer is None or directive is None:
+            return sorted(set(problems + ["us1-observer", "us1-directive"]))
+        expected_result = "SUCCEEDED" if success else "FAILED"
+        if directive["result"] != expected_result:
+            problems.append("us1-directive-result")
+        binding = directive["binding"]
+        if binding["run_id"] != run_id:
+            problems.append("us1-identity")
+        if binding["generation"] != 1:
+            problems.append("us1-generation")
+        if observer["trusted"] is not True:
+            problems.append("us1-observer")
+        if observer["counts"] != {"payment": 1, "query": 0}:
+            problems.append("us1-counts")
+        receipts = observer["receipts"]
+        if len(receipts) != len(generations):
+            problems.append("us1-receipts")
+        if sorted(item["generation"] for item in receipts) != sorted(
+            generations
+        ):
+            problems.append("us1-receipts")
+        if any(item["run_id"] != run_id for item in receipts):
+            problems.append("us1-identity")
+        if any(item["epoch"] != binding["epoch"] for item in receipts):
+            problems.append("us1-identity")
+        binding_receipts = [
+            item
+            for item in receipts
+            if item["generation"] == binding["generation"]
+        ]
+        if not binding_receipts or binding_receipts[0]["last_seq"] < (
+            binding["call_seq"] + 1
+        ):
+            problems.append("us1-receipts")
+        payment_ids = {
+            item["payment_id"]
+            for item in http
+            if item["payment_id"]
+        }
+        if payment_ids != {binding["order_id"]}:
+            problems.append("us1-identity")
+        for item in http:
+            if not (200 <= item["status"] <= 299):
+                problems.append("us1-http")
+                continue
+            if (
+                not item["request_id"]
+                or not item["payment_id"]
+                or not item["result"]
+            ):
+                problems.append("us1-http")
+            elif item["result"] != directive["result"]:
+                problems.append("us1-http-result")
+        statuses = [item["status"] for item in http]
+        if statuses.count(201) != 1:
+            problems.append("us1-http")
+        required_200 = 4 if name.startswith("restart_") else 2
+        if statuses.count(200) < required_200:
+            problems.append("us1-http")
+        if len(http) != (required_200 + 1):
+            problems.append("us1-http")
+        if len(pg) != 3 or any(item["rows"] != 1 for item in pg):
+            problems.append("us1-pg")
+        if {item["state"] for item in pg} != set(US1_PG_STATES):
+            problems.append("us1-pg")
+    elif name == "invalid_requests":
+        if observer is None or directive is not None:
+            problems.append("us1-observer")
+        else:
+            if observer["trusted"] is not True:
+                problems.append("us1-observer")
+            if observer["counts"] != {"payment": 0, "query": 0}:
+                problems.append("us1-counts")
+            receipts = observer["receipts"]
+            if (
+                len(receipts) != 1
+                or receipts[0]["generation"] != 1
+                or receipts[0]["run_id"] != run_id
+            ):
+                problems.append("us1-receipts")
+        if len(pg) != 3 or any(item["rows"] != 0 for item in pg):
+            problems.append("us1-pg")
+        if {item["state"] for item in pg} != set(US1_PG_STATES):
+            problems.append("us1-pg")
+        if not http:
+            problems.append("us1-http")
+        for item in http:
+            if not (400 <= item["status"] <= 499):
+                problems.append("us1-http")
+                continue
+            if item["payment_id"] or item["result"]:
+                problems.append("us1-http")
+            if item["status"] != 400 and not item["request_id"]:
+                problems.append("us1-http-request-id")
+    else:
+        if observer is not None or directive is not None or pg:
+            problems.append("us1-observer")
+        statuses = [item["status"] for item in http]
+        if not http or statuses.count(201) < 1:
+            problems.append("us1-http")
+        if not {400, 401, 413, 415} <= set(statuses):
+            problems.append("us1-http")
+        for item in http:
+            if item["status"] == 201:
+                if (
+                    not item["request_id"]
+                    or not item["payment_id"]
+                    or item["result"] != "SUCCEEDED"
+                ):
+                    problems.append("us1-http")
+                continue
+            if not (400 <= item["status"] <= 499):
+                problems.append("us1-http")
+                continue
+            if item["payment_id"] or item["result"]:
+                problems.append("us1-http")
+            if item["status"] != 400 and not item["request_id"]:
+                problems.append("us1-http-request-id")
+    return sorted(set(problems))
+
+
+def _safe_us1_report(
+    source: dict[str, Any], db_safe: Mapping[str, Any]
+) -> dict[str, Any]:
+    if source.get("schema") != US1_SCHEMA:
+        raise CiError("unsupported-report-schema")
+    _us1_exact_keys(source, ("schema", "run_id", "scenarios"), "top")
+    run_id = _us1_run_id(source.get("run_id"), "run_id")
+    if run_id != db_safe.get("run_id"):
+        raise CiError("us1-run-id-mismatch")
+    scenarios_value = _require_list(source.get("scenarios"), "us1.scenarios")
+    if len(scenarios_value) > len(US1_SCENARIO_NAMES):
+        raise CiError("unsafe-field-us1.scenarios")
+    scenarios: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in scenarios_value:
+        scenario = _us1_scenario(value)
+        if scenario["name"] in seen:
+            raise CiError("us1-scenario-duplicate")
+        seen.add(scenario["name"])
+        scenarios.append(scenario)
+
+    missing = [name for name in US1_SCENARIO_NAMES if name not in seen]
+    problems: list[str] = []
+    if missing:
+        problems.append("us1-missing-scenario")
+    for scenario in scenarios:
+        problems.extend(_us1_scenario_problems(scenario, run_id))
+    if any(item["result"] != "PASS" for item in scenarios):
+        problems.append("us1-scenario-not-pass")
+
+    db_source = db_safe.get("source", {})
+    required = db_safe.get("required_test_results", {})
+    packages = db_safe.get("package_results", {})
+    db_green = (
+        db_safe.get("result") == "pass"
+        and db_safe.get("vet_exit") == 0
+        and db_safe.get("test_exit") == 0
+        and db_source.get("manifest_verification")
+        == MANIFEST_VERIFICATION_UNCHANGED
+        and all(required.get(name) == "pass" for name in DB_REQUIRED_TEST_KEYS)
+        and packages.get("tests", {}).get("status") == "pass"
+    )
+    if not db_green:
+        problems.append("us1-db-not-green")
+    result = "pass" if not problems else "fail"
+    return {
+        "schema": "payment-hub.ci-safe.us1.v1",
+        "status": "exported",
+        "source_schema": US1_SCHEMA,
+        "generated_at": utc_now(),
+        "run_id": run_id,
+        "result": result,
+        "scenarios": scenarios,
+        "missing_scenarios": missing,
+        "problems": sorted(set(problems)),
+        "source": {
+            "manifest_digest": db_source.get("manifest_digest"),
+            "manifest_verification": db_source.get("manifest_verification"),
+            "file_count": db_source.get("file_count", 0),
+        },
+    }
+
+
 def _safe_vulnerability_report(source: dict[str, Any]) -> dict[str, Any]:
     if source.get("schema") != VULNERABILITY_SCHEMA:
         raise CiError("unsupported-report-schema")
@@ -2252,6 +2814,33 @@ def _export_one(
             + "/"
             + REPORT_FILENAMES[name],
             "source_sha256": source_hash,
+        }
+    if name == "us1":
+        db_source_path = _find_db_report(db_root)
+        if db_source_path is None:
+            return _missing_report(name), None
+        db_source, _ = _read_source_json(
+            db_source_path, expected_parent=db_source_path.parent
+        )
+        if db_source.get("run_id") != db_source_path.parent.name:
+            raise CiError("unsafe-field-run_id")
+        db_safe = _safe_db_report(db_source)
+        source_path = db_source_path.parent / REPORT_FILENAMES[name]
+        if not source_path.exists():
+            return _missing_report(name), None
+        source, source_hash = _read_source_json(
+            source_path, expected_parent=db_source_path.parent
+        )
+        safe = _safe_us1_report(source, db_safe)
+        return safe, {
+            "source": db_source_path.parent.name
+            + "/"
+            + REPORT_FILENAMES[name],
+            "source_sha256": source_hash,
+            "source_manifest_digest": db_safe["source"]["manifest_digest"],
+            "source_manifest_verification": db_safe["source"][
+                "manifest_verification"
+            ],
         }
     source_path = report_dir / REPORT_FILENAMES[name]
     if not source_path.exists():

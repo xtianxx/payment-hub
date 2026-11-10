@@ -54,9 +54,11 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 		!validRuntimeLimits(limits) {
 		return ErrRuntimeConfig
 	}
-	if _, err := LoadConfig(lookup); err != nil {
+	appConfig, err := LoadConfig(lookup)
+	if err != nil {
 		return ErrRuntimeConfig
 	}
+	authConfig := httpapi.AuthConfig{ClientID: appConfig.ClientID, APIKey: appConfig.APIKey}
 	databaseURL, ok := lookup(databaseURLEnvName)
 	if !ok || databaseURL == "" {
 		return ErrRuntimeConfig
@@ -103,6 +105,11 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 		}
 		_ = closeRuntimeDatabaseStartup(db, cleanupCtx, limits)
 	}()
+
+	if deps.businessRequired && deps.newBusiness == nil {
+		logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), ErrStartup)
+		return ErrStartup
+	}
 
 	var pingErr error
 	for {
@@ -160,6 +167,28 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 	gate := newReadyGate()
 	workCtx, cancelWork := context.WithCancel(context.Background())
 	defer cancelWork()
+
+	var submit httpapi.PaymentSubmitter
+	var query httpapi.PaymentQuerier
+	if deps.newBusiness != nil {
+		rawSubmit, rawQuery, factoryErr := deps.newBusiness(workCtx, db, testMode)
+		if factoryErr != nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), factoryErr)
+			return ErrStartup
+		}
+		if !validBusinessPort(rawSubmit) || !validBusinessPort(rawQuery) {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), ErrStartup)
+			return ErrStartup
+		}
+		gated, gatedErr := newGatedPaymentService(gate, rawSubmit, rawQuery)
+		if gatedErr != nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), gatedErr)
+			return ErrStartup
+		}
+		submit = gated
+		query = gated
+	}
+
 	check := func(checkCtx context.Context) error {
 		done, admitted := gate.begin()
 		if !admitted {
@@ -171,6 +200,13 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 		return db.Ping(probeCtx)
 	}
 	router := httpapi.NewRouter(check)
+	if submit != nil {
+		router, err = httpapi.NewRouterWithPayments(check, authConfig, submit, query)
+		if err != nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), err)
+			return ErrStartup
+		}
+	}
 	server := &http.Server{
 		Handler:           router,
 		ReadHeaderTimeout: limits.read,
@@ -278,6 +314,10 @@ func shutdownRuntime(server runtimeServer, gate *readyGate, testMode *TestMode, 
 	if forceCloseFailed || !gate.wait(exitCtx) || !waitServeDone(serveDone, exitCtx) {
 		return ErrShutdown
 	}
+	// All admitted readyz and business users have finished. It is now safe to
+	// cancel the shared work context before sealing the observer and closing the
+	// database; this must not happen before the normal gate drain.
+	cancelWork()
 	testModeFailed := false
 	if testMode != nil {
 		if _, err := testMode.Seal(exitCtx); err != nil {

@@ -19,6 +19,7 @@ import (
 const (
 	observerDefaultBarrierTimeout = 10 * time.Second
 	observerIOTimeout             = 10 * time.Second
+	observerPaymentHoldTimeout    = 2 * time.Second
 )
 
 var errObserverRequestTooLarge = errors.New("observer request exceeds frame limit")
@@ -54,14 +55,17 @@ const (
 )
 
 type observerEvent struct {
-	typ     testcontrol.Type
-	seq     uint64
-	kind    testcontrol.Kind
-	point   testcontrol.Point
-	orderID string
-	eventID string
-	ack     testcontrol.Frame
-	barrier *Barrier
+	typ            testcontrol.Type
+	seq            uint64
+	kind           testcontrol.Kind
+	point          testcontrol.Point
+	orderID        string
+	eventID        string
+	ack            testcontrol.Frame
+	barrier        *Barrier
+	paymentHold    *PaymentHold
+	paymentCallSeq *uint64
+	appliedResult  *testcontrol.Directive
 }
 
 type observerGeneration struct {
@@ -87,17 +91,18 @@ type Observer struct {
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
 
-	mu          sync.Mutex
-	closing     bool
-	closeOnce   sync.Once
-	closeErr    error
-	conns       map[net.Conn]bool
-	generations map[uint64]*observerGeneration
-	beginIDs    map[string]uint64
-	barriers    map[observerBarrierKey]*Barrier
-	records     int
-	counts      Counts
-	uncertain   bool
+	mu           sync.Mutex
+	closing      bool
+	closeOnce    sync.Once
+	closeErr     error
+	conns        map[net.Conn]bool
+	generations  map[uint64]*observerGeneration
+	beginIDs     map[string]uint64
+	barriers     map[observerBarrierKey]*Barrier
+	paymentHolds map[uint64]*PaymentHold
+	records      int
+	counts       Counts
+	uncertain    bool
 
 	finalSnapshot ObserverFinalSnapshot
 	finalReady    bool
@@ -122,6 +127,233 @@ type Barrier struct {
 	receipt  testcontrol.Receipt
 	event    *observerEvent
 	reach    testcontrol.Frame
+}
+
+// PaymentBinding is the immutable payment call identity captured when an armed
+// PaymentHold binds to the generation's payment entry call.
+type PaymentBinding struct {
+	RunID      string
+	Epoch      string
+	Generation uint64
+	CallSeq    uint64
+	EventID    string
+	OrderID    string
+}
+
+// PaymentHold is a one-per-generation fixture for selecting a result directive
+// and proving its consumption on the existing MOCK_COMMITTED reach.
+type PaymentHold struct {
+	observer *Observer
+	gen      uint64
+	deadline time.Time
+
+	arrivedCh chan struct{}
+	releaseCh chan struct{}
+	cancelCh  chan struct{}
+
+	status    paymentHoldStatus
+	binding   PaymentBinding
+	directive testcontrol.Directive
+	event     *observerEvent
+	call      testcontrol.Frame
+	ack       testcontrol.Frame
+	canceled  bool
+}
+
+type paymentHoldStatus int
+
+const (
+	paymentHoldArmed paymentHoldStatus = iota
+	paymentHoldBound
+	paymentHoldReleased
+	paymentHoldConsumed
+)
+
+// HoldPaymentEntry arms the single payment result directive fixture for one
+// expected or open generation whose payment entry has not occurred yet.
+func (o *Observer) HoldPaymentEntry(generation uint64) (*PaymentHold, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closing {
+		return nil, testcontrol.ErrControlFault
+	}
+	if o.uncertain {
+		return nil, testcontrol.ErrUncertain
+	}
+	state, ok := o.generations[generation]
+	if !ok || state.status == observerGenerationSealed {
+		return nil, testcontrol.ErrProtocol
+	}
+	if _, exists := o.paymentHolds[generation]; exists {
+		return nil, testcontrol.ErrProtocol
+	}
+	for _, event := range state.events {
+		if event.typ == testcontrol.TypeCall && event.kind == testcontrol.KindPayment {
+			return nil, testcontrol.ErrProtocol
+		}
+	}
+	hold := &PaymentHold{
+		observer:  o,
+		gen:       generation,
+		deadline:  time.Now().Add(observerPaymentHoldTimeout),
+		arrivedCh: make(chan struct{}),
+		releaseCh: make(chan struct{}),
+		cancelCh:  make(chan struct{}),
+	}
+	o.paymentHolds[generation] = hold
+	return hold, nil
+}
+
+// Wait waits for the generation's payment entry call to bind this hold.
+func (h *PaymentHold) Wait(ctx context.Context) (PaymentBinding, error) {
+	if h == nil || h.observer == nil {
+		return PaymentBinding{}, testcontrol.ErrControlFault
+	}
+	o := h.observer
+	if ctx == nil || ctx.Err() != nil {
+		o.mu.Lock()
+		o.latchFaultLocked()
+		o.mu.Unlock()
+		return PaymentBinding{}, testcontrol.ErrControlFault
+	}
+
+	o.mu.Lock()
+	if h.canceled {
+		o.mu.Unlock()
+		return PaymentBinding{}, testcontrol.ErrUncertain
+	}
+	if h.status != paymentHoldArmed {
+		binding := h.binding
+		o.mu.Unlock()
+		return binding, nil
+	}
+	deadline := h.deadline
+	o.mu.Unlock()
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-h.arrivedCh:
+		o.mu.Lock()
+		if h.canceled {
+			o.mu.Unlock()
+			return PaymentBinding{}, testcontrol.ErrUncertain
+		}
+		if ctx.Err() != nil {
+			o.latchFaultLocked()
+			o.mu.Unlock()
+			return PaymentBinding{}, testcontrol.ErrControlFault
+		}
+		binding := h.binding
+		o.mu.Unlock()
+		return binding, nil
+	case <-h.cancelCh:
+		return PaymentBinding{}, testcontrol.ErrUncertain
+	case <-ctx.Done():
+		o.mu.Lock()
+		canceled := h.canceled
+		if !canceled {
+			o.latchFaultLocked()
+		}
+		o.mu.Unlock()
+		if canceled {
+			return PaymentBinding{}, testcontrol.ErrUncertain
+		}
+		return PaymentBinding{}, testcontrol.ErrControlFault
+	case <-timer.C:
+		o.mu.Lock()
+		if h.canceled {
+			o.mu.Unlock()
+			return PaymentBinding{}, testcontrol.ErrUncertain
+		}
+		if h.status != paymentHoldArmed {
+			binding := h.binding
+			o.mu.Unlock()
+			return binding, nil
+		}
+		o.latchFaultLocked()
+		o.mu.Unlock()
+		return PaymentBinding{}, testcontrol.ErrUncertain
+	case <-o.ctx.Done():
+		return PaymentBinding{}, testcontrol.ErrUncertain
+	}
+}
+
+// Release selects the result directive for the bound payment entry.
+func (h *PaymentHold) Release(directive testcontrol.Directive) error {
+	if h == nil || h.observer == nil {
+		return testcontrol.ErrControlFault
+	}
+	if !observerValidDirective(directive) {
+		return testcontrol.ErrProtocol
+	}
+	o := h.observer
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if h.canceled {
+		return testcontrol.ErrUncertain
+	}
+	if h.status != paymentHoldBound || h.event == nil {
+		return testcontrol.ErrProtocol
+	}
+	if !time.Now().Before(h.deadline) {
+		o.latchFaultLocked()
+		return testcontrol.ErrUncertain
+	}
+	h.directive = directive
+	h.status = paymentHoldReleased
+	ack := observerAckCall(h.call)
+	value := directive
+	ack.Directive = &value
+	h.event.ack = ack
+	h.ack = ack
+	close(h.releaseCh)
+	return nil
+}
+
+func (o *Observer) waitPaymentHold(hold *PaymentHold) testcontrol.Frame {
+	if hold == nil {
+		return observerFault(testcontrol.FaultProtocol)
+	}
+	timer := time.NewTimer(time.Until(hold.deadline))
+	defer timer.Stop()
+	select {
+	case <-hold.releaseCh:
+		o.mu.Lock()
+		if hold.canceled {
+			o.mu.Unlock()
+			return observerFault(testcontrol.FaultClosed)
+		}
+		ack := hold.ack
+		o.mu.Unlock()
+		return ack
+	case <-hold.cancelCh:
+		return observerFault(testcontrol.FaultClosed)
+	case <-timer.C:
+		o.mu.Lock()
+		if hold.canceled {
+			o.mu.Unlock()
+			return observerFault(testcontrol.FaultClosed)
+		}
+		if hold.status == paymentHoldReleased || hold.status == paymentHoldConsumed {
+			ack := hold.ack
+			o.mu.Unlock()
+			return ack
+		}
+		o.latchFaultLocked()
+		o.mu.Unlock()
+		return observerFault(testcontrol.FaultTimeout)
+	case <-o.ctx.Done():
+		return observerFault(testcontrol.FaultClosed)
+	}
+}
+
+func (h *PaymentHold) cancelLocked() {
+	if h.canceled {
+		return
+	}
+	h.canceled = true
+	close(h.cancelCh)
 }
 
 func StartObserver(ctx context.Context, cfg ObserverConfig) (*Observer, error) {
@@ -195,6 +427,7 @@ func StartObserver(ctx context.Context, cfg ObserverConfig) (*Observer, error) {
 		generations:    make(map[uint64]*observerGeneration),
 		beginIDs:       make(map[string]uint64),
 		barriers:       make(map[observerBarrierKey]*Barrier),
+		paymentHolds:   make(map[uint64]*PaymentHold),
 	}
 	observer.wg.Add(1)
 	go observer.acceptLoop()
@@ -280,9 +513,12 @@ func (o *Observer) handleConnection(conn *net.UnixConn) {
 		return
 	}
 
-	response, waitBarrier := o.processFrame(frame)
+	response, waitBarrier, waitHold := o.processFrame(frame)
 	if waitBarrier != nil {
 		response = o.waitBarrierRelease(waitBarrier)
+	}
+	if waitHold != nil {
+		response = o.waitPaymentHold(waitHold)
 	}
 	o.writeResponse(conn, response)
 	o.markConnectionComplete(conn)
@@ -341,38 +577,41 @@ func (o *Observer) writeResponse(conn net.Conn, frame testcontrol.Frame) {
 	}
 }
 
-func (o *Observer) processFrame(frame testcontrol.Frame) (testcontrol.Frame, *Barrier) {
+func (o *Observer) processFrame(frame testcontrol.Frame) (testcontrol.Frame, *Barrier, *PaymentHold) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	if o.closing {
-		return observerFault(testcontrol.FaultClosed), nil
+		return observerFault(testcontrol.FaultClosed), nil, nil
 	}
 	if o.uncertain {
-		return observerFault(testcontrol.FaultProtocol), nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil
 	}
 	switch frame.Type {
 	case testcontrol.TypeFault, testcontrol.TypeAck:
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol), nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil
 	}
 	if frame.RunID != o.cfg.RunID || frame.Epoch != o.cfg.Epoch {
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol), nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil
 	}
 
 	switch frame.Type {
 	case testcontrol.TypeBegin:
-		return o.processBeginLocked(frame)
+		response, barrier := o.processBeginLocked(frame)
+		return response, barrier, nil
 	case testcontrol.TypeCall:
-		return o.processCallLocked(frame), nil
+		response, hold := o.processCallLocked(frame)
+		return response, nil, hold
 	case testcontrol.TypeReach:
-		return o.processReachLocked(frame)
+		response, barrier := o.processReachLocked(frame)
+		return response, barrier, nil
 	case testcontrol.TypeSeal:
-		return o.processSealLocked(frame), nil
+		return o.processSealLocked(frame), nil, nil
 	default:
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol), nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil
 	}
 }
 
@@ -404,23 +643,35 @@ func (o *Observer) processBeginLocked(frame testcontrol.Frame) (testcontrol.Fram
 	}
 }
 
-func (o *Observer) processCallLocked(frame testcontrol.Frame) testcontrol.Frame {
+func (o *Observer) processCallLocked(frame testcontrol.Frame) (testcontrol.Frame, *PaymentHold) {
 	state, ok := o.generations[frame.Generation]
 	if !ok || state.status != observerGenerationOpen || !observerEventIDBelongsTo(frame.EventID, state.beginID) {
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol)
+		return observerFault(testcontrol.FaultProtocol), nil
 	}
 	if event, exists := state.events[frame.Seq]; exists {
 		if event.typ != testcontrol.TypeCall || event.kind != frame.Kind ||
 			event.orderID != frame.OrderID || event.eventID != frame.EventID {
 			o.latchFaultLocked()
-			return observerFault(testcontrol.FaultProtocol)
+			return observerFault(testcontrol.FaultProtocol), nil
 		}
-		return event.ack
+		if event.paymentHold != nil {
+			hold := event.paymentHold
+			if hold.canceled {
+				return observerFault(testcontrol.FaultClosed), nil
+			}
+			switch hold.status {
+			case paymentHoldBound:
+				return testcontrol.Frame{}, hold
+			case paymentHoldReleased, paymentHoldConsumed:
+				return event.ack, nil
+			}
+		}
+		return event.ack, nil
 	}
 	if o.records >= testcontrol.MaxRecords {
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol)
+		return observerFault(testcontrol.FaultProtocol), nil
 	}
 	event := &observerEvent{
 		typ:     testcontrol.TypeCall,
@@ -438,7 +689,36 @@ func (o *Observer) processCallLocked(frame testcontrol.Frame) testcontrol.Frame 
 	case testcontrol.KindQuery:
 		o.counts.Query++
 	}
-	return event.ack
+	if frame.Kind == testcontrol.KindPayment {
+		if hold, exists := o.paymentHolds[frame.Generation]; exists {
+			if hold.canceled || hold.status != paymentHoldArmed {
+				// Record and count the independent payment before declaring the
+				// fixture uncertain; a control rejection must not stand in for
+				// business duplicate prevention.
+				o.latchFaultLocked()
+				return observerFault(testcontrol.FaultProtocol), nil
+			}
+			if !time.Now().Before(hold.deadline) {
+				o.latchFaultLocked()
+				return observerFault(testcontrol.FaultTimeout), nil
+			}
+			hold.status = paymentHoldBound
+			hold.binding = PaymentBinding{
+				RunID:      o.cfg.RunID,
+				Epoch:      o.cfg.Epoch,
+				Generation: frame.Generation,
+				CallSeq:    frame.Seq,
+				EventID:    frame.EventID,
+				OrderID:    frame.OrderID,
+			}
+			hold.event = event
+			hold.call = frame
+			event.paymentHold = hold
+			close(hold.arrivedCh)
+			return testcontrol.Frame{}, hold
+		}
+	}
+	return event.ack, nil
 }
 
 func (o *Observer) processReachLocked(frame testcontrol.Frame) (testcontrol.Frame, *Barrier) {
@@ -449,7 +729,9 @@ func (o *Observer) processReachLocked(frame testcontrol.Frame) (testcontrol.Fram
 	}
 	if event, exists := state.events[frame.Seq]; exists {
 		if event.typ != testcontrol.TypeReach || event.point != frame.Point ||
-			event.orderID != frame.OrderID || event.eventID != frame.EventID {
+			event.orderID != frame.OrderID || event.eventID != frame.EventID ||
+			!observerUintPtrEqual(event.paymentCallSeq, frame.PaymentCallSeq) ||
+			!observerDirectivePtrEqual(event.appliedResult, frame.AppliedResult) {
 			o.latchFaultLocked()
 			return observerFault(testcontrol.FaultProtocol), nil
 		}
@@ -463,35 +745,111 @@ func (o *Observer) processReachLocked(frame testcontrol.Frame) (testcontrol.Fram
 		return observerFault(testcontrol.FaultProtocol), nil
 	}
 
+	if frame.Point == testcontrol.PointMockCommitted && frame.PaymentCallSeq == nil {
+		if hold, exists := o.paymentHolds[frame.Generation]; exists && !hold.canceled &&
+			(hold.status == paymentHoldBound || hold.status == paymentHoldReleased) {
+			o.latchFaultLocked()
+			return observerFault(testcontrol.FaultProtocol), nil
+		}
+	}
+
+	var proofCallSeq *uint64
+	var proofResult *testcontrol.Directive
+	if frame.PaymentCallSeq != nil {
+		if err := o.consumePaymentProofLocked(frame); err != nil {
+			o.latchFaultLocked()
+			return observerFault(testcontrol.FaultProtocol), nil
+		}
+		callSeq := *frame.PaymentCallSeq
+		result := *frame.AppliedResult
+		proofCallSeq = &callSeq
+		proofResult = &result
+	}
+
 	event := &observerEvent{
-		typ:     testcontrol.TypeReach,
-		seq:     frame.Seq,
-		point:   frame.Point,
-		orderID: frame.OrderID,
-		eventID: frame.EventID,
+		typ:            testcontrol.TypeReach,
+		seq:            frame.Seq,
+		point:          frame.Point,
+		orderID:        frame.OrderID,
+		eventID:        frame.EventID,
+		paymentCallSeq: proofCallSeq,
+		appliedResult:  proofResult,
 	}
 	state.events[frame.Seq] = event
 	o.records++
 
-	key := observerBarrierKey{generation: frame.Generation, point: frame.Point, orderID: frame.OrderID}
-	if barrier, exists := o.barriers[key]; exists && !barrier.arrived && !barrier.canceled && !barrier.released {
-		barrier.arrived = true
-		barrier.seq = frame.Seq
-		barrier.receipt = testcontrol.Receipt{
-			RunID:      o.cfg.RunID,
-			Epoch:      o.cfg.Epoch,
-			Generation: frame.Generation,
-			LastSeq:    frame.Seq,
+	if frame.PaymentCallSeq == nil {
+		key := observerBarrierKey{generation: frame.Generation, point: frame.Point, orderID: frame.OrderID}
+		if barrier, exists := o.barriers[key]; exists && !barrier.arrived && !barrier.canceled && !barrier.released {
+			barrier.arrived = true
+			barrier.seq = frame.Seq
+			barrier.receipt = testcontrol.Receipt{
+				RunID:      o.cfg.RunID,
+				Epoch:      o.cfg.Epoch,
+				Generation: frame.Generation,
+				LastSeq:    frame.Seq,
+			}
+			barrier.event = event
+			barrier.reach = frame
+			event.barrier = barrier
+			close(barrier.arrivedCh)
+			return testcontrol.Frame{}, barrier
 		}
-		barrier.event = event
-		barrier.reach = frame
-		event.barrier = barrier
-		close(barrier.arrivedCh)
-		return testcontrol.Frame{}, barrier
 	}
 
 	event.ack = observerAckReach(frame, testcontrol.ActionContinue)
 	return event.ack, nil
+}
+
+func (o *Observer) consumePaymentProofLocked(frame testcontrol.Frame) error {
+	if frame.Point != testcontrol.PointMockCommitted ||
+		frame.PaymentCallSeq == nil || frame.AppliedResult == nil ||
+		*frame.PaymentCallSeq < 1 || *frame.PaymentCallSeq >= frame.Seq {
+		return testcontrol.ErrControlFault
+	}
+	hold, ok := o.paymentHolds[frame.Generation]
+	if !ok || hold.canceled || hold.status != paymentHoldReleased || hold.event == nil {
+		return testcontrol.ErrControlFault
+	}
+	if hold.binding.RunID != frame.RunID || hold.binding.Epoch != frame.Epoch ||
+		hold.binding.Generation != frame.Generation ||
+		hold.binding.CallSeq != *frame.PaymentCallSeq ||
+		hold.binding.OrderID != frame.OrderID {
+		return testcontrol.ErrControlFault
+	}
+	state, ok := o.generations[frame.Generation]
+	if !ok {
+		return testcontrol.ErrControlFault
+	}
+	event, ok := state.events[*frame.PaymentCallSeq]
+	if !ok || event != hold.event || event.typ != testcontrol.TypeCall ||
+		event.kind != testcontrol.KindPayment || event.orderID != frame.OrderID ||
+		event.eventID != hold.binding.EventID {
+		return testcontrol.ErrControlFault
+	}
+	if hold.directive != *frame.AppliedResult {
+		return testcontrol.ErrControlFault
+	}
+	hold.status = paymentHoldConsumed
+	return nil
+}
+
+func observerUintPtrEqual(a, b *uint64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func observerDirectivePtrEqual(a, b *testcontrol.Directive) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func observerValidDirective(value testcontrol.Directive) bool {
+	return value == testcontrol.DirectiveSucceeded || value == testcontrol.DirectiveFailed
 }
 
 func (o *Observer) processSealLocked(frame testcontrol.Frame) testcontrol.Frame {
@@ -526,6 +884,14 @@ func (o *Observer) sealLocked(generation, expected uint64) (testcontrol.Receipt,
 	}
 	for _, barrier := range o.barriers {
 		if barrier.gen == generation && !barrier.released && !barrier.canceled {
+			return testcontrol.Receipt{}, testcontrol.ErrControlFault
+		}
+	}
+	for holdGen, hold := range o.paymentHolds {
+		if holdGen != generation {
+			continue
+		}
+		if hold.canceled || hold.status != paymentHoldConsumed {
 			return testcontrol.Receipt{}, testcontrol.ErrControlFault
 		}
 	}
@@ -790,6 +1156,12 @@ func (o *Observer) close(ctx context.Context) error {
 			close(barrier.cancelCh)
 		}
 	}
+	for _, hold := range o.paymentHolds {
+		if hold.status != paymentHoldConsumed {
+			incomplete = true
+		}
+		hold.cancelLocked()
+	}
 	if incomplete {
 		o.uncertain = true
 	}
@@ -889,6 +1261,9 @@ func (o *Observer) latchFaultLocked() {
 			barrier.canceled = true
 			close(barrier.cancelCh)
 		}
+	}
+	for _, hold := range o.paymentHolds {
+		hold.cancelLocked()
 	}
 }
 

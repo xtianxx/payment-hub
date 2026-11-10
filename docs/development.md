@@ -306,14 +306,14 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
 
 省略 `--cleanup-owned-resources` 时普通停止保留卷；提供该开关时也只删除已登记且重新核对精确名称与标签的本次卷，不执行全局prune或 `down -v`。产物 `artifacts/<run_id>/db-foundation.json` 默认保留、不入Git。脚本输出固定摘要与完整白名单报告，不归档连接值、SQL、业务整行或工具原错误。SIGINT/SIGTERM执行有界收尾；SIGKILL或宿主故障不能保证收尾，不宣称具备这类恢复能力。
 
-当前入口执行的integration Go命令如下；T012–T017的历史执行结果另见下表，后续观察器/真实应用扩展见第9节：
+当前入口执行的integration Go命令如下（已纳入US1的`tests`包）；T012–T017历史执行结果仍按当次范围解读：
 
 ```sh
-go vet -mod=readonly -tags=integration -p=1 ./internal/postgres ./internal/mock ./tests/harness
-go test -mod=readonly -tags=integration -race -count=1 -p=1 -timeout=120s -json ./internal/postgres ./internal/mock ./tests/harness
+go vet -mod=readonly -tags=integration -p=1 ./internal/postgres ./internal/mock ./tests/harness ./tests
+go test -mod=readonly -tags=integration -race -count=1 -p=1 -timeout=120s -json ./internal/postgres ./internal/mock ./tests/harness ./tests
 ```
 
-连接配置只由启动器向本次子进程注入；不要把这些命令改成连接开发/演示库的手工操作。当前最小应用可由集成夹具构建并启动，只有readyz；完整支付应用尚未实现。
+连接配置只由启动器向本次子进程注入；不要把这些命令改成连接开发/演示库的手工操作。当前US1已由夹具构建正常应用并验证提交、查询、成功/FAILED和真实重启；下表的readyz-only结果属于基础阶段历史，不代表当前入口仍无业务路由。
 
 ### 本批实际结果（2026-11-07）
 
@@ -454,9 +454,51 @@ setup job由10改20分钟，DB20、漏洞10不变。job上限覆盖整个准备/
 
 本轮真实CLI启动时的pid/starttime未持久化，只有结束后的命令/缓存扫描无匹配，故不宣称完整进程身份追踪证据闭合；容器/network/volume缺席另有查询。原US1改动保持原样并暂停。本轮仅本地验收，尚未提交、推送、合并或远端复验，不新增runner硬杀或Go孙进程清理保证。
 
-本批已另获实施、隔离验证及新分支 Draft PR 授权；仍不合并、发布或部署。T018–T022 已分两次完成本机合流验收；远端结论须以 Draft PR 精确提交的实际检查为准，不能沿用上一批 main 绿灯。
+### main 恢复与 US1 重新开始（2026-11-09）
 
-### 观察器的可信计数合同
+PR #5 head `07e877e` 的run `42546953918` 三job与四类安全报告通过，用户授权合并为main `79a573679f333ce42ad08c3b127615ae5d4fcdb0`。父继续等待并核对合并后的push run `42547858928`：三个job全部成功，default/db/cancellation/vulnerability上传报告与provenance及67项源码输入吻合，可达漏洞0；default监督等待121.651秒、DB137.551秒，均在共享570秒内。此结论是合并后main的实际结果，不是沿用PR绿灯。
+
+用户随后明确恢复US1并同意安全同步基线。原19项未提交改动先备份于`artifacts/us1-core/resume-main-sync/`，stash `49c49f6a37a3e5f54c997af13024fb6cec1ca158`保留；分支`002-us1-payment-submission`从b05da76快进到79a5736再恢复。workflow摘要和工具测试冲突按并集处理，保留main全部570秒/安全计时/未验证报告修复，以及US1的28个default/7项DB精确包绑定。303项工具回归、AST/14个shell块检查通过；备份和stash未删除，无提交推送。
+
+恢复时的业务代码仍未验收：payment有核心实现但生命周期取消未绑定在途调用，需完成已有3项定点回归；postgres/mock仍是安全ErrUnavailable轮廓，未做真实PG行为red，不能把旧compile-only或缺API错误当red。首批仍仅T023–T025/T029–T033，待目标红绿及真实数据库验收后才逐项更新任务；尚未接支付HTTP或宣称US1完成，不扩US2+/CD。
+
+以下T018–T022记录为历史阶段范围；其远端结论须对应当次精确提交，不能作为US1已完成的依据。
+
+US1首批恢复后的核心验收已完成：生命周期在途取消与历史记录重放校验均有新增测试先行的真实断言red→green，平台登记/结果原子保存及Mock独立事实使用冻结集成测试完成freshPG red→green。父独立核对`artifacts/us1-core/core-acceptance/resumed/parent-acceptance.json`：默认28项必需根、DB7项必需结果及新增26个集成子例均通过；81项源码输入稳定，fixture残留0/0/0，导出/provenance与独立资源缺席查询通过。本轮未重复漏洞扫描或取消实验，未改依赖、提交或推送。证据副本`.go`曾污染`./...`造成首次vet失败，现保留字节/hash改为`.go.snapshot`并记映射，检查范围不变；一次相对report-dir参数被执行前拒绝也如实保留。最早T023原始测试先行证据缺失继续披露，不补造；T024普通确认读取随查单补齐。HTTP、私有指令夹具和真实支付重启闭环仍待实施，完整US1未完成。
+
+### US1最终本机运行验收（2026-11-09）
+
+父已独立接受`artifacts/us1-core/real-us1/acceptance/after-sql-evidence-fix/parent-acceptance.json`，run `3ed70eb46c0c48e68dc4725d706c66aa`。实际fresh PG命令退出0（114.214秒），default/db/us1安全导出退出0；11项必需集成结果、四包与六个真实场景全部通过，fixture残留0/0/0。105项输入在执行前后稳定，父重新核对当前逐项SHA、原始/安全报告与provenance哈希、六份无fault且complete的harness报告、进程退出及隔离容器/网络/卷缺席。
+
+成功和FAILED均通过同一正常应用二进制真实POST201、两种GET200及PG逐列事实核对；失败只由可信私有UDS的一次性订单/代次/call绑定指令建立，实际提交结果证明消费，最终可信Seal receipt闭合。两组重启场景真实停止后启动同一二进制、保留PG和父Observer，两代receipt、事实/时间/关联保持，付款调用仍1、渠道查询0。非法请求八条无效果；真实TCP边界十二条保留201/400/401/413/415及唯一server-preapp400的包装例外。
+
+默认38必需根与untagged vet复用此前已通过的同一活动输入（最终三个改动文件均仅integration标签）；父按原快照至最终版逐项比对，不声称最终轮重新执行default/vet。CI已同步38默认/11DB、`tests`包及源码glob、可信artifact根与严格`us1.safe.json`导出，344项工具测试通过；570共享批次及20/20/10 job预算不变。本轮无新漏洞扫描/取消实验，不冒充远端job已通过。
+
+真实验收前的仓库路径、测试DSN附加参数、raw响应解析、失败归档及SQL证据语义错误均保留。SQL表标签曾误传harness的SQLSTATE字段（MOCK四位被拒）；业务PG逐列断言已先通过，父已纠正执行摘要的误分类，未把证据适配失败算作产品red。正确记录为成功SQLSTATE `00000`，表标签仅保留在typed US1计数中。
+
+T024–T041据对应证据完成并更新quickstart；T023当前测试通过，但最早测试先行快照/red未保留，仍未勾选，不补造历史。当前没有US1提交、推送、合并或发布，不进入US2+/CD，也不宣称完整MVP、应用镜像或当前分支远端CI通过。备份、stash和本地worktree管理改动保留。
+
+### US1审查R1：POST组合拒绝优先级（2026-11-10）
+
+只读审查`/tmp/opencode/payment-hub-review-20261109/review.md`独立指出：合法身份和媒体下，POST附查询参数且实际body4097字节时，原实现先拒查询而返回400，违反合同要求的大小优先413。原suite通过不能抵消该反例。本批仅把查询参数拒绝移到受限读取/超限判断之后，保留鉴权、媒体和编码检查在读取之前；未改业务、数据库、路由、依赖或CI工具。
+
+在既有必需根`TestPaymentRequestBoundary/POST_rejection_priority`补7个组合回归，先保存最终测试快照，在旧实现上得到3个真实400/413断言red，再以同测试hash通过。覆盖4096/4097、401与415不读body、未知/误导Content-Length、拒绝零业务调用和有界读取。完整HTTP包329叶子通过；父读回后fresh full vet退出0，正式default全包race门禁38/38、8包终态与default安全导出通过，provenance无错误。证据见`artifacts/us1-core/review-r1-validation/parent-acceptance.json`与`review-r1-parent/resolution.md`。
+
+父核对除两目标文件外195个文件在修复验证前后不变，原未提交工作保留。组合用例已归既有精确CI根覆盖，无需新增根或放宽570秒预算。本批没有重跑PG/真实TCP/US1集成、Python工具、漏洞或取消实验，不把旧PG报告当作R1修改后验证；R2–R6/P3未处理，T023历史证据限制不变。未提交、推送或启用CD。
+
+### CI与代码防漂移（2026-11-10）
+
+当前默认必需清单保留38个根，并显式绑定R1焦点子测试`TestPaymentRequestBoundary/POST_rejection_priority`，合计39项；根pass但该子组缺失、skip、fail、错包或重复都不能绿。DB仍为四包、11项。工作流摘要直接由`check-ci-contract.py --summary default|db`读取常量生成，不手抄名单；默认摘要的包数是必需绑定包数，不是整套测试包数。
+
+模块缓存准备之后、默认检查之前，CI运行stdlib-only的`check-ci-contract.py --go ABS_GO`：比较普通与integration两次`go list`元数据，拒绝新增integration包/文件没有进入启动器选择；核对必需绑定、递归测试/Python/迁移清单及本项目工作流合同。不安装PyYAML、不下载模块、不运行PG；关键合同测试不依赖旧PyYAML额外测试是否可用。该解析器只接受本项目受支持的字面工作流形态，新增YAML形态须连同合同和变异测试一起更新，不是通用YAML验证器。
+
+源码清单自动覆盖`tests/**/*.go`、`scripts/*.py`和`migrations/*.sql`，保留internal/cmd/工作流及显式输入。新文件纳入哈希不等于新行为自动成为必需检查，新增关键行为仍需维护精确Package/Test绑定，并同步测试其缺失时失败。
+
+新增最终`CI gate`（1分钟、无checkout或凭据），`always()`依赖setup、DB、漏洞三个执行job；仅三个结果均为success通过，failure/cancelled/skipped/空值均失败。原job的20/20/10分钟、570秒共享监督、120秒integration包期限、固定工具链/action pins、只读权限、漏洞阻断和安全上传不变，CD保持关闭。远端required-check未配置：首次获授权推送并实际运行后，管理员应将`CI gate`设为分支保护/ruleset的required check并核实阻断；本地工作流变更本身不提供远端保护保证。
+
+本批红绿证据、合流验证及范围快照位于`artifacts/ci-code-sync/`。合流后实际通过403项Python回归（无skip）、两次真实Go metadata预检、vet及39/39默认必需项；fresh隔离PG run `8498488b3ec44d70bdf474fbce08e68a`通过11/11、四包和六US1场景。父独立核对107项当前输入哈希、安全导出/provenance、夹具0/0/0及资源缺席，接受记录为`validation/parent-acceptance.json`。此前R1的default38和US1历史报告仍只适用于各自输入，不沿用旧报告冒称新输入已通过。本批未重跑漏洞扫描或取消实验；全Python首次执行后的证据采集器出错，修正采集器后再次全量通过，此故障不算产品行为red。未提交、推送、配置远端规则或部署。
+
+### 观察器的可信计数合同（以下为基础阶段记录）
 
 - `internal/testcontrol/protocol.go` 只依赖标准库，共享严格有界协议；`tests/harness/observer.go` 是父进程工具，不进入业务依赖。每条私有 Unix socket 连接只交换一帧请求和一帧响应，必须验证完整 EOF；帧含唯一结尾 LF，总长最多4096字节。未知/重复/越型字段、非法身份或额外帧均拒绝，错误不回显原文。
 - 父先 `Expect` 进程代次，producer 以独立 Begin nonce 开启窗口。每次独立 Call/Reach 分配新的本地序号，即使订单相同也不能合并；只有同一事件完整同义的传输重试可去重。PAYMENT/QUERY 分计，Reach不算渠道调用。每个 run 最多64个代次、4096条唯一 Call/Reach。

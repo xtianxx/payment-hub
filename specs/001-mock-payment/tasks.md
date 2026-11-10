@@ -4,7 +4,7 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 # Tasks: 模拟商城一次性 Mock 支付闭环
 
-**Status**: Runtime foundation complete locally — 2026-11-08 已完成获授权的 T001–T022；本批可信观察器/接缝/真实进程工具、最小readyz应用及隔离PG实际验收通过。T023–T082 共60项未执行；基础阶段本机检查不等于故事或完整MVP完成。远端结论须以Draft PR精确head及实际checkout的检查为准。本文件不授予后续实施、安装、运行、迁移、发布、清理数据、提交或推送权限；本批功能分支提交推送/Draft PR另有明确授权，不合并、不进入T023+。
+**Status**: US1 local runtime accepted, historical evidence exception retained — T001–T022及CI加固/依赖整改已合并；US1分支基于main `79a5736`，当前未提交/推送。US1真实HTTP/PG/成功/FAILED/两代进程重启及安全导出已独立验收，T024–T041完成；T023当前测试通过但最早测试先行证据未保留，仍不勾选，不宣称所有历史证据齐全。US2+、完整MVP、应用镜像、远端分支CI与CD未验收。本文件本身不授予执行或Git权限，后续提交/推送/合并及US2+、CD仍须另获授权。
 
 **Input**: `specs/001-mock-payment/` 中已批准的设计，基线提交 `a999f01`。
 
@@ -82,28 +82,34 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 ### Tests for User Story 1（必需，先于对应实现）
 
+**2026-11-09首批核心验收**：`artifacts/us1-core/core-acceptance/resumed/parent-acceptance.json` 独立核对默认28项、DB7项必需检查、26个新增集成子例全部通过，81项输入稳定且隔离资源缺席。T023当前测试通过，但最早实现前的原始测试快照/red输出未保留；后建outline仅作反例，故不声称历史测试先行证据齐全，暂不勾选。T024登记/原子保存部分已通过真实PG同测试red→green，普通已确认读取部分随T034继续完成，暂不整项勾选。以下实现项勾选仅代表所列核心行为已经验收，不消除上述证据限制，也不代表HTTP、真实业务重启、T028夹具或完整US1完成。
+
+**同日查询/HTTP适配批验收更新**：`artifacts/us1-core/query-http-acceptance/parent-acceptance.json` 独立核对默认31项、DB8项全部通过，92输入稳定；T024普通读取增量已由冻结lookup测试真实PG red→green补齐，现整项勾选。T027/T034–T038适配层行为通过，HTTP包313叶子测试通过，但不代表真实socket、应用子进程或重启闭环。唯一授权冻结夹具修正使“重复Content-Encoding”实际包含两个值，415/零业务断言未放宽，并以新测试hash另留outline red；GET暂时零字节读取缺口亦保留真实parser red→green。T023原始历史证据限制不变。
+
+**最终本地运行验收**：`artifacts/us1-core/real-us1/acceptance/after-sql-evidence-fix/parent-acceptance.json` 独立核对run `3ed70eb46c0c48e68dc4725d706c66aa`：11/11必需集成结果、六真实场景PASS、两种查询、成功/FAILED跨真实重启保持、独立付款计数、可信消费封口、0/0/0夹具残留及资源缺席，105输入稳定。默认38根与untagged vet复用此前已通过且输入未变的结果；344项工具测试同期接CI。路径/DSN/raw HTTP解析/SQLSTATE证据适配失败不当业务red；SQLSTATE适配曾被执行摘要误判成PG断言失败，父分类修正另有记录。T023历史缺证不消除；其余US1运行任务可据实际证据勾选，未提交推送或进入US2+。
+
 - [ ] T023 [P] [US1] 在 `internal/payment/submit_test.go` 编写新建资格、成功/明确失败、金额1与1,000,000及0/负数/越界/非CNY的测试，断言无效请求无登记/调用、故障不被猜成付款失败、未可靠保存不能宣称新确认，先建立业务层付款调用spy。（依赖：T022；验收：覆盖FR-001–004/013与SC-001/004/008，原始事实和付款资格分别判断。）
-- [ ] T024 [P] [US1] 在 `internal/postgres/flow_test.go` 编写真实登记、当前接入方定位、确认与最小依据同事务保存测试；核对显式UNKNOWN、结果/confirmed_at组合和普通确认读取不额外加锁/写记录。（依赖：T022；验收：测试直接检查PG事实，不以Mock存储或HTTP状态替代原子性。）
-- [ ] T025 [P] [US1] 在 `internal/mock/transaction_test.go` 编写独立成功/失败事实与原交易查询测试，验证Mock使用实际调用值、自己的UUID和处理时间，付款观测在防重之前，查询不创建交易，也不从平台表补值。（依赖：T022；验收：调用计数与交易效果单独断言，正常查询不改持久化结果；可见性故障扩展归T060，不阻塞US1的正常夹具。）
-- [ ] T026 [P] [US1] 在 `internal/httpapi/request_test.go`、`tests/us1_http_boundary_test.go` 编写严格输入与真实连接用例：UTF-8单JSON对象、三必填字段、拒缺失/null/未知/重复字段及错误类型，金额拒字符串/小数/指数/不安全表示；两种GET校验UUIDv4、唯一业务参数且拒非空体/未知参数；POST拒查询参数、错误/重复媒体类型、额外参数和压缩编码，实际4096/4097字节及流式无Content-Length分界均无提前业务效果。（依赖：T022；验收：明确400/413/415、鉴权优先及服务器提前拒绝的包装例外，不能只检查声明长度。）
-- [ ] T027 [P] [US1] 在 `internal/httpapi/response_test.go` 编写单对象七字段、UUIDv4请求号、UTC RFC3339时间、UNKNOWN空confirmed_at、新建201/Location、查询200、404无记录、互斥error/issues及无问题省略issues的合同测试，检查所有业务响应JSON/no-store且不生成ETag/Last-Modified或用304绕过查询。（依赖：T022；验收：FAILED是正常付款事实，2xx不等于付款成功或追踪完整，状态映射以合同为准。）
-- [ ] T028 [P] [US1] 在 `tests/us1_test.go`、`tests/us1_restart_test.go` 编写US1-A1–A5的HTTP+PG及真实进程测试：成功/失败各自闭环，非法初始请求无订单/效果，重启保留订单身份/金额/币种/关联/结果；父观察器跨重启记录付款次数。（依赖：T022；验收：使用真实应用子进程而非new对象，场景完整前不把进程或容器存活当业务通过。）
+- [x] T024 [P] [US1] 在 `internal/postgres/flow_test.go` 编写真实登记、当前接入方定位、确认与最小依据同事务保存测试；核对显式UNKNOWN、结果/confirmed_at组合和普通确认读取不额外加锁/写记录。（依赖：T022；验收：测试直接检查PG事实，不以Mock存储或HTTP状态替代原子性。普通读取增量见 `internal/postgres/lookup_test.go`，其余沿冻结flow测试。）
+- [x] T025 [P] [US1] 在 `internal/mock/transaction_test.go` 编写独立成功/失败事实与原交易查询测试，验证Mock使用实际调用值、自己的UUID和处理时间，付款观测在防重之前，查询不创建交易，也不从平台表补值。（依赖：T022；验收：调用计数与交易效果单独断言，正常查询不改持久化结果；可见性故障扩展归T060，不阻塞US1的正常夹具。）
+- [x] T026 [P] [US1] 在 `internal/httpapi/request_test.go`、`tests/us1_http_boundary_test.go` 编写严格输入与真实连接用例：UTF-8单JSON对象、三必填字段、拒缺失/null/未知/重复字段及错误类型，金额拒字符串/小数/指数/不安全表示；两种GET校验UUIDv4、唯一业务参数且拒非空体/未知参数；POST拒查询参数、错误/重复媒体类型、额外参数和压缩编码，实际4096/4097字节及流式无Content-Length分界均无提前业务效果。（依赖：T022；验收：明确400/413/415、鉴权优先及服务器提前拒绝的包装例外，不能只检查声明长度。）
+- [x] T027 [P] [US1] 在 `internal/httpapi/response_test.go` 编写单对象七字段、UUIDv4请求号、UTC RFC3339时间、UNKNOWN空confirmed_at、新建201/Location、查询200、404无记录、互斥error/issues及无问题省略issues的合同测试，检查所有业务响应JSON/no-store且不生成ETag/Last-Modified或用304绕过查询。（依赖：T022；验收：FAILED是正常付款事实，2xx不等于付款成功或追踪完整，状态映射以合同为准。）
+- [x] T028 [P] [US1] 在 `tests/us1_test.go`、`tests/us1_restart_test.go` 编写US1-A1–A5的HTTP+PG及真实进程测试：成功/失败各自闭环，非法初始请求无订单/效果，重启保留订单身份/金额/币种/关联/结果；父观察器跨重启记录付款次数。（依赖：T022；验收：使用真实应用子进程而非new对象，场景完整前不把进程或容器存活当业务通过。）
 
 ### Implementation for User Story 1
 
-- [ ] T029 [P] [US1] 实现 `internal/postgres/orders.go` 的Read Committed短事务登记：业务唯一键使用 `ON CONFLICT DO NOTHING`，只在本次确实新建且提交确认后返回资格，冲突使用下一条独立SELECT，不吞其他唯一错误；提交不明不当无记录或重新给资格。（依赖：T023,T024；验收：T024登记断言成立，Mock调用不跨事务或持有订单锁。）
-- [ ] T030 [P] [US1] 实现 `internal/mock/transaction.go` 的独立付款和事实保存，渠道编号独立于平台号，仅保存SUCCEEDED/FAILED，不因答复丢失更改结果；接入T019观测，正常路径不依赖测试模式。（依赖：T025；验收：T025通过，保存自身实际处理值，不创建后台任务或处理中交易状态。）
-- [ ] T031 [P] [US1] 实现 `internal/payment/result.go` 的依据校验和处理决定，保留原文：“`evidence` 只允许 `platform_reference_id`、`mock_transaction_id`、`amount`、`currency`、`result`、`differences`。”；“`differences` 只列出不匹配的字段名，不是任意嵌套报文。”；使用 `ACCEPT_CONFIRMATION`、`KEEP_UNKNOWN`、`KEEP_CONFIRMED`、`REJECT_EVIDENCE`，前后状态按数据模型，不补造未取得字段或以空对象接受新确认。（依赖：T023,T024；验收：关联、交易号、金额、币种及确认结果匹配才接受，非法类型/长度/格式只留受控分类，金额不经浮点。）
-- [ ] T032 [US1] 实现 `internal/postgres/results.go` 的完整结果保存原子动作：固定观测/记录号后按接入方与稳定订单号锁行，不以UNKNOWN过滤锁定；依据锁下当前状态条件更新并追加最小记录，确认提交才返回新结论，普通已确认读取不进入该写流程。（依赖：T024,T031；验收：T024原子保存成立，记录前后状态不用Mock调用前旧快照，不暴露pgx事务给业务。）
-- [ ] T033 [US1] 实现 `internal/payment/submit.go` 的提交编排，依次验证输入、登记、确认本次资格、事务外调用Mock及保存固定观测；只有可靠保存才返回新确认，已有订单不再次付款，错误不触发后台支付或换号重试。（依赖：T029,T030,T031,T032；验收：T023正常/拒绝路径通过，结果未知与处理故障分开表达。）
-- [ ] T034 [P] [US1] 实现 `internal/postgres/lookup.go` 的按平台UUID和业务单号两种当前接入方单笔定位，已确认普通读取无写锁、无新增核实记录；读取错误不被解释为无记录。（依赖：T024,T027；验收：不能跨身份读单，查询不创建记录或恢复资格。）
-- [ ] T035 [US1] 实现 `internal/mock/query.go` 从自身交易表查询原交易的正常路径，平台关联号稳定，不读取平台结果、改写渠道事实或产生付款效果。（依赖：T025,T030；验收：能核实既有成功/失败，可靠无匹配与查询故障有不同表达。）
-- [ ] T036 [US1] 实现 `internal/payment/query.go` 的共同查询流程：已有确认直接可靠返回，未知必须调用Mock核实，匹配则经T032保存确认与依据，仍无法确认则保留未知并保存应有核实记录，无平台订单直接返回无记录。（依赖：T031,T032,T034,T035；验收：两个GET语义一致，未知查询绝不创建新付款，US3再扩展受控故障和并发保护。）
-- [ ] T037 [US1] 实现 `internal/httpapi/request.go`，按合同先鉴权后媒体/大小和结构检查，再业务值校验；受限读取完成前无业务效果，GET与POST字段来源不混用，不自动裁剪/转型或通过浮点解析金额。（依赖：T011,T026；验收：T026输入用例通过，金额冲突细分由US2补齐，不放宽非法表示。）
-- [ ] T038 [US1] 实现 `internal/httpapi/response.go` 的request_id、payment、error、issues和HTTP映射，七个订单字段与时间按合同，201只用于确认本次新建并附Location；错误说明白名单脱敏，三入口所有应用响应JSON/no-store。（依赖：T027,T031；验收：T027通过，不把候选订单号、未保存答复或错误码旁路表达为新付款事实。）
-- [ ] T039 [US1] 在 `internal/httpapi/payments.go`、`internal/httpapi/router.go`、`internal/app/app.go` 连接POST `/api/v1/payments`、GET `/api/v1/payments/{payment_id}`、GET `/api/v1/payments?business_order_no=...`；三业务入口鉴权，readyz独立，不注册列表、控制或管理别名。（依赖：T022,T033,T036,T037,T038；验收：实际路由可达同一支付业务，HTTP层不直接调用Mock或写订单表。）
-- [ ] T040 [US1] 接线并执行 `tests/us1_test.go`、`tests/us1_http_boundary_test.go`、`tests/us1_restart_test.go` 的真实HTTP/PG/子进程验收，检查输入拒绝不新增订单或付款、两种查询同单及确认结果跨重启保留。（依赖：T026,T027,T028,T039；验收：US1-A1–A5各有主证据，连接级字节限制不能由内存路由测试替代，记录实际命令及失败摘录。）
-- [ ] T041 [US1] 在 `artifacts/<run_id>/us1.json` 保存本故事焦点检查、响应、白名单PG状态、独立调用与效果证据、进程代次及未执行项；按真实结果更新 `specs/001-mock-payment/quickstart.md` 的US1操作，不提前宣布完整MVP或镜像通过。（依赖：T040；验收：编译、业务与数据库/HTTP检查的实际命令和退出码可复查，缺证据不勾选本故事完成。）
+- [x] T029 [P] [US1] 实现 `internal/postgres/orders.go` 的Read Committed短事务登记：业务唯一键使用 `ON CONFLICT DO NOTHING`，只在本次确实新建且提交确认后返回资格，冲突使用下一条独立SELECT，不吞其他唯一错误；提交不明不当无记录或重新给资格。（依赖：T023,T024；验收：T024登记断言成立，Mock调用不跨事务或持有订单锁。）
+- [x] T030 [P] [US1] 实现 `internal/mock/transaction.go` 的独立付款和事实保存，渠道编号独立于平台号，仅保存SUCCEEDED/FAILED，不因答复丢失更改结果；接入T019观测，正常路径不依赖测试模式。（依赖：T025；验收：T025通过，保存自身实际处理值，不创建后台任务或处理中交易状态。）
+- [x] T031 [P] [US1] 实现 `internal/payment/result.go` 的依据校验和处理决定，保留原文：“`evidence` 只允许 `platform_reference_id`、`mock_transaction_id`、`amount`、`currency`、`result`、`differences`。”；“`differences` 只列出不匹配的字段名，不是任意嵌套报文。”；使用 `ACCEPT_CONFIRMATION`、`KEEP_UNKNOWN`、`KEEP_CONFIRMED`、`REJECT_EVIDENCE`，前后状态按数据模型，不补造未取得字段或以空对象接受新确认。（依赖：T023,T024；验收：关联、交易号、金额、币种及确认结果匹配才接受，非法类型/长度/格式只留受控分类，金额不经浮点。）
+- [x] T032 [US1] 实现 `internal/postgres/results.go` 的完整结果保存原子动作：固定观测/记录号后按接入方与稳定订单号锁行，不以UNKNOWN过滤锁定；依据锁下当前状态条件更新并追加最小记录，确认提交才返回新结论，普通已确认读取不进入该写流程。（依赖：T024,T031；验收：T024原子保存成立，记录前后状态不用Mock调用前旧快照，不暴露pgx事务给业务。）
+- [x] T033 [US1] 实现 `internal/payment/submit.go` 的提交编排，依次验证输入、登记、确认本次资格、事务外调用Mock及保存固定观测；只有可靠保存才返回新确认，已有订单不再次付款，错误不触发后台支付或换号重试。（依赖：T029,T030,T031,T032；验收：T023正常/拒绝路径通过，结果未知与处理故障分开表达。）
+- [x] T034 [P] [US1] 实现 `internal/postgres/lookup.go` 的按平台UUID和业务单号两种当前接入方单笔定位，已确认普通读取无写锁、无新增核实记录；读取错误不被解释为无记录。（依赖：T024,T027；验收：不能跨身份读单，查询不创建记录或恢复资格。）
+- [x] T035 [US1] 实现 `internal/mock/query.go` 从自身交易表查询原交易的正常路径，平台关联号稳定，不读取平台结果、改写渠道事实或产生付款效果。（依赖：T025,T030；验收：能核实既有成功/失败，可靠无匹配与查询故障有不同表达。）
+- [x] T036 [US1] 实现 `internal/payment/query.go` 的共同查询流程：已有确认直接可靠返回，未知必须调用Mock核实，匹配则经T032保存确认与依据，仍无法确认则保留未知并保存应有核实记录，无平台订单直接返回无记录。（依赖：T031,T032,T034,T035；验收：两个GET语义一致，未知查询绝不创建新付款，US3再扩展受控故障和并发保护。）
+- [x] T037 [US1] 实现 `internal/httpapi/request.go`，按合同先鉴权后媒体/大小和结构检查，再业务值校验；受限读取完成前无业务效果，GET与POST字段来源不混用，不自动裁剪/转型或通过浮点解析金额。（依赖：T011,T026；验收：T026输入及T040真实连接用例已通过；金额冲突细分由US2补齐，不放宽非法表示。）
+- [x] T038 [US1] 实现 `internal/httpapi/response.go` 的request_id、payment、error、issues和HTTP映射，七个订单字段与时间按合同，201只用于确认本次新建并附Location；错误说明白名单脱敏，三入口所有应用响应JSON/no-store。（依赖：T027,T031；验收：T027通过，不把候选订单号、未保存答复或错误码旁路表达为新付款事实。）
+- [x] T039 [US1] 在 `internal/httpapi/payments.go`、`internal/httpapi/router.go`、`internal/app/app.go` 连接POST `/api/v1/payments`、GET `/api/v1/payments/{payment_id}`、GET `/api/v1/payments?business_order_no=...`；三业务入口鉴权，readyz独立，不注册列表、控制或管理别名。（依赖：T022,T033,T036,T037,T038；验收：实际路由可达同一支付业务，HTTP层不直接调用Mock或写订单表。）
+- [x] T040 [US1] 接线并执行 `tests/us1_test.go`、`tests/us1_http_boundary_test.go`、`tests/us1_restart_test.go` 的真实HTTP/PG/子进程验收，检查输入拒绝不新增订单或付款、两种查询同单及确认结果跨重启保留。（依赖：T026,T027,T028,T039；验收：US1-A1–A5各有主证据，连接级字节限制不能由内存路由测试替代，记录实际命令及失败摘录。）
+- [x] T041 [US1] 在 `artifacts/<run_id>/us1.json` 保存本故事焦点检查、响应、白名单PG状态、独立调用与效果证据、进程代次及未执行项；按真实结果更新 `specs/001-mock-payment/quickstart.md` 的US1操作，不提前宣布完整MVP或镜像通过。（依赖：T040；验收：编译、业务与数据库/HTTP检查的实际命令和退出码可复查，缺证据不勾选本故事完成。）
 
 **Checkpoint**: US1可用自己的夹具验收成功/失败、输入保护与重启查询；不是完整首期交付，US2和US3仍为P1必需。
 
