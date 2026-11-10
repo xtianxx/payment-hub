@@ -206,8 +206,10 @@ func classifyRegistrationError(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		// A unique collision other than the targeted business-key conflict is
-		// not reuse. The primary-key and mock-association keys fall here.
-		return payment.ErrConflict
+		// a definite non-business registration rejection. The primary-key and
+		// mock-association keys fall here. It must not be recovered as intent
+		// reuse or grant payment eligibility.
+		return payment.ErrRegistrationRejected
 	}
 	return payment.ErrUnavailable
 }

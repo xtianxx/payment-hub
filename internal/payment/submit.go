@@ -86,8 +86,11 @@ func (s *Submitter) Submit(ctx context.Context, requestID RequestID, input Regis
 	if ctx.Err() != nil {
 		return SubmitResult{}, ctx.Err()
 	}
-	if err := validateSubmitInput(requestID, input); err != nil {
+	if err := validateSubmitRequestInput(requestID, input); err != nil {
 		return SubmitResult{}, err
+	}
+	if err := validateSubmitBusinessInput(input); err != nil {
+		return s.resolveInvalidBusinessValue(ctx, input)
 	}
 
 	workCtx, cancelWork := s.newWorkContext(ctx)
@@ -95,6 +98,9 @@ func (s *Submitter) Submit(ctx context.Context, requestID RequestID, input Regis
 
 	registered, registerErr := s.registrar.RegisterOrder(workCtx, input)
 	if registerErr != nil {
+		if errors.Is(registerErr, ErrRegistrationRejected) {
+			return SubmitResult{}, ErrRegistrationRejected
+		}
 		return s.recoverRegistration(input, registerErr)
 	}
 	if err := validateRegisterResult(registered, input); err != nil {
@@ -176,25 +182,6 @@ func (s *Submitter) Submit(ctx context.Context, requestID RequestID, input Regis
 	)
 }
 
-func validateSubmitInput(requestID RequestID, input RegisterOrderInput) error {
-	if ValidateClientID(input.ClientID) != nil {
-		return ErrInvalidInput
-	}
-	if ValidateBusinessOrderNo(input.BusinessOrderNo) != nil {
-		return ErrInvalidInput
-	}
-	if ValidateAmount(input.Amount) != nil {
-		return ErrInvalidInput
-	}
-	if ValidateCurrency(input.Currency) != nil {
-		return ErrInvalidInput
-	}
-	if ValidateUUIDv4(string(requestID)) != nil {
-		return ErrInvalidInput
-	}
-	return nil
-}
-
 func validateRegisterResult(result RegisterOrderResult, input RegisterOrderInput) error {
 	if result.Outcome != RegisterOutcomeCreated && result.Outcome != RegisterOutcomeReused {
 		return ErrUnavailable
@@ -224,6 +211,12 @@ func validateRegisterResult(result RegisterOrderResult, input RegisterOrderInput
 }
 
 func (s *Submitter) recoverRegistration(input RegisterOrderInput, registerErr error) (SubmitResult, error) {
+	// A definite non-business registration failure is not an unknown commit
+	// and must not be read back into intent reuse or payment eligibility.
+	if errors.Is(registerErr, ErrRegistrationRejected) {
+		return SubmitResult{}, ErrRegistrationRejected
+	}
+
 	finish := newFinishScope(s.lifecycle)
 	defer finish.cancel()
 
