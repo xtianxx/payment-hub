@@ -51,6 +51,13 @@ const (
 	ActionReplyHidden Action = "reply_hidden"
 )
 
+type Directive string
+
+const (
+	DirectiveSucceeded Directive = "SUCCEEDED"
+	DirectiveFailed    Directive = "FAILED"
+)
+
 type FaultCode string
 
 const (
@@ -82,20 +89,23 @@ type Receipt struct {
 }
 
 type Frame struct {
-	Version         int       `json:"v"`
-	Type            Type      `json:"type"`
-	RunID           string    `json:"run_id,omitempty"`
-	Epoch           string    `json:"observer_epoch,omitempty"`
-	Generation      uint64    `json:"generation,omitempty"`
-	Seq             uint64    `json:"seq,omitempty"`
-	EventID         string    `json:"event_id,omitempty"`
-	Kind            Kind      `json:"kind,omitempty"`
-	Point           Point     `json:"point,omitempty"`
-	OrderID         string    `json:"order_id,omitempty"`
-	ExpectedLastSeq *uint64   `json:"expected_last_seq,omitempty"`
-	For             Type      `json:"for,omitempty"`
-	Action          Action    `json:"action,omitempty"`
-	Code            FaultCode `json:"code,omitempty"`
+	Version         int        `json:"v"`
+	Type            Type       `json:"type"`
+	RunID           string     `json:"run_id,omitempty"`
+	Epoch           string     `json:"observer_epoch,omitempty"`
+	Generation      uint64     `json:"generation,omitempty"`
+	Seq             uint64     `json:"seq,omitempty"`
+	EventID         string     `json:"event_id,omitempty"`
+	Kind            Kind       `json:"kind,omitempty"`
+	Point           Point      `json:"point,omitempty"`
+	OrderID         string     `json:"order_id,omitempty"`
+	ExpectedLastSeq *uint64    `json:"expected_last_seq,omitempty"`
+	For             Type       `json:"for,omitempty"`
+	Action          Action     `json:"action,omitempty"`
+	Code            FaultCode  `json:"code,omitempty"`
+	Directive       *Directive `json:"directive,omitempty"`
+	PaymentCallSeq  *uint64    `json:"payment_call_seq,omitempty"`
+	AppliedResult   *Directive `json:"applied_result,omitempty"`
 }
 
 var errFrame = errors.New("invalid frame")
@@ -224,7 +234,7 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 			return Frame{}, errFrame
 		}
 	case TypeReach:
-		if err := requireExactKeys(fields, append(append([]string{}, identityKeys...), "seq", "point", "order_id")...); err != nil {
+		if err := requireExactOrOptionalKeys(fields, append(append([]string{}, identityKeys...), "seq", "point", "order_id"), "payment_call_seq", "applied_result"); err != nil {
 			return Frame{}, errFrame
 		}
 	case TypeSeal:
@@ -242,7 +252,7 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 				return Frame{}, errFrame
 			}
 		case TypeCall:
-			if err := requireExactKeys(fields, append(append([]string{}, identityKeys...), "seq", "for")...); err != nil {
+			if err := requireExactOrOptionalKeys(fields, append(append([]string{}, identityKeys...), "seq", "for"), "directive"); err != nil {
 				return Frame{}, errFrame
 			}
 		case TypeReach:
@@ -319,6 +329,23 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 		frame.Seq = seq
 		frame.Point = Point(pointValue)
 		frame.OrderID = orderID
+		rawCallSeq, hasCallSeq := fields["payment_call_seq"]
+		rawApplied, hasApplied := fields["applied_result"]
+		if hasCallSeq != hasApplied {
+			return Frame{}, errFrame
+		}
+		if hasCallSeq {
+			callSeq, err := decodeUintRaw(rawCallSeq)
+			if err != nil {
+				return Frame{}, errFrame
+			}
+			applied, err := decodeDirectiveRaw(rawApplied)
+			if err != nil {
+				return Frame{}, errFrame
+			}
+			frame.PaymentCallSeq = &callSeq
+			frame.AppliedResult = &applied
+		}
 	case TypeSeal:
 		expected, err := decodeUintField(fields, "expected_last_seq")
 		if err != nil {
@@ -336,6 +363,13 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 				return Frame{}, errFrame
 			}
 			frame.Seq = seq
+			if raw, ok := fields["directive"]; ok {
+				directive, err := decodeDirectiveRaw(raw)
+				if err != nil {
+					return Frame{}, errFrame
+				}
+				frame.Directive = &directive
+			}
 		case TypeReach:
 			seq, err := decodeUintField(fields, "seq")
 			if err != nil {
@@ -373,7 +407,8 @@ func validateFrame(frame Frame) error {
 		if frame.RunID != "" || frame.Epoch != "" || frame.Generation != 0 ||
 			frame.Seq != 0 || frame.EventID != "" || frame.Kind != "" ||
 			frame.Point != "" || frame.OrderID != "" || frame.ExpectedLastSeq != nil ||
-			frame.For != "" || frame.Action != "" {
+			frame.For != "" || frame.Action != "" || frame.Directive != nil ||
+			frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
 			return errFrame
 		}
 		return nil
@@ -398,7 +433,8 @@ func validateFrame(frame Frame) error {
 			return errFrame
 		}
 		if frame.Seq != 0 || frame.Kind != "" || frame.Point != "" || frame.OrderID != "" ||
-			frame.ExpectedLastSeq != nil || frame.For != "" || frame.Action != "" || frame.Code != "" {
+			frame.ExpectedLastSeq != nil || frame.For != "" || frame.Action != "" || frame.Code != "" ||
+			frame.Directive != nil || frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
 			return errFrame
 		}
 	case TypeCall:
@@ -407,7 +443,8 @@ func validateFrame(frame Frame) error {
 			return errFrame
 		}
 		if frame.Point != "" || frame.ExpectedLastSeq != nil || frame.For != "" ||
-			frame.Action != "" || frame.Code != "" {
+			frame.Action != "" || frame.Code != "" || frame.Directive != nil ||
+			frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
 			return errFrame
 		}
 	case TypeReach:
@@ -416,8 +453,18 @@ func validateFrame(frame Frame) error {
 			return errFrame
 		}
 		if frame.Kind != "" || frame.ExpectedLastSeq != nil || frame.For != "" ||
-			frame.Action != "" || frame.Code != "" {
+			frame.Action != "" || frame.Code != "" || frame.Directive != nil {
 			return errFrame
+		}
+		if (frame.PaymentCallSeq == nil) != (frame.AppliedResult == nil) {
+			return errFrame
+		}
+		if frame.PaymentCallSeq != nil {
+			if frame.Point != PointMockCommitted || *frame.PaymentCallSeq < 1 ||
+				*frame.PaymentCallSeq >= frame.Seq || frame.Seq > MaxRecords ||
+				!validDirective(*frame.AppliedResult) {
+				return errFrame
+			}
 		}
 	case TypeSeal:
 		if frame.ExpectedLastSeq == nil || *frame.ExpectedLastSeq > MaxRecords ||
@@ -425,7 +472,8 @@ func validateFrame(frame Frame) error {
 			return errFrame
 		}
 		if frame.Seq != 0 || frame.Kind != "" || frame.Point != "" || frame.OrderID != "" ||
-			frame.For != "" || frame.Action != "" || frame.Code != "" {
+			frame.For != "" || frame.Action != "" || frame.Code != "" ||
+			frame.Directive != nil || frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
 			return errFrame
 		}
 	case TypeAck:
@@ -438,7 +486,8 @@ func validateFrame(frame Frame) error {
 				return errFrame
 			}
 			if frame.Seq != 0 || frame.Action != "" || frame.ExpectedLastSeq != nil ||
-				frame.Kind != "" || frame.Point != "" || frame.OrderID != "" || frame.Code != "" {
+				frame.Kind != "" || frame.Point != "" || frame.OrderID != "" || frame.Code != "" ||
+				frame.Directive != nil || frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
 				return errFrame
 			}
 		case TypeCall:
@@ -446,7 +495,11 @@ func validateFrame(frame Frame) error {
 				return errFrame
 			}
 			if frame.Action != "" || frame.ExpectedLastSeq != nil || frame.Kind != "" ||
-				frame.Point != "" || frame.OrderID != "" || frame.Code != "" {
+				frame.Point != "" || frame.OrderID != "" || frame.Code != "" ||
+				frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
+				return errFrame
+			}
+			if frame.Directive != nil && !validDirective(*frame.Directive) {
 				return errFrame
 			}
 		case TypeReach:
@@ -455,7 +508,8 @@ func validateFrame(frame Frame) error {
 				return errFrame
 			}
 			if frame.ExpectedLastSeq != nil || frame.Kind != "" || frame.Point != "" ||
-				frame.OrderID != "" || frame.Code != "" {
+				frame.OrderID != "" || frame.Code != "" || frame.Directive != nil ||
+				frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
 				return errFrame
 			}
 		case TypeSeal:
@@ -464,7 +518,8 @@ func validateFrame(frame Frame) error {
 				return errFrame
 			}
 			if frame.Seq != 0 || frame.Action != "" || frame.Kind != "" || frame.Point != "" ||
-				frame.OrderID != "" || frame.Code != "" {
+				frame.OrderID != "" || frame.Code != "" || frame.Directive != nil ||
+				frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
 				return errFrame
 			}
 		}
@@ -477,6 +532,27 @@ func requireExactKeys(fields map[string]json.RawMessage, keys ...string) error {
 		return errFrame
 	}
 	for _, key := range keys {
+		if _, ok := fields[key]; !ok {
+			return errFrame
+		}
+	}
+	return nil
+}
+
+func requireExactOrOptionalKeys(fields map[string]json.RawMessage, required []string, optional ...string) error {
+	allowed := make(map[string]struct{}, len(required)+len(optional))
+	for _, key := range required {
+		allowed[key] = struct{}{}
+	}
+	for _, key := range optional {
+		allowed[key] = struct{}{}
+	}
+	for key := range fields {
+		if _, ok := allowed[key]; !ok {
+			return errFrame
+		}
+	}
+	for _, key := range required {
 		if _, ok := fields[key]; !ok {
 			return errFrame
 		}
@@ -497,6 +573,21 @@ func decodeStringField(fields map[string]json.RawMessage, key string) (string, e
 		return "", errFrame
 	}
 	return *value, nil
+}
+
+func decodeDirectiveRaw(raw json.RawMessage) (Directive, error) {
+	var value *string
+	if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+		return "", errFrame
+	}
+	if !utf8.ValidString(*value) {
+		return "", errFrame
+	}
+	directive := Directive(*value)
+	if !validDirective(directive) {
+		return "", errFrame
+	}
+	return directive, nil
 }
 
 func decodeUintField(fields map[string]json.RawMessage, key string) (uint64, error) {
@@ -564,6 +655,10 @@ func validPoint(value Point) bool {
 
 func validAction(value Action) bool {
 	return value == ActionContinue || value == ActionReplyHidden
+}
+
+func validDirective(value Directive) bool {
+	return value == DirectiveSucceeded || value == DirectiveFailed
 }
 
 func validFaultCode(value FaultCode) bool {
