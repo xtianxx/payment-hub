@@ -23,6 +23,24 @@ type Control interface {
 	Committed(context.Context, payment.PaymentOrderID) error
 }
 
+// PaymentEntryOutcome is one per-Pay result directive plus the callback for the
+// fact actually committed by this call. A nil Result means no directive and the
+// legacy result generator remains authoritative. OnCommitted must be non-nil
+// for a successful PaymentEntryResult call; it receives the actual stored
+// result, never the directive value.
+type PaymentEntryOutcome struct {
+	Result      *payment.Result
+	OnCommitted func(context.Context, payment.Result) error
+}
+
+// PaymentResultControl is the optional trusted-test-mode extension for a
+// per-Pay result directive. A Control that implements it is observed only
+// through PaymentEntryResult, not through the legacy PaymentEntry/Committed
+// pair.
+type PaymentResultControl interface {
+	PaymentEntryResult(context.Context, payment.PaymentOrderID) (PaymentEntryOutcome, error)
+}
+
 // Hooks forwards mock observation points to an optional Control. The zero value
 // and nil Control are safe no-ops.
 type Hooks struct {
@@ -46,6 +64,68 @@ func (h *Hooks) PaymentEntry(ctx context.Context, order payment.PaymentOrderID) 
 	if err := h.control.PaymentEntry(ctx, order); err != nil {
 		return ErrControlFault
 	}
+	return nil
+}
+
+// PaymentEntryResult performs the precommit payment-entry observation and
+// returns the per-Pay directive/callback pair. A nil/zero Hooks returns a nil
+// Result with a safe non-nil no-op callback. An optional PaymentResultControl
+// is used exclusively; otherwise the legacy PaymentEntry is called exactly once
+// and the returned callback wraps the legacy Committed observation.
+func (h *Hooks) PaymentEntryResult(ctx context.Context, order payment.PaymentOrderID) (PaymentEntryOutcome, error) {
+	if h == nil || isNilControl(h.control) {
+		return PaymentEntryOutcome{OnCommitted: noopCommitted}, nil
+	}
+
+	if optional, ok := h.control.(PaymentResultControl); ok {
+		outcome, err := optional.PaymentEntryResult(ctx, order)
+		if err != nil {
+			return PaymentEntryOutcome{}, ErrControlFault
+		}
+		return normalizePaymentEntryOutcome(outcome)
+	}
+
+	if err := h.control.PaymentEntry(ctx, order); err != nil {
+		return PaymentEntryOutcome{}, ErrControlFault
+	}
+	return PaymentEntryOutcome{
+		OnCommitted: func(ctx context.Context, _ payment.Result) error {
+			return h.Committed(ctx, order)
+		},
+	}, nil
+}
+
+func normalizePaymentEntryOutcome(outcome PaymentEntryOutcome) (PaymentEntryOutcome, error) {
+	if outcome.OnCommitted == nil {
+		return PaymentEntryOutcome{}, ErrControlFault
+	}
+
+	if outcome.Result != nil {
+		result := *outcome.Result
+		if !validMockResult(result) {
+			return PaymentEntryOutcome{}, ErrControlFault
+		}
+		outcome.Result = &result
+	}
+
+	callback := outcome.OnCommitted
+	outcome.OnCommitted = func(ctx context.Context, result payment.Result) error {
+		return normalizeCommittedCallbackError(callback(ctx, result))
+	}
+	return outcome, nil
+}
+
+func normalizeCommittedCallbackError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrReplyHidden) {
+		return ErrReplyHidden
+	}
+	return ErrControlFault
+}
+
+func noopCommitted(context.Context, payment.Result) error {
 	return nil
 }
 
