@@ -90,6 +90,7 @@ EXPECTED_UPLOADS = {
         "${{ runner.temp }}/payment-hub-db/reports/upload/db-foundation.safe.json",
         "${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json",
         "${{ runner.temp }}/payment-hub-db/reports/upload/us1.safe.json",
+        "${{ runner.temp }}/payment-hub-db/reports/upload/us2.safe.json",
         "${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json",
     ],
     "vulnerability-check": [
@@ -99,16 +100,22 @@ EXPECTED_UPLOADS = {
 }
 EXPECTED_EXPORTS = {
     "setup-check": "--expect default",
-    "database-foundation": "--expect db,cancellation,us1",
+    "database-foundation": "--expect db,cancellation,us1,us2",
     "vulnerability-check": "--expect vulnerability",
 }
 FORBIDDEN_WORKFLOW_TOKENS = (
     "26 个",
     "38 个",
     "39 个",
+    "42 个",
+    "40 个",
     "十一个",
+    "十八个",
     "TestSubmitPayment",
     "TestUS1Payment",
+    "TestPaymentIdempotency",
+    "TestUS2Replay",
+    "TestOrderRegistrationConcurrencyIntegration",
     "TestApplicationLifecycleIntegration",
     "TestPaymentRequestBoundary/POST_rejection_priority",
 )

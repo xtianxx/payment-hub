@@ -56,6 +56,13 @@ ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST = "TestOrderLookupIntegration"
 TEST_US1_PAYMENT = "TestUS1Payment"
 TEST_US1_RESTART = "TestUS1Restart"
 TEST_US1_HTTP_BOUNDARY = "TestUS1HTTPBoundary"
+US2_ORDER_CONCURRENCY = "TestOrderRegistrationConcurrencyIntegration"
+US2_MOCK_IDEMPOTENCY = "TestMockIdempotencyIntegration"
+TEST_US2_REPLAY = "TestUS2Replay"
+TEST_US2_CONFLICT = "TestUS2Conflict"
+TEST_US2_CONCURRENCY = "TestUS2Concurrency"
+TEST_US2_RESTART = "TestUS2Restart"
+TEST_US2_REPORT_SAFETY = "TestUS2ReportSafety"
 HARNESS_PACKAGE = "payment-hub/tests/harness"
 TESTS_PACKAGE = "payment-hub/tests"
 POSTGRES_PACKAGE = "payment-hub/internal/postgres"
@@ -73,6 +80,13 @@ REQUIRED_TEST_PACKAGE = {
     TEST_US1_PAYMENT: TESTS_PACKAGE,
     TEST_US1_RESTART: TESTS_PACKAGE,
     TEST_US1_HTTP_BOUNDARY: TESTS_PACKAGE,
+    US2_ORDER_CONCURRENCY: POSTGRES_PACKAGE,
+    US2_MOCK_IDEMPOTENCY: MOCK_PACKAGE,
+    TEST_US2_REPLAY: TESTS_PACKAGE,
+    TEST_US2_CONFLICT: TESTS_PACKAGE,
+    TEST_US2_CONCURRENCY: TESTS_PACKAGE,
+    TEST_US2_RESTART: TESTS_PACKAGE,
+    TEST_US2_REPORT_SAFETY: TESTS_PACKAGE,
 }
 
 
@@ -186,8 +200,24 @@ def us1_required_pass_output():
     )
 
 
+def us2_required_pass_output():
+    return (
+        required_pass_output(US2_ORDER_CONCURRENCY)
+        + required_pass_output(US2_MOCK_IDEMPOTENCY)
+        + required_pass_output(TEST_US2_REPLAY)
+        + required_pass_output(TEST_US2_CONFLICT)
+        + required_pass_output(TEST_US2_CONCURRENCY)
+        + required_pass_output(TEST_US2_RESTART)
+        + required_pass_output(TEST_US2_REPORT_SAFETY)
+    )
+
+
 def all_required_pass_output():
-    return pr3_required_pass_output() + us1_required_pass_output()
+    return (
+        pr3_required_pass_output()
+        + us1_required_pass_output()
+        + us2_required_pass_output()
+    )
 
 
 def roots_only_required_pass_output():
@@ -202,6 +232,13 @@ def roots_only_required_pass_output():
         + required_root_pass_output(TEST_US1_PAYMENT)
         + required_root_pass_output(TEST_US1_RESTART)
         + required_root_pass_output(TEST_US1_HTTP_BOUNDARY)
+        + required_root_pass_output(US2_ORDER_CONCURRENCY)
+        + required_root_pass_output(US2_MOCK_IDEMPOTENCY)
+        + required_root_pass_output(TEST_US2_REPLAY)
+        + required_root_pass_output(TEST_US2_CONFLICT)
+        + required_root_pass_output(TEST_US2_CONCURRENCY)
+        + required_root_pass_output(TEST_US2_RESTART)
+        + required_root_pass_output(TEST_US2_REPORT_SAFETY)
     )
 
 
@@ -786,6 +823,149 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 )
                 self.assertIn(name, CI_MOD.DB_REQUIRED_TEST_KEYS)
 
+    def test_us2_required_bindings_use_storage_mock_and_tests_roots(self):
+        self.assertEqual(
+            MOD.REQUIRED_TEST_PACKAGES.get(US2_ORDER_CONCURRENCY),
+            POSTGRES_PACKAGE,
+        )
+        self.assertEqual(
+            MOD.REQUIRED_TEST_PACKAGES.get(US2_MOCK_IDEMPOTENCY),
+            MOCK_PACKAGE,
+        )
+        for name in (
+            TEST_US2_REPLAY,
+            TEST_US2_CONFLICT,
+            TEST_US2_CONCURRENCY,
+            TEST_US2_RESTART,
+            TEST_US2_REPORT_SAFETY,
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    MOD.REQUIRED_TEST_PACKAGES.get(name), TESTS_PACKAGE
+                )
+                self.assertNotEqual(
+                    MOD.REQUIRED_TEST_PACKAGES.get(name), HARNESS_PACKAGE
+                )
+        for name in (
+            US2_ORDER_CONCURRENCY,
+            US2_MOCK_IDEMPOTENCY,
+            TEST_US2_REPLAY,
+            TEST_US2_CONFLICT,
+            TEST_US2_CONCURRENCY,
+            TEST_US2_RESTART,
+            TEST_US2_REPORT_SAFETY,
+        ):
+            with self.subTest(name=name):
+                self.assertNotEqual(
+                    MOD.REQUIRED_TEST_PACKAGES.get(name), HARNESS_PACKAGE
+                )
+                self.assertIn(name, CI_MOD.DB_REQUIRED_TEST_KEYS)
+
+    def test_us2_parser_requires_new_storage_mock_and_tests_roots(self):
+        required, problems = self.launcher._parse_required_test_results(
+            PACKAGE_OK_OUTPUT + us1_required_pass_output()
+        )
+        for name in (
+            US2_ORDER_CONCURRENCY,
+            US2_MOCK_IDEMPOTENCY,
+            TEST_US2_REPLAY,
+            TEST_US2_CONFLICT,
+            TEST_US2_CONCURRENCY,
+            TEST_US2_RESTART,
+            TEST_US2_REPORT_SAFETY,
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(required.get(name), "missing")
+        self.assertIn("required-test-missing", problems)
+
+    def test_us2_parser_accepts_all_eighteen_required_roots(self):
+        _, problems = self.launcher._parse_test_output(
+            PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 0
+        )
+        self.assertEqual(problems, [])
+
+    def test_us2_parser_requires_each_new_root_individually(self):
+        stdout = PACKAGE_OK_OUTPUT + all_required_pass_output()
+        for name in (
+            US2_ORDER_CONCURRENCY,
+            US2_MOCK_IDEMPOTENCY,
+            TEST_US2_REPLAY,
+            TEST_US2_CONFLICT,
+            TEST_US2_CONCURRENCY,
+            TEST_US2_RESTART,
+            TEST_US2_REPORT_SAFETY,
+        ):
+            with self.subTest(name=name):
+                required, problems = self.launcher._parse_required_test_results(
+                    without_test_events(stdout, name)
+                )
+                self.assertEqual(required.get(name), "missing")
+                self.assertIn("required-test-missing", problems)
+
+    def test_us2_parser_rejects_skip_fail_wrong_package_and_duplicate(self):
+        for target, package in (
+            (US2_ORDER_CONCURRENCY, POSTGRES_PACKAGE),
+            (US2_MOCK_IDEMPOTENCY, MOCK_PACKAGE),
+            (TEST_US2_REPLAY, TESTS_PACKAGE),
+            (TEST_US2_CONFLICT, TESTS_PACKAGE),
+            (TEST_US2_CONCURRENCY, TESTS_PACKAGE),
+            (TEST_US2_RESTART, TESTS_PACKAGE),
+            (TEST_US2_REPORT_SAFETY, TESTS_PACKAGE),
+        ):
+            for action in ("skip", "fail"):
+                with self.subTest(target=target, action=action):
+                    required, problems = (
+                        self.launcher._parse_required_test_results(
+                            replace_test_terminal(
+                                PACKAGE_OK_OUTPUT
+                                + all_required_pass_output(),
+                                package,
+                                target,
+                                action,
+                            )
+                        )
+                    )
+                    self.assertEqual(required.get(target), action)
+                    self.assertIn(
+                        "required-test-" + action, problems
+                    )
+            with self.subTest(target=target, action="duplicate"):
+                stdout = PACKAGE_OK_OUTPUT + all_required_pass_output()
+                stdout += json_event("run", package, target)
+                stdout += json_event("pass", package, target, elapsed=0.01)
+                required, _ = self.launcher._parse_required_test_results(
+                    stdout
+                )
+                self.assertEqual(required.get(target), "duplicate")
+            with self.subTest(target=target, action="wrong-package"):
+                stdout = without_test_events(
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(), target
+                )
+                stdout += json_event("run", HARNESS_PACKAGE, target)
+                stdout += json_event(
+                    "pass", HARNESS_PACKAGE, target, elapsed=0.01
+                )
+                required, problems = (
+                    self.launcher._parse_required_test_results(stdout)
+                )
+                self.assertEqual(required.get(target), "wrong-package")
+                self.assertIn("required-test-wrong-package", problems)
+            with self.subTest(target=target, action="output-spoof"):
+                stdout = without_test_events(
+                    PACKAGE_OK_OUTPUT + all_required_pass_output(), target
+                )
+                stdout += json_event(
+                    "output",
+                    package,
+                    test=target,
+                    output="--- PASS: " + target + " (0.00s)\n",
+                )
+                required, problems = (
+                    self.launcher._parse_required_test_results(stdout)
+                )
+                self.assertEqual(required.get(target), "missing")
+                self.assertIn("required-test-missing", problems)
+
     def test_us1_parser_requires_new_storage_and_mock_roots(self):
         required, problems = self.launcher._parse_required_test_results(
             PACKAGE_OK_OUTPUT + pr3_required_pass_output()
@@ -804,6 +984,29 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.assertIn("required-test-missing", problems)
 
     def test_us1_parser_accepts_all_eleven_required_roots(self):
+        # Historical US1 11-entry subset remains independently green in the
+        # larger 18-entry launcher mapping.
+        required, problems = self.launcher._parse_required_test_results(
+            PACKAGE_OK_OUTPUT + all_required_pass_output()
+        )
+        self.assertEqual(problems, [])
+        for name in (
+            REQUIRED_INTEGRATION_TEST,
+            T020_REQUIRED_INTEGRATION_TEST,
+            T022_REQUIRED_INTEGRATION_TEST,
+            REQUIRED_SUBTEST,
+            T023_REQUIRED_INTEGRATION_TEST,
+            T024_REQUIRED_INTEGRATION_TEST,
+            T025_REQUIRED_INTEGRATION_TEST,
+            ORDER_LOOKUP_REQUIRED_INTEGRATION_TEST,
+            TEST_US1_PAYMENT,
+            TEST_US1_RESTART,
+            TEST_US1_HTTP_BOUNDARY,
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(required.get(name), "pass")
+
+    def test_parser_accepts_all_eighteen_required_roots(self):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 0
         )
@@ -1940,9 +2143,10 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
                     "${{ runner.temp }}/payment-hub-db/reports/upload/db-foundation.safe.json",
                     "${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json",
                     "${{ runner.temp }}/payment-hub-db/reports/upload/us1.safe.json",
+                    "${{ runner.temp }}/payment-hub-db/reports/upload/us2.safe.json",
                     "${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json",
                 ],
-                "--expect db,cancellation,us1",
+                "--expect db,cancellation,us1,us2",
             ),
             "vulnerability-check": (
                 "Upload safe vulnerability reports",

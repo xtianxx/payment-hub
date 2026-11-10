@@ -9,10 +9,11 @@ cover the trusted private UDS observer and helper lifecycle, the current real
 application binary's readyz/SIGTERM, bad-config, missing-migration,
 startup-timeout, startup-cancel, and startup-listen diagnostics, and the
 first-batch storage/mock core (order registration, observation atomic save,
-and mock transaction) paths, the next-batch order-lookup path, and the US1
-real payment HTTP/byte-boundary/restart integration lane. It is not the T072
-full check and does not claim payment HTTP beyond US1, business
-restart/idempotency beyond US1, application image, full MVP, T077, or CD.
+and mock transaction) paths, the next-batch order-lookup path, the US1
+real payment HTTP/byte-boundary/restart integration lane, and the US2
+same-intent replay/conflict/concurrency/restart idempotency lane. It is not
+the T072 full check and does not claim payment HTTP beyond US1/US2,
+application image, full MVP, T077, or CD.
 
 Only Python's standard library is used. No tool is installed automatically.
 The script never prints raw Docker/build/Goose/Go output; all tool output is
@@ -134,6 +135,27 @@ REQUIRED_TEST_PACKAGES[
 ] = f"{EXPECTED_MODULE}/tests"
 REQUIRED_TEST_PACKAGES[
     "TestUS1HTTPBoundary"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestOrderRegistrationConcurrencyIntegration"
+] = f"{EXPECTED_MODULE}/internal/postgres"
+REQUIRED_TEST_PACKAGES[
+    "TestMockIdempotencyIntegration"
+] = f"{EXPECTED_MODULE}/internal/mock"
+REQUIRED_TEST_PACKAGES[
+    "TestUS2Replay"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS2Conflict"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS2Concurrency"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS2Restart"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS2ReportSafety"
 ] = f"{EXPECTED_MODULE}/tests"
 EXPECTED_PACKAGE_PATHS = tuple(
     f"{EXPECTED_MODULE}/{name}" for name in PACKAGES
@@ -321,9 +343,10 @@ class Launcher:
             "child isolation, post-leader-exit cleanup deadlines, bounded startup "
             "diagnostic logs, safe release after failed Seal, immutable final "
             "snapshot archiving, helper self-tests, first-batch storage/mock "
-            "core paths, order lookup, and US1 real payment HTTP/byte-boundary/"
-            "restart integration; owned cleanup only; not payment HTTP beyond "
-            "US1, business restart/idempotency beyond US1, application image, "
+            "core paths, order lookup, US1 real payment HTTP/byte-boundary/"
+            "restart integration, and US2 same-intent replay/conflict/"
+            "concurrency/restart idempotency integration; owned cleanup only; "
+            "not payment HTTP beyond US1/US2, application image, "
             "full MVP, T072, T077, or CD"
         )
         self.started_at = utc_now()
@@ -3061,9 +3084,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "explicit empty-Env child isolation, post-leader-exit cleanup deadlines, "
             "bounded startup diagnostic logs, safe release after failed Seal, "
             "immutable final snapshot archiving, helper self-tests, first-batch "
-            "storage/mock core paths, order lookup, and US1 real payment HTTP/"
-            "byte-boundary/restart integration. Not payment HTTP beyond US1, "
-            "business restart/idempotency beyond US1, application image, the T072 "
+            "storage/mock core paths, order lookup, US1 real payment HTTP/"
+            "byte-boundary/restart integration, and US2 same-intent replay/"
+            "conflict/concurrency/restart idempotency integration. Not payment "
+            "HTTP beyond US1/US2, application image, the T072 "
             "full check, T077, or CD."
         )
     )

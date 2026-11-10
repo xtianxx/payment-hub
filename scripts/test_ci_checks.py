@@ -96,9 +96,22 @@ EXPECTED_US1_DEFAULT_REQUIRED = {
     "TestPaymentRuntimeWiring": APP,
     "TestPaymentRouterWiring": HTTPAPI,
 }
+
+US2_FOCUS_SUBTEST = (
+    "TestPaymentRequestBoundary/POST_business_value_delegation"
+)
+# US2 default additions frozen by the parent in this order. The existing
+# TestPaymentRequestBoundary root remains bound above; only the new delegated
+# business-value subtest is appended here.
+EXPECTED_US2_DEFAULT_REQUIRED = {
+    "TestPaymentIdempotency": PAYMENT,
+    "TestPaymentSubmitConflictPriority": PAYMENT,
+    US2_FOCUS_SUBTEST: HTTPAPI,
+}
 EXPECTED_DEFAULT_REQUIRED_TOTAL = {
     **EXPECTED_DEFAULT_REQUIRED,
     **EXPECTED_US1_DEFAULT_REQUIRED,
+    **EXPECTED_US2_DEFAULT_REQUIRED,
 }
 
 PAYMENT_DIRECTIVE_DEFAULT_ROOTS = (
@@ -123,6 +136,13 @@ EXPECTED_DB_REQUIRED = {
     "TestUS1Payment": TESTS,
     "TestUS1Restart": TESTS,
     "TestUS1HTTPBoundary": TESTS,
+    "TestOrderRegistrationConcurrencyIntegration": POSTGRES,
+    "TestMockIdempotencyIntegration": MOCK,
+    "TestUS2Replay": TESTS,
+    "TestUS2Conflict": TESTS,
+    "TestUS2Concurrency": TESTS,
+    "TestUS2Restart": TESTS,
+    "TestUS2ReportSafety": TESTS,
 }
 EXPECTED_PR3_DB_REQUIRED = {
     name: package
@@ -133,6 +153,24 @@ EXPECTED_PR3_DB_REQUIRED = {
         "TestHarnessProcessPreservesParentStateIntegration",
         "TestApplicationLifecycleIntegration",
         "TestApplicationLifecycleIntegration/startup_diagnostics",
+    }
+}
+EXPECTED_LEGACY_DB_REQUIRED = {
+    name: package
+    for name, package in EXPECTED_DB_REQUIRED.items()
+    if name
+    in {
+        "TestCommitHookIntegrationHidesReplyAfterRealCommit",
+        "TestHarnessProcessPreservesParentStateIntegration",
+        "TestApplicationLifecycleIntegration",
+        "TestApplicationLifecycleIntegration/startup_diagnostics",
+        "TestOrderRegistrationIntegration",
+        "TestObservationAtomicSaveIntegration",
+        "TestMockTransactionIntegration",
+        "TestOrderLookupIntegration",
+        "TestUS1Payment",
+        "TestUS1Restart",
+        "TestUS1HTTPBoundary",
     }
 }
 
@@ -1019,24 +1057,74 @@ class DefaultInventoryTests(unittest.TestCase):
             EXPECTED_US1_DEFAULT_REQUIRED,
         )
         self.assertEqual(
+            {
+                name: MOD.DEFAULT_REQUIRED_TESTS.get(name)
+                for name in EXPECTED_US2_DEFAULT_REQUIRED
+            },
+            EXPECTED_US2_DEFAULT_REQUIRED,
+        )
+        self.assertEqual(
             MOD.DEFAULT_REQUIRED_TESTS, EXPECTED_DEFAULT_REQUIRED_TOTAL
         )
-        self.assertEqual(len(MOD.DEFAULT_REQUIRED_TESTS), 39)
-        roots = [
-            name
+        self.assertEqual(
+            len(MOD.DEFAULT_REQUIRED_TESTS),
+            len(EXPECTED_DEFAULT_REQUIRED_TOTAL),
+        )
+        self.assertEqual(len(EXPECTED_DEFAULT_REQUIRED_TOTAL), 42)
+        roots = {
+            name.split("/", 1)[0]
             for name in MOD.DEFAULT_REQUIRED_TESTS
-            if "/" not in name
-        ]
-        self.assertEqual(len(roots), 38)
+        }
+        expected_roots = {
+            name.split("/", 1)[0]
+            for name in EXPECTED_DEFAULT_REQUIRED_TOTAL
+        }
+        self.assertEqual(roots, expected_roots)
+        self.assertEqual(len(roots), 40)
         subtests = [
             name
             for name in MOD.DEFAULT_REQUIRED_TESTS
             if "/" in name
         ]
-        self.assertEqual(subtests, [FOCUS_SUBTEST])
+        self.assertEqual(subtests, [FOCUS_SUBTEST, US2_FOCUS_SUBTEST])
         self.assertEqual(
             MOD.DEFAULT_REQUIRED_TESTS.get(FOCUS_SUBTEST), HTTPAPI
         )
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get(US2_FOCUS_SUBTEST), HTTPAPI
+        )
+
+    def test_us2_default_roots_bind_to_payment_and_http_core(self):
+        self.assertEqual(
+            tuple(EXPECTED_US2_DEFAULT_REQUIRED),
+            (
+                "TestPaymentIdempotency",
+                "TestPaymentSubmitConflictPriority",
+                US2_FOCUS_SUBTEST,
+            ),
+        )
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get("TestPaymentIdempotency"),
+            PAYMENT,
+        )
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get("TestPaymentSubmitConflictPriority"),
+            PAYMENT,
+        )
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get(US2_FOCUS_SUBTEST), HTTPAPI
+        )
+        # The existing root remains bound; only the delegated subtest is new.
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get("TestPaymentRequestBoundary"),
+            HTTPAPI,
+        )
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get(FOCUS_SUBTEST), HTTPAPI
+        )
+        for name in EXPECTED_US2_DEFAULT_REQUIRED:
+            with self.subTest(name=name):
+                self.assertNotIn(name, MOD.DB_REQUIRED_TEST_KEYS)
 
     def test_default_required_covers_d1_d2_and_helper(self):
         for name in (
@@ -1103,7 +1191,7 @@ class DefaultInventoryTests(unittest.TestCase):
                 self.assertIn(name, MOD.DB_REQUIRED_TEST_KEYS)
                 self.assertNotIn(name, MOD.DEFAULT_REQUIRED_TESTS)
 
-    def test_db_required_keys_are_the_eleven_explicit_bindings(self):
+    def test_db_required_keys_are_the_eighteen_explicit_bindings(self):
         self.assertEqual(
             MOD.DB_REQUIRED_TEST_KEYS,
             (
@@ -1118,17 +1206,42 @@ class DefaultInventoryTests(unittest.TestCase):
                 "TestUS1Payment",
                 "TestUS1Restart",
                 "TestUS1HTTPBoundary",
+                "TestOrderRegistrationConcurrencyIntegration",
+                "TestMockIdempotencyIntegration",
+                "TestUS2Replay",
+                "TestUS2Conflict",
+                "TestUS2Concurrency",
+                "TestUS2Restart",
+                "TestUS2ReportSafety",
             ),
         )
         self.assertEqual(
             tuple(MOD.DB_REQUIRED_TEST_KEYS), tuple(EXPECTED_DB_REQUIRED)
         )
 
+    def test_db_required_keys_are_the_eleven_explicit_bindings(self):
+        # Historical 11-entry subset remains the exact prefix of the frozen
+        # 18-entry order; this keeps the pre-US2 regression name and coverage.
+        self.assertEqual(
+            tuple(MOD.DB_REQUIRED_TEST_KEYS)[: len(EXPECTED_LEGACY_DB_REQUIRED)],
+            tuple(EXPECTED_LEGACY_DB_REQUIRED),
+        )
+        for name in EXPECTED_LEGACY_DB_REQUIRED:
+            with self.subTest(name=name):
+                self.assertIn(name, MOD.DB_REQUIRED_TEST_KEYS)
+
     def test_us1_safe_report_kind_is_registered(self):
         self.assertIn("us1", MOD.EXPECT_NAMES)
         self.assertEqual(MOD.REPORT_FILENAMES.get("us1"), "us1.json")
         self.assertEqual(
             MOD.SAFE_FILENAMES.get("us1"), "us1.safe.json"
+        )
+
+    def test_us2_safe_report_kind_is_registered(self):
+        self.assertIn("us2", MOD.EXPECT_NAMES)
+        self.assertEqual(MOD.REPORT_FILENAMES.get("us2"), "us2.json")
+        self.assertEqual(
+            MOD.SAFE_FILENAMES.get("us2"), "us2.safe.json"
         )
 
     def test_shared_batch_timeout_constant_is_570(self):
@@ -1171,14 +1284,28 @@ class DefaultInventoryTests(unittest.TestCase):
             "TestUS1Payment",
             "TestUS1Restart",
             "TestUS1HTTPBoundary",
+            "TestUS2Replay",
+            "TestUS2Conflict",
+            "TestUS2Concurrency",
+            "TestUS2Restart",
+            "TestUS2ReportSafety",
         ):
             with self.subTest(name=name):
                 self.assertEqual(EXPECTED_DB_REQUIRED[name], TESTS)
                 self.assertNotEqual(EXPECTED_DB_REQUIRED[name], HARNESS)
+        self.assertEqual(
+            EXPECTED_DB_REQUIRED[
+                "TestOrderRegistrationConcurrencyIntegration"
+            ],
+            POSTGRES,
+        )
+        self.assertEqual(
+            EXPECTED_DB_REQUIRED["TestMockIdempotencyIntegration"], MOCK
+        )
 
 
 class DbRequiredParserTests(unittest.TestCase):
-    """Parser-level DB launcher inventory for the eleven explicit bindings."""
+    """Parser-level DB launcher inventory for the eighteen explicit bindings."""
 
     def parse(self, stdout, required=None):
         mapping = {
@@ -1199,7 +1326,7 @@ class DbRequiredParserTests(unittest.TestCase):
             (POSTGRES, MOCK, HARNESS, TESTS), EXPECTED_DB_REQUIRED
         )
 
-    def test_full_eleven_binding_stream_is_green(self):
+    def test_full_eighteen_binding_stream_is_green(self):
         result = self.parse(self.full_stream())
         self.assertEqual(result["problems"], [])
         self.assertEqual(
@@ -1213,6 +1340,26 @@ class DbRequiredParserTests(unittest.TestCase):
             )
         )
 
+    def test_full_eleven_binding_stream_is_green(self):
+        # Historical US1 11-entry mapping remains independently green.
+        stream = default_stream(
+            (POSTGRES, MOCK, HARNESS, TESTS),
+            EXPECTED_LEGACY_DB_REQUIRED,
+        )
+        result = MOD.parse_go_test_json(
+            stream,
+            "",
+            0,
+            (POSTGRES, MOCK, HARNESS, TESTS),
+            EXPECTED_LEGACY_DB_REQUIRED,
+            allowed_no_test_files=(),
+        )
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(
+            set(result["required_test_results"]),
+            set(EXPECTED_LEGACY_DB_REQUIRED),
+        )
+
     def test_each_new_db_root_is_required(self):
         for target in (
             "TestOrderRegistrationIntegration",
@@ -1222,6 +1369,13 @@ class DbRequiredParserTests(unittest.TestCase):
             "TestUS1Payment",
             "TestUS1Restart",
             "TestUS1HTTPBoundary",
+            "TestOrderRegistrationConcurrencyIntegration",
+            "TestMockIdempotencyIntegration",
+            "TestUS2Replay",
+            "TestUS2Conflict",
+            "TestUS2Concurrency",
+            "TestUS2Restart",
+            "TestUS2ReportSafety",
         ):
             with self.subTest(target=target):
                 result = self.parse(
@@ -1307,6 +1461,220 @@ class DbRequiredParserTests(unittest.TestCase):
             result["required_test_results"].get(target), "missing"
         )
         self.assertIn("required-test-missing", result["problems"])
+
+    def test_us2_db_bindings_are_exact(self):
+        for name, package in (
+            ("TestOrderRegistrationConcurrencyIntegration", POSTGRES),
+            ("TestMockIdempotencyIntegration", MOCK),
+            ("TestUS2Replay", TESTS),
+            ("TestUS2Conflict", TESTS),
+            ("TestUS2Concurrency", TESTS),
+            ("TestUS2Restart", TESTS),
+            ("TestUS2ReportSafety", TESTS),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(EXPECTED_DB_REQUIRED[name], package)
+                self.assertIn(name, MOD.DB_REQUIRED_TEST_KEYS)
+                self.assertEqual(
+                    MOD.DB_REQUIRED_TEST_KEYS[
+                        MOD.DB_REQUIRED_TEST_KEYS.index(name)
+                    ],
+                    name,
+                )
+                self.assertNotEqual(package, HARNESS)
+
+    def test_us2_db_roots_skip_and_fail_are_not_green(self):
+        for target in (
+            "TestOrderRegistrationConcurrencyIntegration",
+            "TestMockIdempotencyIntegration",
+            "TestUS2Replay",
+            "TestUS2Conflict",
+            "TestUS2Concurrency",
+            "TestUS2Restart",
+            "TestUS2ReportSafety",
+        ):
+            package = EXPECTED_DB_REQUIRED[target]
+            for action in ("skip", "fail"):
+                with self.subTest(target=target, action=action):
+                    result = self.parse(
+                        replace_test_terminal(
+                            self.full_stream(), package, target, action
+                        )
+                    )
+                    self.assertEqual(
+                        result["required_test_results"].get(target), action
+                    )
+                    self.assertIn(
+                        "required-test-" + action, result["problems"]
+                    )
+
+    def test_us2_db_roots_wrong_package_are_not_green(self):
+        for target, wrong_package in (
+            ("TestOrderRegistrationConcurrencyIntegration", MOCK),
+            ("TestMockIdempotencyIntegration", POSTGRES),
+            ("TestUS2Replay", HARNESS),
+            ("TestUS2Conflict", HARNESS),
+            ("TestUS2Concurrency", HARNESS),
+            ("TestUS2Restart", HARNESS),
+            ("TestUS2ReportSafety", HARNESS),
+        ):
+            with self.subTest(target=target):
+                stdout = without_test_events(self.full_stream(), target)
+                stdout += event("run", wrong_package, target)
+                stdout += event("pass", wrong_package, target, elapsed=0.01)
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target),
+                    "wrong-package",
+                )
+                self.assertIn(
+                    "required-test-wrong-package", result["problems"]
+                )
+
+    def test_us2_db_roots_duplicate_is_not_green(self):
+        for target in (
+            "TestOrderRegistrationConcurrencyIntegration",
+            "TestMockIdempotencyIntegration",
+            "TestUS2Replay",
+            "TestUS2Conflict",
+            "TestUS2Concurrency",
+            "TestUS2Restart",
+            "TestUS2ReportSafety",
+        ):
+            package = EXPECTED_DB_REQUIRED[target]
+            with self.subTest(target=target):
+                stdout = self.full_stream()
+                stdout += event("run", package, target)
+                stdout += event("pass", package, target, elapsed=0.01)
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target), "duplicate"
+                )
+
+    def test_us2_db_roots_output_spoof_is_not_a_pass(self):
+        for target in (
+            "TestOrderRegistrationConcurrencyIntegration",
+            "TestMockIdempotencyIntegration",
+            "TestUS2Replay",
+            "TestUS2Conflict",
+            "TestUS2Concurrency",
+            "TestUS2Restart",
+            "TestUS2ReportSafety",
+        ):
+            package = EXPECTED_DB_REQUIRED[target]
+            with self.subTest(target=target):
+                stdout = without_test_events(self.full_stream(), target)
+                stdout += event(
+                    "output",
+                    package,
+                    test=target,
+                    output="--- PASS: " + target + " (0.00s)\n",
+                )
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target), "missing"
+                )
+                self.assertIn("required-test-missing", result["problems"])
+
+
+class Us2DefaultRequiredParserTests(unittest.TestCase):
+    """Parser-level default inventory for the three frozen US2 additions."""
+
+    PACKAGES = (APP, HARNESS, CMD, PAYMENT, HTTPAPI, MOCK, TESTCONTROL)
+
+    def parse(self, stdout):
+        return MOD.parse_go_test_json(
+            stdout,
+            "",
+            0,
+            self.PACKAGES,
+            MOD.DEFAULT_REQUIRED_TESTS,
+            allowed_no_test_files=(CMD,),
+        )
+
+    def full_stream(self):
+        return default_stream(self.PACKAGES, MOD.DEFAULT_REQUIRED_TESTS)
+
+    def test_full_forty_two_binding_stream_is_green(self):
+        result = self.parse(self.full_stream())
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(
+            set(result["required_test_results"]),
+            set(EXPECTED_DEFAULT_REQUIRED_TOTAL),
+        )
+
+    def test_us2_default_roots_missing_skip_fail_are_not_green(self):
+        for target in EXPECTED_US2_DEFAULT_REQUIRED:
+            package = EXPECTED_US2_DEFAULT_REQUIRED[target]
+            with self.subTest(target=target, mutation="missing"):
+                result = self.parse(
+                    without_test_events(self.full_stream(), target)
+                )
+                self.assertEqual(
+                    result["required_test_results"].get(target), "missing"
+                )
+                self.assertIn("required-test-missing", result["problems"])
+            for action in ("skip", "fail"):
+                with self.subTest(target=target, mutation=action):
+                    result = self.parse(
+                        replace_test_terminal(
+                            self.full_stream(), package, target, action
+                        )
+                    )
+                    self.assertEqual(
+                        result["required_test_results"].get(target), action
+                    )
+                    self.assertIn(
+                        "required-test-" + action, result["problems"]
+                    )
+
+    def test_us2_default_roots_wrong_package_are_not_green(self):
+        for target, wrong_package in (
+            ("TestPaymentIdempotency", HTTPAPI),
+            ("TestPaymentSubmitConflictPriority", HTTPAPI),
+            (US2_FOCUS_SUBTEST, APP),
+        ):
+            with self.subTest(target=target):
+                stdout = without_test_events(self.full_stream(), target)
+                stdout += event("run", wrong_package, target)
+                stdout += event("pass", wrong_package, target, elapsed=0.01)
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target),
+                    "wrong-package",
+                )
+                self.assertIn(
+                    "required-test-wrong-package", result["problems"]
+                )
+
+    def test_us2_default_roots_duplicate_are_not_green(self):
+        for target in EXPECTED_US2_DEFAULT_REQUIRED:
+            package = EXPECTED_US2_DEFAULT_REQUIRED[target]
+            with self.subTest(target=target):
+                stdout = self.full_stream()
+                stdout += event("run", package, target)
+                stdout += event("pass", package, target, elapsed=0.01)
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target), "duplicate"
+                )
+
+    def test_us2_default_roots_output_spoof_is_not_a_pass(self):
+        for target in EXPECTED_US2_DEFAULT_REQUIRED:
+            package = EXPECTED_US2_DEFAULT_REQUIRED[target]
+            with self.subTest(target=target):
+                stdout = without_test_events(self.full_stream(), target)
+                stdout += event(
+                    "output",
+                    package,
+                    test=target,
+                    output="--- PASS: " + target + " (0.00s)\n",
+                )
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target), "missing"
+                )
+                self.assertIn("required-test-missing", result["problems"])
 
 
 class RunDefaultTests(unittest.TestCase):
@@ -2640,7 +3008,10 @@ class ExportReportsTests(unittest.TestCase):
         )
         self.assertEqual(safe["status"], "exported")
         self.assertEqual(safe["result"], "pass")
-        self.assertEqual(len(safe["required_test_results"]), 39)
+        self.assertEqual(
+            len(safe["required_test_results"]),
+            len(EXPECTED_DEFAULT_REQUIRED_TOTAL),
+        )
         self.assertEqual(
             safe["required_test_results"].get(FOCUS_SUBTEST), "pass"
         )
@@ -3091,6 +3462,8 @@ class ExportReportsTests(unittest.TestCase):
         self.assertNotEqual(safe.get("result"), "pass")
 
     def test_export_db_old_fail_report_backfills_eleven_non_green(self):
+        # Historical 11-entry report remains non-green and backfills the old
+        # subset; the full 18-key assertion lives in the next test.
         value = self.db_report(result="fail")
         value["tests"]["required_test_results"] = {
             name: "pass" for name in EXPECTED_PR3_DB_REQUIRED
@@ -3105,7 +3478,33 @@ class ExportReportsTests(unittest.TestCase):
         )
         self.assertEqual(safe["status"], "exported")
         self.assertEqual(safe["result"], "fail")
-        self.assertEqual(len(safe["required_test_results"]), 11)
+        for name in EXPECTED_LEGACY_DB_REQUIRED:
+            if name in EXPECTED_PR3_DB_REQUIRED:
+                continue
+            with self.subTest(name=name):
+                self.assertEqual(
+                    safe["required_test_results"].get(name), "missing"
+                )
+
+    def test_export_db_old_fail_report_backfills_eighteen_non_green(self):
+        value = self.db_report(result="fail")
+        value["tests"]["required_test_results"] = {
+            name: "pass" for name in EXPECTED_PR3_DB_REQUIRED
+        }
+        self.write_db(value)
+        code, _ = self.export(["db"])
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "db-foundation.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe["result"], "fail")
+        self.assertEqual(
+            len(safe["required_test_results"]),
+            len(EXPECTED_DB_REQUIRED),
+        )
         for name in (
             "TestOrderRegistrationIntegration",
             "TestObservationAtomicSaveIntegration",
@@ -3114,6 +3513,13 @@ class ExportReportsTests(unittest.TestCase):
             "TestUS1Payment",
             "TestUS1Restart",
             "TestUS1HTTPBoundary",
+            "TestOrderRegistrationConcurrencyIntegration",
+            "TestMockIdempotencyIntegration",
+            "TestUS2Replay",
+            "TestUS2Conflict",
+            "TestUS2Concurrency",
+            "TestUS2Restart",
+            "TestUS2ReportSafety",
         ):
             with self.subTest(name=name):
                 self.assertEqual(
@@ -3121,10 +3527,18 @@ class ExportReportsTests(unittest.TestCase):
                 )
 
     def test_export_db_required_results_cover_eleven_bindings(self):
+        # Historical 11-entry subset remains present in the 18-entry report.
+        required = self.db_report()["tests"]["required_test_results"]
+        for name in EXPECTED_LEGACY_DB_REQUIRED:
+            with self.subTest(name=name):
+                self.assertIn(name, required)
+
+    def test_export_db_required_results_cover_eighteen_bindings(self):
         self.assertEqual(
             set(self.db_report()["tests"]["required_test_results"]),
             set(EXPECTED_DB_REQUIRED),
         )
+        self.assertEqual(len(EXPECTED_DB_REQUIRED), 18)
 
     def test_export_db_digest_mismatch_fails_without_raw_fields(self):
         value = self.db_report()
@@ -3792,6 +4206,987 @@ class ExportReportsTests(unittest.TestCase):
         value = self.us1_report()
         value["scenarios"][0]["directive"]["binding"]["generation"] = 2
         self.assert_us1_non_green(value)
+
+    US2_ORDER_ID = "11111111-1111-4111-8111-111111111111"
+    US2_OTHER_ID = "44444444-4444-4444-8444-444444444444"
+    US2_EPOCH = "fedcba9876543210fedcba9876543210"
+    US2_BEGIN_ID = "0123456789abcdef0123456789abcdef"
+    US2_EVENT_ID = US2_BEGIN_ID + ":1"
+    US2_SCENARIOS = (
+        "replay_success",
+        "replay_failed",
+        "replay_unknown",
+        "conflict_priority",
+        "concurrency",
+        "restart_success",
+        "restart_failed",
+        "key_rotation",
+    )
+
+    def us2_request_id(self, index):
+        return "33333333-3333-4333-8333-" + format(index, "012x")
+
+    def us2_counts(self, payment, query, order, mock, trace):
+        return {
+            "payment_calls": payment,
+            "query_calls": query,
+            "order_rows": order,
+            "mock_rows": mock,
+            "trace_rows": trace,
+        }
+
+    def us2_checks(
+        self,
+        before,
+        after,
+        *,
+        stable_facts=True,
+        readonly_probes=0,
+        lookup_fault="none",
+        waiter_count=0,
+        mixed_waiter_count=0,
+    ):
+        return {
+            "counts_before": dict(before),
+            "counts_after": dict(after),
+            "stable_facts": stable_facts,
+            "readonly_probes": readonly_probes,
+            "lookup_fault": lookup_fault,
+            "waiter_count": waiter_count,
+            "mixed_waiter_count": mixed_waiter_count,
+        }
+
+    def us2_http(self, status, request_id, payment_id, result):
+        return {
+            "status": status,
+            "request_id": request_id,
+            "payment_id": payment_id,
+            "result": result,
+        }
+
+    def us2_directive(self, order_id=None):
+        return {
+            "result": "SUCCEEDED",
+            "binding": {
+                "run_id": self.run_id,
+                "epoch": self.US2_EPOCH,
+                "generation": 1,
+                "call_seq": 1,
+                "event_id": self.US2_EVENT_ID,
+                "order_id": order_id or self.US2_ORDER_ID,
+            },
+        }
+
+    def us2_commands(self):
+        # Producer facts.commands records build + process_stop. HTTP probes are
+        # represented by the http array and test assertions, not necessarily a
+        # separate command record; http_probe remains allowed but optional.
+        return [
+            {"kind": "build", "exit": 0, "not_run": False},
+            {"kind": "process_stop", "exit": 0, "not_run": False},
+        ]
+
+    def us2_scenario(self, name):
+        if name == "replay_unknown":
+            counts = self.us2_counts(0, 0, 1, 0, 0)
+            checks = self.us2_checks(counts, counts)
+            generations = [1]
+            http = [
+                self.us2_http(200, self.us2_request_id(1), self.US2_ORDER_ID, "UNKNOWN"),
+                self.us2_http(200, self.us2_request_id(2), self.US2_ORDER_ID, "UNKNOWN"),
+            ]
+            directive = None
+            commands = self.us2_commands()
+        elif name == "concurrency":
+            before = self.us2_counts(0, 0, 0, 0, 0)
+            after = self.us2_counts(1, 0, 1, 1, 1)
+            checks = self.us2_checks(
+                before, after, waiter_count=2, mixed_waiter_count=2
+            )
+            generations = [1]
+            http = [
+                self.us2_http(201, self.us2_request_id(1), self.US2_ORDER_ID, "SUCCEEDED"),
+                self.us2_http(200, self.us2_request_id(2), self.US2_ORDER_ID, "UNKNOWN"),
+                self.us2_http(200, self.us2_request_id(3), self.US2_ORDER_ID, "SUCCEEDED"),
+                self.us2_http(409, "", "", ""),
+                self.us2_http(200, self.us2_request_id(4), self.US2_ORDER_ID, "SUCCEEDED"),
+                self.us2_http(200, self.us2_request_id(5), self.US2_ORDER_ID, "SUCCEEDED"),
+            ]
+            directive = self.us2_directive()
+            commands = self.us2_commands()
+        elif name == "conflict_priority":
+            counts = self.us2_counts(1, 0, 1, 1, 1)
+            checks = self.us2_checks(
+                counts,
+                counts,
+                readonly_probes=5,
+                lookup_fault="timeout",
+            )
+            generations = [1]
+            http = [
+                self.us2_http(201, self.us2_request_id(1), self.US2_ORDER_ID, "SUCCEEDED"),
+                self.us2_http(409, "", "", ""),
+                self.us2_http(409, "", "", ""),
+                self.us2_http(400, "", "", ""),
+                self.us2_http(400, "", "", ""),
+                self.us2_http(400, "", "", ""),
+                self.us2_http(400, "", "", ""),
+                self.us2_http(401, "", "", ""),
+                self.us2_http(503, "", "", ""),
+            ]
+            directive = None
+            commands = self.us2_commands()
+        else:
+            counts = self.us2_counts(1, 0, 1, 1, 1)
+            checks = self.us2_checks(counts, counts)
+            if name in ("restart_success", "restart_failed"):
+                generations = [1, 2]
+            elif name == "key_rotation":
+                generations = [1, 2]
+            else:
+                generations = [1]
+            result = (
+                "FAILED" if name.endswith("_failed") else "SUCCEEDED"
+            )
+            http = [
+                self.us2_http(
+                    201, self.us2_request_id(1), self.US2_ORDER_ID, result
+                ),
+                self.us2_http(
+                    200, self.us2_request_id(2), self.US2_ORDER_ID, result
+                ),
+                self.us2_http(
+                    200, self.us2_request_id(3), self.US2_ORDER_ID, result
+                ),
+            ]
+            if name == "key_rotation":
+                http.append(self.us2_http(401, "", "", ""))
+            directive = (
+                self.us2_directive()
+                if name in ("key_rotation",)
+                else None
+            )
+            commands = self.us2_commands()
+        receipts = [
+            {
+                "run_id": self.run_id,
+                "epoch": self.US2_EPOCH,
+                "generation": generation,
+                "last_seq": 2,
+            }
+            for generation in generations
+        ]
+        observer = {
+            "trusted": True,
+            "counts": {
+                "payment": checks["counts_after"]["payment_calls"],
+                "query": checks["counts_after"]["query_calls"],
+            },
+            "receipts": receipts,
+        }
+        pg = [
+            {"state": "ORDER", "rows": checks["counts_after"]["order_rows"]},
+            {"state": "MOCK", "rows": checks["counts_after"]["mock_rows"]},
+            {"state": "TRACE", "rows": checks["counts_after"]["trace_rows"]},
+        ]
+        return {
+            "name": name,
+            "result": "PASS",
+            "generations": generations,
+            "http": http,
+            "pg": pg,
+            "observer": observer,
+            "directive": directive,
+            "commands": commands,
+            "checks": checks,
+        }
+
+    def us2_report(self):
+        return {
+            "schema": "payment-hub.us2.v1",
+            "run_id": self.run_id,
+            "scenarios": [
+                self.us2_scenario(name) for name in self.US2_SCENARIOS
+            ],
+        }
+
+    def write_us2(self, value, run_id=None):
+        run_id = value.get("run_id", self.run_id) if run_id is None else run_id
+        path = self.db_root / run_id / "us2.json"
+        self.write(path, value)
+        return path
+
+    def export_db_us2(self):
+        return self.export(["db", "us2"])
+
+    def read_us2_safe(self):
+        path = self.report_dir / "upload" / "us2.safe.json"
+        self.assertTrue(path.is_file(), "us2 safe report is missing")
+        return json.loads(path.read_text())
+
+    def test_export_us2_complete_pass_rebuilds_safe_report(self):
+        self.write_db(self.db_report())
+        self.write_us2(self.us2_report())
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 0)
+        safe = self.read_us2_safe()
+        self.assertEqual(safe["schema"], "payment-hub.ci-safe.us2.v1")
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe.get("result"), "pass")
+        self.assertEqual(len(safe["scenarios"]), 8)
+        self.assertEqual(safe["run_id"], self.run_id)
+        self.assertEqual(
+            [item["name"] for item in safe["scenarios"]],
+            list(self.US2_SCENARIOS),
+        )
+        for scenario in safe["scenarios"]:
+            self.assertIn("checks", scenario)
+            self.assertEqual(
+                set(scenario["checks"]),
+                {
+                    "counts_before",
+                    "counts_after",
+                    "stable_facts",
+                    "readonly_probes",
+                    "lookup_fault",
+                    "waiter_count",
+                    "mixed_waiter_count",
+                },
+            )
+        text = json.dumps(safe)
+        for forbidden in ("SECRET", "Authorization", "postgres://"):
+            self.assertNotIn(forbidden, text)
+        provenance = json.loads(
+            (self.report_dir / "upload" / "provenance.json").read_text()
+        )
+        record = next(
+            entry for entry in provenance["reports"] if entry["name"] == "us2"
+        )
+        self.assertEqual(record["source"], self.run_id + "/us2.json")
+        self.assertEqual(record["export"], "us2.safe.json")
+        self.assertRegex(record["source_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(record["export_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(record["source_manifest_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            record["source_manifest_verification"], "verified-unchanged"
+        )
+
+    def test_export_us2_missing_file_is_missing_nonzero(self):
+        self.write_db(self.db_report())
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        safe = self.read_us2_safe()
+        self.assertEqual(safe["status"], "missing")
+
+    def test_export_us2_wrong_schema_rejected(self):
+        value = self.us2_report()
+        value["schema"] = "payment-hub.us1.v1"
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us2_safe()["status"], "error")
+
+    def test_export_us2_missing_scenario_is_non_green(self):
+        value = self.us2_report()
+        value["scenarios"] = value["scenarios"][:-1]
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        safe = self.read_us2_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("key_rotation", safe["missing_scenarios"])
+
+    def test_export_us2_duplicate_scenario_rejected(self):
+        value = self.us2_report()
+        value["scenarios"].append(value["scenarios"][0])
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us2_safe()["status"], "error")
+
+    def test_export_us2_unknown_scenario_rejected(self):
+        value = self.us2_report()
+        value["scenarios"][0]["name"] = "bogus_scenario"
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us2_safe()["status"], "error")
+
+    def test_export_us2_scenario_result_unknown_is_rejected(self):
+        # UNKNOWN is an HTTP/payment result, never a scenario execution
+        # conclusion. This guards against treating replay_unknown as a green
+        # UNKNOWN scenario instead of PASS with HTTP result UNKNOWN.
+        value = self.us2_report()
+        value["scenarios"][2]["result"] = "UNKNOWN"
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        safe = self.read_us2_safe()
+        self.assertEqual(safe["status"], "error")
+        self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_us2_replay_unknown_pass_with_http_unknown(self):
+        self.write_db(self.db_report())
+        self.write_us2(self.us2_report())
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 0)
+        safe = self.read_us2_safe()
+        replay = safe["scenarios"][2]
+        self.assertEqual(replay["name"], "replay_unknown")
+        self.assertEqual(replay["result"], "PASS")
+        self.assertEqual([item["status"] for item in replay["http"]], [200, 200])
+        self.assertEqual(
+            [item["result"] for item in replay["http"]],
+            ["UNKNOWN", "UNKNOWN"],
+        )
+        self.assertIsNone(replay["directive"])
+
+    def test_export_us2_replay_result_mismatch_is_non_green(self):
+        for index, bad_result in ((0, "UNKNOWN"), (1, "SUCCEEDED"), (2, "SUCCEEDED")):
+            with self.subTest(index=index):
+                value = self.us2_report()
+                value["scenarios"][index]["http"][-1]["result"] = bad_result
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_replay_requires_two_200_and_all_results(self):
+        for index in (0, 1):
+            expected = (
+                "SUCCEEDED"
+                if self.us2_report()["scenarios"][index]["name"]
+                == "replay_success"
+                else "FAILED"
+            )
+            for mutation in (
+                "drop-second-200",
+                "change-nonfinal-result",
+                "unexpected-401",
+            ):
+                with self.subTest(index=index, mutation=mutation):
+                    value = self.us2_report()
+                    http = value["scenarios"][index]["http"]
+                    if mutation == "drop-second-200":
+                        for position, item in enumerate(http):
+                            if item["status"] == 200:
+                                http.pop(position)
+                                break
+                    elif mutation == "change-nonfinal-result":
+                        for item in http:
+                            if item["status"] == 200:
+                                item["result"] = (
+                                    "FAILED"
+                                    if expected == "SUCCEEDED"
+                                    else "SUCCEEDED"
+                                )
+                                break
+                    else:
+                        http.append(self.us2_http(401, "", "", ""))
+                    self.write_db(self.db_report())
+                    self.write_us2(value)
+                    code, _ = self.export_db_us2()
+                    self.assertEqual(code, 1)
+                    self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_restart_requires_setup_and_two_200(self):
+        for index in (5, 6):
+            expected = (
+                "SUCCEEDED"
+                if self.us2_report()["scenarios"][index]["name"]
+                == "restart_success"
+                else "FAILED"
+            )
+            for mutation in (
+                "drop-second-200",
+                "change-nonfinal-result",
+                "unexpected-409",
+            ):
+                with self.subTest(index=index, mutation=mutation):
+                    value = self.us2_report()
+                    http = value["scenarios"][index]["http"]
+                    if mutation == "drop-second-200":
+                        for position, item in enumerate(http):
+                            if item["status"] == 200:
+                                http.pop(position)
+                                break
+                    elif mutation == "change-nonfinal-result":
+                        for item in http:
+                            if item["status"] == 200:
+                                item["result"] = (
+                                    "FAILED"
+                                    if expected == "SUCCEEDED"
+                                    else "SUCCEEDED"
+                                )
+                                break
+                    else:
+                        http.append(self.us2_http(409, "", "", ""))
+                    self.write_db(self.db_report())
+                    self.write_us2(value)
+                    code, _ = self.export_db_us2()
+                    self.assertEqual(code, 1)
+                    self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_key_rotation_requires_201_two_200_401(self):
+        for mutation in (
+            "drop-second-200",
+            "change-nonfinal-result",
+            "missing-401",
+            "401-result",
+            "401-new-id",
+            "unexpected-409",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                http = value["scenarios"][7]["http"]
+                if mutation == "drop-second-200":
+                    for position, item in enumerate(http):
+                        if item["status"] == 200:
+                            http.pop(position)
+                            break
+                elif mutation == "change-nonfinal-result":
+                    next(
+                        item for item in http if item["status"] == 200
+                    )["result"] = "FAILED"
+                elif mutation == "missing-401":
+                    http.remove(
+                        next(item for item in http if item["status"] == 401)
+                    )
+                elif mutation == "401-result":
+                    next(
+                        item for item in http if item["status"] == 401
+                    )["result"] = "FAILED"
+                elif mutation == "401-new-id":
+                    next(
+                        item for item in http if item["status"] == 401
+                    )["payment_id"] = self.US2_OTHER_ID
+                else:
+                    http.append(self.us2_http(409, "", "", ""))
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_all_scenarios_must_pass(self):
+        value = self.us2_report()
+        value["scenarios"][0]["result"] = "FAIL"
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        safe = self.read_us2_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us2-scenario-not-pass", safe["problems"])
+
+    def test_export_us2_observer_required_and_trusted(self):
+        for mutation in ("missing", "untrusted", "empty-receipts"):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                scenario = value["scenarios"][0]
+                if mutation == "missing":
+                    scenario["observer"] = None
+                elif mutation == "untrusted":
+                    scenario["observer"]["trusted"] = False
+                else:
+                    scenario["observer"]["receipts"] = []
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_counts_must_match_observer_and_pg(self):
+        for mutation in ("after-payment", "observer-payment", "pg-order"):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                scenario = value["scenarios"][0]
+                if mutation == "after-payment":
+                    scenario["checks"]["counts_after"]["payment_calls"] = 2
+                elif mutation == "observer-payment":
+                    scenario["observer"]["counts"]["payment"] = 2
+                else:
+                    next(
+                        item
+                        for item in scenario["pg"]
+                        if item["state"] == "ORDER"
+                    )["rows"] = 2
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_checks_exact_fields_and_uint_types(self):
+        for mutation in (
+            "extra-field",
+            "bool-uint",
+            "negative-uint",
+            "bad-fault",
+            "missing-count-key",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                checks = value["scenarios"][0]["checks"]
+                if mutation == "extra-field":
+                    checks["raw_secret"] = "SECRET_CANARY"
+                elif mutation == "bool-uint":
+                    checks["waiter_count"] = True
+                elif mutation == "negative-uint":
+                    checks["readonly_probes"] = -1
+                elif mutation == "bad-fault":
+                    checks["lookup_fault"] = "error"
+                else:
+                    del checks["counts_after"]["trace_rows"]
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                text = json.dumps(self.read_us2_safe())
+                self.assertNotIn("SECRET_CANARY", text)
+                self.assertNotEqual(
+                    json.loads(
+                        (self.report_dir / "upload" / "us2.safe.json").read_text()
+                    ).get("result"),
+                    "pass",
+                )
+
+    def test_export_us2_mixed_waiter_count_required_and_scoped(self):
+        self.write_db(self.db_report())
+        self.write_us2(self.us2_report())
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 0)
+        safe = self.read_us2_safe()
+        self.assertEqual(safe.get("result"), "pass")
+        for scenario in safe["scenarios"]:
+            with self.subTest(name=scenario["name"]):
+                self.assertIn(
+                    "mixed_waiter_count", scenario["checks"]
+                )
+                expected = (
+                    2 if scenario["name"] == "concurrency" else 0
+                )
+                self.assertEqual(
+                    scenario["checks"]["mixed_waiter_count"], expected
+                )
+
+    def test_export_us2_missing_mixed_waiter_count_is_rejected(self):
+        value = self.us2_report()
+        for scenario in value["scenarios"]:
+            del scenario["checks"]["mixed_waiter_count"]
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us2_safe()["status"], "error")
+
+    def test_export_us2_mixed_waiter_count_type_rejections(self):
+        # Baseline with the valid field must be accepted first; the old
+        # validator rejects the required new field as an unknown extra.
+        self.write_db(self.db_report())
+        self.write_us2(self.us2_report())
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 0)
+        for mutation in ("bool", "negative", "string"):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                checks = value["scenarios"][0]["checks"]
+                if mutation == "bool":
+                    checks["mixed_waiter_count"] = True
+                elif mutation == "negative":
+                    checks["mixed_waiter_count"] = -1
+                else:
+                    checks["mixed_waiter_count"] = "2"
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe()["status"], "error")
+
+    def test_export_us2_mixed_waiter_count_scenario_mismatch(self):
+        for mutation in (
+            "concurrency-0",
+            "concurrency-1",
+            "concurrency-3",
+            "other-1",
+            "borrowed-waiter-2-mixed-0",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                if mutation == "concurrency-0":
+                    value["scenarios"][4]["checks"][
+                        "mixed_waiter_count"
+                    ] = 0
+                elif mutation == "concurrency-1":
+                    value["scenarios"][4]["checks"][
+                        "mixed_waiter_count"
+                    ] = 1
+                elif mutation == "concurrency-3":
+                    value["scenarios"][4]["checks"][
+                        "mixed_waiter_count"
+                    ] = 3
+                elif mutation == "other-1":
+                    value["scenarios"][0]["checks"][
+                        "mixed_waiter_count"
+                    ] = 1
+                else:
+                    value["scenarios"][4]["checks"][
+                        "waiter_count"
+                    ] = 2
+                    value["scenarios"][4]["checks"][
+                        "mixed_waiter_count"
+                    ] = 0
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                safe = self.read_us2_safe()
+                self.assertEqual(safe["status"], "exported")
+                self.assertEqual(safe.get("result"), "fail")
+
+    def test_export_us2_stable_facts_must_be_true(self):
+        value = self.us2_report()
+        value["scenarios"][0]["checks"]["stable_facts"] = False
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_concurrency_requires_two_waiters_and_statuses(self):
+        for mutation in (
+            "waiters",
+            "no-201",
+            "two-201",
+            "no-409",
+            "too-few-200",
+            "final-get-different-id",
+            "final-get-different-result",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                scenario = value["scenarios"][4]
+                http = scenario["http"]
+                if mutation == "waiters":
+                    scenario["checks"]["waiter_count"] = 1
+                elif mutation == "no-201":
+                    next(item for item in http if item["status"] == 201)[
+                        "status"
+                    ] = 200
+                elif mutation == "two-201":
+                    http[1]["status"] = 201
+                elif mutation == "no-409":
+                    next(item for item in http if item["status"] == 409)[
+                        "status"
+                    ] = 200
+                elif mutation == "too-few-200":
+                    scenario["http"] = [
+                        item for item in http if item["status"] != 200
+                    ][:1] + [
+                        item for item in http if item["status"] == 200
+                    ][:2]
+                elif mutation == "final-get-different-id":
+                    http[-1]["payment_id"] = self.US2_OTHER_ID
+                else:
+                    http[-1]["result"] = "UNKNOWN"
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_conflict_requires_setup201_and_status_matrix(self):
+        for mutation in (
+            "no-setup-201",
+            "two-201",
+            "missing-409",
+            "missing-400",
+            "missing-401",
+            "missing-503",
+            "normal-500",
+            "new-id-on-error",
+            "result-on-error",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                scenario = value["scenarios"][3]
+                http = scenario["http"]
+                if mutation == "no-setup-201":
+                    next(item for item in http if item["status"] == 201)[
+                        "status"
+                    ] = 200
+                elif mutation == "two-201":
+                    http.append(
+                        self.us2_http(
+                            201,
+                            self.us2_request_id(90),
+                            self.US2_OTHER_ID,
+                            "SUCCEEDED",
+                        )
+                    )
+                elif mutation == "missing-409":
+                    http.remove(next(item for item in http if item["status"] == 409))
+                elif mutation == "missing-400":
+                    http.remove(next(item for item in http if item["status"] == 400))
+                elif mutation == "missing-401":
+                    http.remove(next(item for item in http if item["status"] == 401))
+                elif mutation == "missing-503":
+                    http.remove(next(item for item in http if item["status"] == 503))
+                elif mutation == "normal-500":
+                    http.append(self.us2_http(500, "", "", ""))
+                elif mutation == "new-id-on-error":
+                    next(item for item in http if item["status"] == 409)[
+                        "payment_id"
+                    ] = self.US2_OTHER_ID
+                else:
+                    next(item for item in http if item["status"] == 400)[
+                        "result"
+                    ] = "FAILED"
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_controlled_500_is_not_accepted_in_binary_scenarios(self):
+        for index in (0, 3, 4):
+            with self.subTest(index=index):
+                value = self.us2_report()
+                value["scenarios"][index]["http"].append(
+                    self.us2_http(500, "", "", "")
+                )
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_readonly_and_fault_matrix(self):
+        for mutation in ("readonly", "fault", "other-readonly", "other-fault"):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                if mutation == "readonly":
+                    value["scenarios"][3]["checks"]["readonly_probes"] = 4
+                elif mutation == "fault":
+                    value["scenarios"][3]["checks"]["lookup_fault"] = "none"
+                elif mutation == "other-readonly":
+                    value["scenarios"][0]["checks"]["readonly_probes"] = 1
+                else:
+                    value["scenarios"][4]["checks"]["lookup_fault"] = "timeout"
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_receipts_bind_run_epoch_generation(self):
+        for mutation in (
+            "run-id",
+            "epoch",
+            "generation",
+            "missing-generation",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                scenario = value["scenarios"][5]
+                receipts = scenario["observer"]["receipts"]
+                if mutation == "run-id":
+                    receipts[0]["run_id"] = "b" * 32
+                elif mutation == "epoch":
+                    receipts[0]["epoch"] = "a" * 32
+                elif mutation == "generation":
+                    receipts[0]["generation"] = 2
+                else:
+                    receipts.pop()
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_generations_restart_and_key_rotation(self):
+        for mutation in (
+            "restart-missing-generation",
+            "restart-not-two",
+            "key-rotation-one-generation",
+            "duplicate-generation",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                if mutation == "restart-missing-generation":
+                    value["scenarios"][5]["generations"] = [1]
+                elif mutation == "restart-not-two":
+                    value["scenarios"][5]["generations"] = [1, 2, 3]
+                elif mutation == "key-rotation-one-generation":
+                    value["scenarios"][7]["generations"] = [1]
+                else:
+                    value["scenarios"][0]["generations"] = [1, 1]
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                safe = self.read_us2_safe()
+                if mutation in ("restart-not-two", "duplicate-generation"):
+                    self.assertEqual(safe["status"], "error")
+                else:
+                    self.assertEqual(safe.get("result"), "fail")
+
+    def test_export_us2_directive_binding_checks(self):
+        for mutation in (
+            "run-id",
+            "epoch",
+            "generation",
+            "last-seq",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                scenario = value["scenarios"][4]
+                binding = scenario["directive"]["binding"]
+                if mutation == "run-id":
+                    binding["run_id"] = "b" * 32
+                elif mutation == "epoch":
+                    binding["epoch"] = "a" * 32
+                elif mutation == "generation":
+                    binding["generation"] = 2
+                else:
+                    scenario["observer"]["receipts"][0]["last_seq"] = 1
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_commands_must_be_observed(self):
+        for mutation in (
+            "empty",
+            "not-run",
+            "nonzero",
+            "missing-build",
+            "missing-process-stop",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us2_report()
+                commands = value["scenarios"][0]["commands"]
+                if mutation == "empty":
+                    value["scenarios"][0]["commands"] = []
+                elif mutation == "not-run":
+                    commands[0]["not_run"] = True
+                    commands[0]["exit"] = None
+                elif mutation == "nonzero":
+                    commands[0]["exit"] = 1
+                elif mutation == "missing-build":
+                    value["scenarios"][0]["commands"] = [
+                        item
+                        for item in commands
+                        if item["kind"] != "build"
+                    ]
+                else:
+                    value["scenarios"][0]["commands"] = [
+                        item
+                        for item in commands
+                        if item["kind"] != "process_stop"
+                    ]
+                self.write_db(self.db_report())
+                self.write_us2(value)
+                code, _ = self.export_db_us2()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_optional_http_probe_command_is_allowed(self):
+        value = self.us2_report()
+        value["scenarios"][0]["commands"].append(
+            {"kind": "http_probe", "exit": 0, "not_run": False}
+        )
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_us2_safe().get("result"), "pass")
+
+    def test_export_us2_request_id_duplicate_non_green(self):
+        value = self.us2_report()
+        value["scenarios"][0]["http"][1]["request_id"] = value[
+            "scenarios"
+        ][0]["http"][0]["request_id"]
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us2_safe().get("result"), "fail")
+
+    def test_export_us2_run_id_mismatch_rejected(self):
+        value = self.us2_report()
+        value["run_id"] = "b" * 32
+        self.write_db(self.db_report())
+        self.write_us2(value, run_id=self.run_id)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us2_safe()["status"], "error")
+
+    def test_export_us2_db_not_green_non_green(self):
+        self.write_db(self.db_report(result="fail"))
+        self.write_us2(self.us2_report())
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        safe = self.read_us2_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe.get("result"), "fail")
+
+    def test_export_us2_db_missing_new_roots_error(self):
+        value = self.db_report()
+        value["tests"]["required_test_results"] = {
+            name: "pass"
+            for name in (
+                "TestCommitHookIntegrationHidesReplyAfterRealCommit",
+                "TestHarnessProcessPreservesParentStateIntegration",
+                "TestApplicationLifecycleIntegration",
+                "TestApplicationLifecycleIntegration/startup_diagnostics",
+                "TestOrderRegistrationIntegration",
+                "TestObservationAtomicSaveIntegration",
+                "TestMockTransactionIntegration",
+                "TestOrderLookupIntegration",
+                "TestUS1Payment",
+                "TestUS1Restart",
+                "TestUS1HTTPBoundary",
+            )
+        }
+        self.write_db(value)
+        self.write_us2(self.us2_report())
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        safe = self.read_us2_safe()
+        self.assertEqual(safe["status"], "error")
+
+    def test_export_us2_unsafe_extras_rejected(self):
+        value = self.us2_report()
+        value["authorization"] = "Bearer SECRET_CANARY"
+        value["scenarios"][0]["raw_log"] = "SECRET_CANARY"
+        self.write_db(self.db_report())
+        self.write_us2(value)
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 1)
+        text = json.dumps(self.read_us2_safe())
+        self.assertNotIn("SECRET_CANARY", text)
+        self.assertEqual(self.read_us2_safe()["status"], "error")
+
+    def test_export_us2_absent_directive_stays_none(self):
+        self.write_db(self.db_report())
+        self.write_us2(self.us2_report())
+        code, _ = self.export_db_us2()
+        self.assertEqual(code, 0)
+        safe = self.read_us2_safe()
+        replay = safe["scenarios"][0]
+        self.assertIsNone(replay["directive"])
+        conflict = safe["scenarios"][3]
+        self.assertIsNone(conflict["directive"])
 
     def vulnerability_report(self, result="vulnerable"):
         if result == "pass":

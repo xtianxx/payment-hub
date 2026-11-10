@@ -131,6 +131,7 @@ jobs:
             python3 -B scripts/check-ci-contract.py --summary default
             echo ""
             echo "其中 US1 默认根覆盖 core/查询/HTTP 合同与私有结果指令协议/客户端/observer/mock/app 消费封口及 app/router wiring unit，不代表真实失败 POST 或应用重启已完成。"
+            echo "US2 默认根覆盖相同支付意图重放、提交冲突优先级与 HTTP 业务值委派分层 unit，不代表真实并发、跨代重启或数据库防重已验收。"
             echo "setup job 的 20 分钟是整个 job 上限，由准备、检查与上传共用，不保证各步骤最大值叠加，也不是对 570 秒整批预算的替代或额外预留。"
             echo "这些是 unit/默认包结果，不代表支付 HTTP、业务重启防重、应用镜像、默认全时长实测或完整 MVP 已验收。"
             echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture、迁移工具镜像、必需 commit-hook 提交实验、工具 helper 两代父 Observer/真实 PG 保留、当前应用二进制 readyz/SIGTERM/坏配置/缺迁移启动失败与 startup 超时/取消/监听失败诊断，以及 US1 真实支付 HTTP/字节边界/成功与失败/两代重启，由 database-foundation job 在实际执行时逐项核对；US1 范围外的完整支付流程、扩展业务重启、应用镜像、完整 MVP/T072/T077/CD 不在本步骤，也不由该 job 验收。"
@@ -278,7 +279,7 @@ jobs:
             echo "## Database foundation checks / 数据库基础检查"
             echo ""
             echo "本摘要来自安全启动器的固定前缀输出；launcher-exit-code 为 0 才表示启动器自身成功，非零失败不会被摘要掩盖。"
-            echo "本 job 覆盖数据库约束、已接线的 runtime harness integration、首批存储/mock core integration、订单查询 integration 与 US1 真实 payment HTTP/字节边界/成功与失败/重启 integration；下列必需 integration 项（含显式子测试）及包绑定由 scripts/check-ci-contract.py --summary db 从 ci_checks.DB_REQUIRED_TEST_KEYS 与启动器绑定动态生成，由启动器实际执行时逐项核对；其中 US1 三项绑定 payment-hub/tests 包并配套安全 us1 报告导出。不包含应用镜像、完整 MVP、T072、T077、CD、发布或部署。"
+            echo "本 job 覆盖数据库约束、已接线的 runtime harness integration、首批存储/mock core integration、订单查询 integration、US1 真实 payment HTTP/字节边界/成功与失败/重启 integration，以及 US2 相同支付意图重放/冲突优先级/并发/真实重启防重 integration；下列必需 integration 项（含显式子测试）及包绑定由 scripts/check-ci-contract.py --summary db 从 ci_checks.DB_REQUIRED_TEST_KEYS 与启动器绑定动态生成，由启动器实际执行时逐项核对；其中 US1/US2 绑定 payment-hub/tests 包并配套安全 us1/us2 报告导出。不包含应用镜像、完整 MVP、T072、T077、CD、发布或部署。"
             echo ""
             python3 -B scripts/check-ci-contract.py --summary db
             echo ""
@@ -303,7 +304,7 @@ jobs:
             else
               echo "cancellation-report: missing (normal PG failed, step skipped, or report not written)"
             fi
-            echo "安全归档由 scripts/ci_checks.py export-reports 仅从白名单字段重建 db-foundation.safe.json、cancellation.safe.json、us1.safe.json 与 provenance.json，并上传这四个固定文件；不递归复制 artifacts 目录，不包含原始 launcher 日志、环境、原始 us1 报告或任意报告内容。"
+            echo "安全归档由 scripts/ci_checks.py export-reports 仅从白名单字段重建 db-foundation.safe.json、cancellation.safe.json、us1.safe.json、us2.safe.json 与 provenance.json，并上传这些固定安全文件；不递归复制 artifacts 目录，不包含原始 launcher 日志、环境、原始 us1/us2 报告或任意报告内容。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Export safe database reports
@@ -314,7 +315,7 @@ jobs:
           python3 -B scripts/ci_checks.py export-reports \
             --report-dir "$RUNNER_TEMP/payment-hub-db/reports" \
             --db-artifact-root "$RUNNER_TEMP/payment-hub-db/artifacts" \
-            --expect db,cancellation,us1
+            --expect db,cancellation,us1,us2
 
       - name: Upload safe database reports
         if: always()
@@ -325,6 +326,7 @@ jobs:
             ${{ runner.temp }}/payment-hub-db/reports/upload/db-foundation.safe.json
             ${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json
             ${{ runner.temp }}/payment-hub-db/reports/upload/us1.safe.json
+            ${{ runner.temp }}/payment-hub-db/reports/upload/us2.safe.json
             ${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json
           if-no-files-found: error
           retention-days: 14
