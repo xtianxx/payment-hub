@@ -238,9 +238,15 @@ class WorkflowContractTests(unittest.TestCase):
             "26 个",
             "38 个",
             "39 个",
+            "42 个",
+            "40 个",
             "十一个",
+            "十八个",
             "TestSubmitPayment",
             "TestUS1Payment",
+            "TestPaymentIdempotency",
+            "TestUS2Replay",
+            "TestOrderRegistrationConcurrencyIntegration",
             "TestApplicationLifecycleIntegration",
             "TestPaymentRequestBoundary/POST_rejection_priority",
         ):
@@ -290,7 +296,7 @@ class WorkflowContractTests(unittest.TestCase):
             "database-foundation",
             "Export safe database reports",
         )
-        self.assertIn("--expect db,cancellation,us1", export)
+        self.assertIn("--expect db,cancellation,us1,us2", export)
         upload = _step(
             self.workflow,
             "database-foundation",
@@ -311,6 +317,7 @@ class WorkflowContractTests(unittest.TestCase):
                 "${{ runner.temp }}/payment-hub-db/reports/upload/db-foundation.safe.json",
                 "${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json",
                 "${{ runner.temp }}/payment-hub-db/reports/upload/us1.safe.json",
+                "${{ runner.temp }}/payment-hub-db/reports/upload/us2.safe.json",
                 "${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json",
             ],
         )
@@ -345,6 +352,7 @@ class WorkflowContractTests(unittest.TestCase):
                     self.assertNotIn("/artifacts/", path)
                     self.assertNotIn("check-db-foundation.log", path)
                     self.assertNotIn("us1.json", path)
+                    self.assertNotIn("us2.json", path)
 
     def test_vulnerability_scan_remains_blocking(self):
         step = _step(
@@ -465,6 +473,50 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotEqual(text, self.text)
         issues = self._issues_for_mutation(text)
         self.assertTrue(issues)
+
+    def test_validation_detects_missing_us2_export(self):
+        text = self.text.replace(
+            "--expect db,cancellation,us1,us2",
+            "--expect db,cancellation,us1",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "workflow-export", {issue.kind for issue in issues}
+        )
+
+    def test_validation_detects_missing_us2_upload_path(self):
+        text = self.text.replace(
+            "            ${{ runner.temp }}/payment-hub-db/reports/upload/us2.safe.json\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "workflow-upload-paths", {issue.kind for issue in issues}
+        )
+
+    def test_validation_detects_us2_upload_after_provenance(self):
+        us2_line = (
+            "            ${{ runner.temp }}/payment-hub-db/reports/upload/"
+            "us2.safe.json\n"
+        )
+        provenance_line = (
+            "            ${{ runner.temp }}/payment-hub-db/reports/upload/"
+            "provenance.json\n"
+        )
+        text = self.text.replace(
+            us2_line + provenance_line,
+            provenance_line + us2_line,
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "workflow-upload-paths", {issue.kind for issue in issues}
+        )
 
     def test_validation_detects_continue_on_error(self):
         text = self.text.replace(
@@ -687,6 +739,11 @@ class ManifestContractTests(unittest.TestCase):
 class BindingContractTests(unittest.TestCase):
     def test_real_binding_inventory_passes(self):
         self.assertEqual(MOD.check_binding_inventory(), [])
+        self.assertEqual(len(CI_MOD.DB_REQUIRED_TEST_KEYS), 18)
+        self.assertEqual(
+            tuple(CI_MOD.DB_REQUIRED_TEST_KEYS),
+            tuple(DB_MOD.REQUIRED_TEST_PACKAGES),
+        )
 
     def test_missing_package_is_rejected(self):
         packages = tuple(
@@ -704,6 +761,37 @@ class BindingContractTests(unittest.TestCase):
         issues = MOD.check_binding_inventory(required_keys=keys)
         self.assertTrue(issues)
 
+    def test_missing_us2_explicit_key_is_rejected(self):
+        for target in (
+            "TestOrderRegistrationConcurrencyIntegration",
+            "TestMockIdempotencyIntegration",
+            "TestUS2Replay",
+            "TestUS2Conflict",
+            "TestUS2Concurrency",
+            "TestUS2Restart",
+            "TestUS2ReportSafety",
+        ):
+            with self.subTest(target=target):
+                keys = tuple(
+                    name
+                    for name in CI_MOD.DB_REQUIRED_TEST_KEYS
+                    if name != target
+                )
+                issues = MOD.check_binding_inventory(required_keys=keys)
+                self.assertTrue(issues)
+                self.assertIn(
+                    "binding-keys-mismatch",
+                    {issue.kind for issue in issues},
+                )
+
+    def test_binding_order_mismatch_is_rejected(self):
+        keys = tuple(reversed(CI_MOD.DB_REQUIRED_TEST_KEYS))
+        issues = MOD.check_binding_inventory(required_keys=keys)
+        self.assertTrue(issues)
+        self.assertIn(
+            "binding-keys-mismatch", {issue.kind for issue in issues}
+        )
+
     def test_binding_to_unselected_package_is_rejected(self):
         bindings = dict(DB_MOD.REQUIRED_TEST_PACKAGES)
         bindings["TestUS1Payment"] = "payment-hub/internal/app"
@@ -713,6 +801,22 @@ class BindingContractTests(unittest.TestCase):
             "binding-package-unselected",
             {issue.kind for issue in issues},
         )
+
+    def test_us2_binding_to_unselected_package_is_rejected(self):
+        for target in (
+            "TestOrderRegistrationConcurrencyIntegration",
+            "TestMockIdempotencyIntegration",
+            "TestUS2Replay",
+        ):
+            with self.subTest(target=target):
+                bindings = dict(DB_MOD.REQUIRED_TEST_PACKAGES)
+                bindings[target] = "payment-hub/internal/app"
+                issues = MOD.check_binding_inventory(bindings=bindings)
+                self.assertTrue(issues)
+                self.assertIn(
+                    "binding-package-unselected",
+                    {issue.kind for issue in issues},
+                )
 
 
 class MetadataContractTests(unittest.TestCase):
@@ -897,6 +1001,30 @@ class SummaryContractTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, output)
                 self.assertIn(bindings[name], output)
+        self.assertEqual(len(keys), 18)
+        ordered = [
+            line[len("- ") :]
+            for line in output.splitlines()
+            if line.startswith("- ")
+        ]
+        self.assertEqual(
+            ordered,
+            [
+                f"{name} -> {bindings[name]}"
+                for name in keys
+            ],
+        )
+        for name in (
+            "TestOrderRegistrationConcurrencyIntegration",
+            "TestMockIdempotencyIntegration",
+            "TestUS2Replay",
+            "TestUS2Conflict",
+            "TestUS2Concurrency",
+            "TestUS2Restart",
+            "TestUS2ReportSafety",
+        ):
+            with self.subTest(us2=name):
+                self.assertIn(name, output)
 
     def test_summary_cli_runs_without_go_on_path(self):
         env = dict(os.environ)

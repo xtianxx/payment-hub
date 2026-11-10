@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"payment-hub/internal/payment"
 )
 
@@ -274,6 +276,28 @@ func TestDecodeEvidenceAcceptsOnlyTypedAllowedFields(t *testing.T) {
 		if _, err := decodeEvidence(invalid); !errors.Is(err, errStoredEvidence) {
 			t.Fatalf("invalid stored evidence was not rejected by the fixed error")
 		}
+	}
+}
+
+func TestClassifyRegistrationErrorNonBusinessUnique(t *testing.T) {
+	// A unique collision other than the targeted business-key conflict is a
+	// definite non-business rejection, never intent reuse. This unit assertion
+	// is the fast red/green companion to the real-PostgreSQL collision test.
+	for _, constraint := range []string{"payment_orders_pkey", "payment_orders_mock_transaction_id_key"} {
+		err := &pgconn.PgError{Code: "23505", ConstraintName: constraint}
+		classified := classifyRegistrationError(err)
+		if !errors.Is(classified, payment.ErrRegistrationRejected) {
+			t.Fatalf("non-business unique error did not map to registration rejected")
+		}
+		if errors.Is(classified, payment.ErrConflict) {
+			t.Fatalf("non-business unique error was misclassified as an intent conflict")
+		}
+	}
+	if got := classifyRegistrationError(errors.New("storage fault")); !errors.Is(got, payment.ErrUnavailable) {
+		t.Fatalf("non-unique storage error changed its unavailable classification")
+	}
+	if got := classifyRegistrationError(nil); got != nil {
+		t.Fatalf("nil error changed classification")
 	}
 }
 

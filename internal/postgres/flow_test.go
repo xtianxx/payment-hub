@@ -223,6 +223,12 @@ func TestOrderRegistrationIntegration(t *testing.T) {
 		})
 		cancel()
 		committedTestRequireSafeError(t, err, "non-business unique error")
+		if !errors.Is(err, payment.ErrRegistrationRejected) {
+			t.Fatalf("non-business unique error was not classified as registration rejected")
+		}
+		if errors.Is(err, payment.ErrConflict) {
+			t.Fatalf("non-business unique error was misclassified as an intent conflict")
+		}
 		if result.Outcome == payment.RegisterOutcomeCreated || result.Outcome == payment.RegisterOutcomeReused {
 			t.Fatalf("non-business unique error was reported as a reliable registration outcome")
 		}
@@ -1049,6 +1055,8 @@ func committedTestErrorClass(err error) string {
 		return "invalid input"
 	case errors.Is(err, payment.ErrConflict):
 		return "conflict"
+	case errors.Is(err, payment.ErrRegistrationRejected):
+		return "registration rejected"
 	case errors.Is(err, payment.ErrUnavailable):
 		return "unavailable"
 	case errors.Is(err, payment.ErrIndeterminate):

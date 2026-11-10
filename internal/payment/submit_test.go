@@ -289,12 +289,13 @@ func TestSubmitPayment(t *testing.T) {
 	t.Run("invalid_inputs_have_no_effect", func(t *testing.T) {
 		valid := submitTestInput()
 		cases := []struct {
-			name      string
-			mutate    func(*RegisterOrderInput)
-			requestID RequestID
-			ctx       context.Context
-			lifecycle context.Context
-			want      error
+			name               string
+			mutate             func(*RegisterOrderInput)
+			requestID          RequestID
+			ctx                context.Context
+			lifecycle          context.Context
+			want               error
+			wantBusinessLookup int
 		}{
 			{
 				name:      "invalid_client_id",
@@ -313,36 +314,40 @@ func TestSubmitPayment(t *testing.T) {
 				want:      ErrInvalidInput,
 			},
 			{
-				name:      "amount_zero",
-				mutate:    func(in *RegisterOrderInput) { in.Amount = 0 },
-				requestID: submitTestRequestID,
-				ctx:       context.Background(),
-				lifecycle: context.Background(),
-				want:      ErrInvalidInput,
+				name:               "amount_zero",
+				mutate:             func(in *RegisterOrderInput) { in.Amount = 0 },
+				requestID:          submitTestRequestID,
+				ctx:                context.Background(),
+				lifecycle:          context.Background(),
+				want:               ErrInvalidInput,
+				wantBusinessLookup: 1,
 			},
 			{
-				name:      "amount_negative",
-				mutate:    func(in *RegisterOrderInput) { in.Amount = -1 },
-				requestID: submitTestRequestID,
-				ctx:       context.Background(),
-				lifecycle: context.Background(),
-				want:      ErrInvalidInput,
+				name:               "amount_negative",
+				mutate:             func(in *RegisterOrderInput) { in.Amount = -1 },
+				requestID:          submitTestRequestID,
+				ctx:                context.Background(),
+				lifecycle:          context.Background(),
+				want:               ErrInvalidInput,
+				wantBusinessLookup: 1,
 			},
 			{
-				name:      "amount_above_maximum",
-				mutate:    func(in *RegisterOrderInput) { in.Amount = 1_000_001 },
-				requestID: submitTestRequestID,
-				ctx:       context.Background(),
-				lifecycle: context.Background(),
-				want:      ErrInvalidInput,
+				name:               "amount_above_maximum",
+				mutate:             func(in *RegisterOrderInput) { in.Amount = 1_000_001 },
+				requestID:          submitTestRequestID,
+				ctx:                context.Background(),
+				lifecycle:          context.Background(),
+				want:               ErrInvalidInput,
+				wantBusinessLookup: 1,
 			},
 			{
-				name:      "currency_invalid",
-				mutate:    func(in *RegisterOrderInput) { in.Currency = "USD" },
-				requestID: submitTestRequestID,
-				ctx:       context.Background(),
-				lifecycle: context.Background(),
-				want:      ErrInvalidInput,
+				name:               "currency_invalid",
+				mutate:             func(in *RegisterOrderInput) { in.Currency = "USD" },
+				requestID:          submitTestRequestID,
+				ctx:                context.Background(),
+				lifecycle:          context.Background(),
+				want:               ErrInvalidInput,
+				wantBusinessLookup: 1,
 			},
 			{
 				name:      "invalid_request_id",
@@ -383,7 +388,15 @@ func TestSubmitPayment(t *testing.T) {
 				if got.Order.ID != "" || got.Created || len(got.Issues) != 0 {
 					t.Fatalf("invalid input must not produce a result")
 				}
-				deps.assertNoCalls(t)
+				if deps.reg.calls != 0 || deps.payer.calls != 0 || deps.recorder.calls != 0 || deps.lookup.byIDCalls != 0 {
+					t.Fatalf("invalid input must not create a side effect")
+				}
+				if deps.lookup.byBusinessCalls != tc.wantBusinessLookup {
+					t.Fatalf("business lookup calls = %d, want %d", deps.lookup.byBusinessCalls, tc.wantBusinessLookup)
+				}
+				if tc.wantBusinessLookup > 0 && deps.lookup.byBusinessDeadline.IsZero() {
+					t.Fatalf("business-value validation lookup must use a bounded context")
+				}
 			})
 		}
 

@@ -498,6 +498,28 @@ T024–T041据对应证据完成并更新quickstart；T023当前测试通过，�
 
 本批红绿证据、合流验证及范围快照位于`artifacts/ci-code-sync/`。合流后实际通过403项Python回归（无skip）、两次真实Go metadata预检、vet及39/39默认必需项；fresh隔离PG run `8498488b3ec44d70bdf474fbce08e68a`通过11/11、四包和六US1场景。父独立核对107项当前输入哈希、安全导出/provenance、夹具0/0/0及资源缺席，接受记录为`validation/parent-acceptance.json`。此前R1的default38和US1历史报告仍只适用于各自输入，不沿用旧报告冒称新输入已通过。本批未重跑漏洞扫描或取消实验；全Python首次执行后的证据采集器出错，修正采集器后再次全量通过，此故障不算产品行为red。未提交、推送、配置远端规则或部署。
 
+### US2实施与验收边界（2026-11-10）
+
+US1及CI防漂移已通过PR #6四项远端检查，合并提交为`11369b9`。用户随后授权US2 T042–T053，并确认按既定HTTP合同分层：HTTP保持严格结构、类型、定位及整数表示检查；payment负责业务金额/币种及必要的一次当前接入方普通只读冲突判断。非法业务值可靠命中不同事实409、查无400、读取故障500/503；不调用GET核实流程、不登记、不写追踪或授予付款资格。
+
+非业务唯一碰撞使用脱敏内部分类`ErrRegistrationRejected`，不得被登记恢复读回吞成200，也不返回业务409或换UUID重试。Mock现有生产防重实现不改，新增真实PG测试分别核对入口调用数、持久效果和原交易时间。已正确的重放行为记录baseline green，不为过程形式制造red；新增/修复分支保留同测试hash的真实断言红绿。
+
+当前接线为默认42项/40根、DB18项/四包；原US1和R1绑定保留。工作流新增`us2.safe.json`白名单导出，仍用动态摘要和既有`CI gate`，不新增job、凭据、依赖或部署。测试包含八个US2场景：成功/失败/UNKNOWN重放、冲突、空意图双HTTP竞争、成功/失败真实重启及同接入方换密钥。UNKNOWN使用无Mock效果的独立种子，绝不因重放补付；并发释放候选事务前按实际阻塞PID确认两个PG等待者，初始零行数和最终效果分别读取。
+
+报告`checks`是实际测试断言的安全摘要，不是独立执行证明。最终调用数来自已封口父观察器，最终行数来自本次PG读取；重放前调用数由真实setup绑定和最终不增加约束推导，不能宣称未封口的live Snapshot。原事实稳定性由前后身份、金额、币种、结果及时间比较断言给出；限定只读probe数仅指HTTP探测次数，SQL恰一次由payment spy另证。
+
+真实503测试在本次fresh隔离DB独占运行时短暂锁住整个`payment_orders`表，不是接入方行级锁；不与其他PG测试并行，检查回滚错误。500另由真实loopback HTTP、实际router/Submitter及受控拒绝registrar验证，核对零恢复定位/保存/Mock与PG事实不变；它不是正常应用二进制发生真实PG内部故障的证明，也不混入八场景报告。
+
+本机正式接受run为`813b3f4bed304b66a4e765d7dc6e7a7c`：18/18、四包、US2八场景与US1六场景通过，夹具0/0/0、117项当前输入稳定、本次资源缺席，安全导出与provenance无错误。父已独立读回实际报告、逐源码哈希、跨代进程/封口凭据及US1/US2产物共存，接受记录为`artifacts/us2/final-validation-after-namespace/parent-acceptance.json`。463项Python、真实metadata、untagged vet和default42复用同批先前有效结果，不冒称补验重跑全部。首轮run `c008b9900fe34c95bbed1673e4aab084`因US1/US2同名重启产物目录碰撞失败；只修复两个integration标签测试文件，US2内部路径改为`scenarios/us2/<scenario>`，保存真实产物并存红绿回归后fresh PG重验，原失败不覆盖、不算支付业务red。T042–T053据此完成；T023历史缺证保留，US3及CD不在本批范围，漏洞扫描/取消实验本批未重跑（对应实现/依赖未变），US2已本地提交、尚未推送，也未进行远端CI验收。
+
+### US2审查P2：混合并发独立证据（2026-11-10）
+
+外部只读审查`/tmp/opencode/payment-hub-us2-review/review.md`指出：原混合重放/冲突请求只同时释放goroutine，串行完成也能通过，因此此前T050混合部分的接受偏宽；初始同金额竞争的两个真实PG等待者不能替代这对请求的证明。这是测试可靠性缺口，不是已发现支付重付或错误接受冲突。
+
+本批只改三个US2测试文件和两个CI工具/测试文件。混合100分重放与101分冲突前，在本次隔离DB取得`payment_orders`的SHARE表锁，绑定该事务backend PID；实际确认两个请求在同表上等待RowExclusiveLock后才回滚释放，再核对200/409、同单、原事实、两种最终GET及付款/效果不增加。锁影响本次整表，只串行使用隔离fixture；不修改生产事务、表、接口或预算。
+
+报告保留初始竞争`waiter_count=2`，另强制`mixed_waiter_count=2`；其他七场景该新字段为0。两个计数分别来自各自PG查询返回，不能复用或填写模板。安全导出拒绝缺失、错误类型、混合缺证和非混合场景冒用；不以原报告的初始waiter数替代新证据。focused同测试hash红绿后，fresh run `7757e1e6fd034e75a5b7c0f09b778d8e`的18项门禁、四包、US1六场景及US2八场景通过。父独立核对实际初始2＋混合2、200/409、付款1/查询0、订单/Mock/处理记录1/1/1、两个独立5秒屏障及安全导出；467项Python和真实metadata通过，untagged vet/default42复用有效证据未重跑。117项源码哈希稳定、夹具0/0/0、本次资源缺席，接受记录为`artifacts/us2/review-mixed-concurrency/validation/parent-acceptance.json`，修复结论见同目录上级`resolution.md`。旧run与原审查报告保留，不冒称旧报告包含新混合证明；已本地提交、尚未推送、尚未运行远端CI或进入US3/CD，T023历史缺证不变。
+
 ### 观察器的可信计数合同（以下为基础阶段记录）
 
 - `internal/testcontrol/protocol.go` 只依赖标准库，共享严格有界协议；`tests/harness/observer.go` 是父进程工具，不进入业务依赖。每条私有 Unix socket 连接只交换一帧请求和一帧响应，必须验证完整 EOF；帧含唯一结尾 LF，总长最多4096字节。未知/重复/越型字段、非法身份或额外帧均拒绝，错误不回显原文。

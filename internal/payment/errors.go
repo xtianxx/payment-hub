@@ -10,4 +10,7 @@ var (
 	ErrIndeterminate       = errors.New("payment: commit indeterminate")
 	ErrObservationConflict = errors.New("payment: observation conflict")
 	ErrNotFound            = errors.New("payment: order not found")
+	// ErrRegistrationRejected is a definite non-business registration failure.
+	// It must not be recovered into intent reuse or grant payment eligibility.
+	ErrRegistrationRejected = errors.New("payment: registration rejected")
 )

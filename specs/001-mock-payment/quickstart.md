@@ -1,8 +1,8 @@
 # 运行与验证指南：模拟商城一次性 Mock 支付闭环
 
-**Status**: US1 locally verified — 基础阶段及US1真实HTTP/PG/成功与FAILED/重启已完成本机运行验收，见0.2。T023最早测试先行证据缺失仍披露；US2/US3、应用镜像、远端分支CI和发布/CD未验收，不代表完整MVP完成。
+**Status**: US1 merged; US2 locally accepted — US1及CI防漂移已通过PR #6四项远端检查并合并到main `11369b9`；US2 T042–T053本机独立验收完成，见0.3。US2已本地提交、尚未推送，也未进行远端CI验收；T023最早测试先行证据缺失仍披露。US3、应用镜像和发布/CD不在本批范围，不代表完整MVP完成。本批不自动提交、推送或合并。
 
-**Date**: 2026-11-09
+**Date**: 2026-11-10
 
 **依据**: [plan.md](plan.md)、[spec.md](spec.md)、[data-model.md](data-model.md)、[HTTP 合同](contracts/http-api.md)。
 
@@ -63,24 +63,40 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
   export GOMODCACHE="$cache/gomod" GOCACHE="$cache/gobuild"
   export CGO_ENABLED=1 GOMAXPROCS=2 GOPROXY=off GOSUMDB=off TMPDIR=/tmp/opencode
   mkdir -p "$PWD/artifacts"
-  root="$(mktemp -d "$PWD/artifacts/us1-local.XXXXXX")"
+  root="$(mktemp -d "$PWD/artifacts/stories-local.XXXXXX")"
+  python3 -B scripts/check-ci-contract.py --go "$go" &&
   python3 -B scripts/ci_checks.py run-default --go "$go" --report-dir "$root/reports" &&
   python3 -B scripts/check-db-foundation.py --go "$go" --cache-dir "$cache" \
     --prepare-images --cleanup-owned-resources --artifact-root "$root/db" &&
   python3 -B scripts/ci_checks.py export-reports --report-dir "$root/reports" \
-    --db-artifact-root "$root/db" --expect default,db,us1
+    --db-artifact-root "$root/db" --expect default,db,us1,us2
 )
 ```
 
-- 默认门禁为38个必需根＋`TestPaymentRequestBoundary/POST_rejection_priority`焦点子测试，共39项必需检查；数据库入口显式选择`internal/postgres`、`internal/mock`、`tests/harness`、`tests`四包，11项必需结果。普通`go test ./...`不执行integration标签的真实US1测试。整批监督570秒、默认包90秒、integration包120秒，不为本指南放宽；超时后的kill/reap与报告时间不包含在570秒内。
+- US1合并时默认门禁为38个必需根＋R1焦点子测试，共39项；DB四包、11项。本批US2接线后的当前清单为40个根＋2个焦点子测试，共42项，DB仍选择`internal/postgres`、`internal/mock`、`tests/harness`、`tests`四包，增加至18项；这些是必需项而非全套测试总数，执行结果须以当前合流验收为准。普通`go test ./...`不执行integration标签的真实故事测试。整批监督570秒、默认包90秒、integration包120秒不变；超时后的kill/reap与报告时间不包含在570秒内。
 - 模块缓存准备好后，先运行`python3 -B scripts/check-ci-contract.py --go "$HOME/.cache/payment-hub/toolchains/go1.27.3/bin/go"`；它比较普通/integration两次真实`go list`元数据，拒绝新增integration文件所在包未被数据库启动器选择，并核对清单和工作流合同，不运行数据库或下载模块。嵌套`tests/**/*.go`、`scripts/*.py`、`migrations/*.sql`自动纳入输入清单；新增必需行为仍须维护明确测试绑定，不能仅靠文件扫描。
 - 工作流摘要用`check-ci-contract.py --summary default|db`从常量生成；默认摘要的`package-count`仅指必需项绑定包数，并非实际执行包总数。`CI gate`以`always()`收口三个执行job，只有全部success通过，失败/取消/跳过/缺失结果均失败。源码新增此job不等于远端已注册或成为required check：后续获授权提交/推送并完成首次运行后，仓库管理员须配置分支保护或ruleset要求`CI gate`，再核对实际阻断；本批不修改远端设置，也不启用CD。
 - `tests`包自行构建正常`cmd/payment-hub`，成功/FAILED各用独立实验，经真实POST、两种GET及PG逐列检查；重启场景停止并启动同一二进制，父Observer和数据库跨代保留，核对订单事实不变、付款调用仍1次。非法请求无业务效果，另核对真实TCP的4096接受、4097拒绝、无Content-Length的chunked超限及原始连接拒绝。
 - FAILED仅由可信testmode私有UDS的一次性结果指令建立，绑定实际订单/进程代次/call序号；实际Mock提交结果证明消费，未消费或Seal异常不通过。正常关闭testmode仍默认成功。业务请求不能指定失败，不使用预置FAILED行或另一fixture二进制，不支持本批未验收的“指令＋答复隐藏”组合。
-- 真实报告在`$root/db/<run_id>/us1.json`及受控scenario子目录；上传只使用`$root/reports/upload/`中的`go-default.safe.json`、`db-foundation.safe.json`、`us1.safe.json`和provenance。不要上传原始报文、凭据、DSN、动态SQL或原始工具日志。失败场景的固定阶段诊断不能当PASS。
+- 当前启动器会运行四包全部必需integration检查，不支持故事选择参数。真实报告在`$root/db/<run_id>/us1.json`、`us2.json`及受控scenario子目录；US2内部产物使用`scenarios/us2/<scenario>`，不覆盖US1同名重启产物。上传只使用`$root/reports/upload/`中的`go-default.safe.json`、`db-foundation.safe.json`、`us1.safe.json`、`us2.safe.json`和provenance。不要上传原始报文、凭据、DSN、动态SQL或原始工具日志。失败场景的固定阶段诊断不能当PASS。
 - 已独立接受的本机run为`3ed70eb46c0c48e68dc4725d706c66aa`：11/11、六场景PASS、夹具残留0/0/0、105项输入稳定、资源缺席；证据见`artifacts/us1-core/real-us1/acceptance/after-sql-evidence-fix/parent-acceptance.json`。默认38根和untagged vet复用此前已通过且输入未变的结果，不声称该轮重跑。正式PG/US1命令退出0，default/db/us1导出退出0；本轮未重复漏洞扫描或取消实验。
 - CI防漂移合流后的fresh run为`8498488b3ec44d70bdf474fbce08e68a`，11/11、六US1场景及资源清理通过；同期403项Python回归、真实metadata预检、vet、默认39项与安全导出通过，107项源码清单输入稳定。父独立接受记录见`artifacts/ci-code-sync/validation/parent-acceptance.json`；此轮未重跑漏洞扫描或取消实验，不替代远端实际job。
-- 之前的路径、DSN、raw响应解析及SQL证据字段适配失败均保留，不冒充产品行为red；T023最早测试先行证据缺失未补造，任务仍未勾选。US1本地运行验收不等于完整MVP、镜像或远端CI通过；当前未提交、推送、发布或启用CD。
+- 之前的路径、DSN、raw响应解析及SQL证据字段适配失败均保留，不冒充产品行为red；T023最早测试先行证据缺失未补造，任务仍未勾选。US1本地运行验收不等于完整MVP、镜像或远端CI通过；当前分支已本地提交，尚未推送、发布或启用CD。
+
+### 0.3 本机已验收：US2重放、并发与冲突验证
+
+沿用0.2的当前合流入口与原HTTP合同，使用隔离夹具，不连接开发数据库；当前分支真实验收结果须另读本批接受记录，不能用US1历史run代替。US2增加以下检查：
+
+- 同意图成功/失败请求顺序重放两次，返回同单及当前事实，不缓存首次HTTP答复、不再付款；FAILED仍返回原失败，首期没有重新支付或重置入口。
+- UNKNOWN使用独立有效订单种子且无Mock/处理记录；两次POST仍UNKNOWN、调用/效果均不增加，不借查询核实改变该重放实验的事实。
+- 空意图双HTTP竞争先在真实PG观察到本次候选事务的两个等待者，再释放；最终同单且付款入口与效果分别至多一次，允许竞争响应具有不同瞬时快照。随后同参重放与冲突请求另用独立SHARE表锁/PID绑定屏障，实际观察两者均在服务端等待后才释放，再确认200/409、两种GET结果一致及原身份、金额、币种和时间不变。报告`waiter_count`只证明初始竞争；`mixed_waiter_count`单独证明混合这对请求，各应为2，不得相互替代。
+- 已有不同金额/币种返回409；可比较非法业务值的新意图400；结构/鉴权仍先拒绝。限定只读核对不登记、不付款、不写追踪；真实PG读取超时503不得冒称无订单。受控500是独立真实HTTP/实际业务层错误映射回归，不是正常应用进程真实PG内部故障的证明。
+- 成功/失败均真实停止第一代、启动第二代后重放，核对同单、原结果及跨代父观察器封口；换演示密钥但保持同一client_id也不得绕过原意图，密钥不进入报告。
+- 八场景`us2.json`的PASS、完整运行身份/代次凭据、命令、HTTP及PG事实缺一不可；`checks`是这些测试断言的白名单摘要，不是独立执行证明。读取超时夹具临时锁住本次fresh DB整张订单表，故仅串行执行并检查回滚，不能与其他PG任务并行。
+
+本机接受run为`813b3f4bed304b66a4e765d7dc6e7a7c`：DB18/18、四包、US2八场景及US1六场景PASS，夹具0/0/0、117项输入稳定、本次资源缺席，default/db/us1/us2安全导出与provenance通过。父接受记录为`artifacts/us2/final-validation-after-namespace/parent-acceptance.json`。463项Python、真实metadata、untagged vet及default42沿用同批命名空间修复前的有效结果；补验仅改变两个integration标签夹具/报告测试文件，未宣称全部重跑。首轮`c008b9900fe34c95bbed1673e4aab084`因US1/US2同名重启产物目录碰撞失败，修复后同名产物并存；原失败及红绿证据保留，不算支付业务red。漏洞扫描/取消实验本批未重跑，对应实现及依赖未变。
+
+外部审查随后确认原T050混合请求没有独立服务端重叠证明，本批补独立屏障及必需报告字段后，fresh run `7757e1e6fd034e75a5b7c0f09b778d8e`已通过18/18、四包、US1六/US2八场景和安全导出；父核对初始等待者2与混合等待者2的独立来源、混合200/409、付款和效果不增加及资源缺席，接受记录见`artifacts/us2/review-mixed-concurrency/validation/parent-acceptance.json`。同期467项Python及真实metadata通过，untagged vet/default42复用有效结果，未重跑漏洞扫描/取消实验；117项当前输入稳定。前述813b等旧run不包含新混合证明，不冒称覆盖当前字段。US2历史报告、首次失败及夹具命名空间修复证据均保留。T023历史缺证继续披露；本批已本地提交、尚未推送、尚未运行远端CI，此指南不授权US3、镜像、发布/CD或Git推送。
 
 ## 1. 启动数据库
 

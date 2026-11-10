@@ -4,7 +4,7 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 # Tasks: 模拟商城一次性 Mock 支付闭环
 
-**Status**: US1 local runtime accepted, historical evidence exception retained — T001–T022及CI加固/依赖整改已合并；US1分支基于main `79a5736`，当前未提交/推送。US1真实HTTP/PG/成功/FAILED/两代进程重启及安全导出已独立验收，T024–T041完成；T023当前测试通过但最早测试先行证据未保留，仍不勾选，不宣称所有历史证据齐全。US2+、完整MVP、应用镜像、远端分支CI与CD未验收。本文件本身不授予执行或Git权限，后续提交/推送/合并及US2+、CD仍须另获授权。
+**Status**: US1 merged; US2 locally accepted — US1及CI防漂移已通过PR #6四项远端检查并合并到main `11369b9`；T024–T041完成。US2在`003-us2-payment-idempotency`完成T042–T053，本机fresh PG run `813b3f4bed304b66a4e765d7dc6e7a7c`的18项必需检查、US1六场景和US2八场景及安全导出已独立接受，见`artifacts/us2/final-validation-after-namespace/parent-acceptance.json`。T023最早测试先行证据缺失仍披露且不勾选；US2当前已本地提交、尚未推送，也未进行远端CI验收。不进入US3，完整MVP、应用镜像和CD未验收。本文件本身不授予执行或Git权限；本批不自动提交、推送、合并或部署。
 
 **Input**: `specs/001-mock-payment/` 中已批准的设计，基线提交 `a999f01`。
 
@@ -121,21 +121,25 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 ### Tests for User Story 2（必需，先于对应扩展）
 
-- [ ] T042 [P] [US2] 在 `internal/payment/idempotency_test.go` 编写成功/失败/未知相同参数重放、明确失败后不支持新支付尝试及当前结果不冻结首次响应的测试，以独立spy确认复用不再调用付款。（依赖：T041；验收：FR-009/011与SC-002/007断言明确，不因重试新建意图或重置资格。）
-- [ ] T043 [P] [US2] 在 `internal/postgres/concurrency_test.go` 编写真实PG竞争登记、唯一冲突后独立SELECT、非业务键碰撞、原始事实不可覆盖及两请求最终同单测试，使用同步屏障而非sleep。（依赖：T041；验收：并发请求可返回不同瞬时快照，但最终单一订单、付款调用与效果均至多一次，数据库错误不冒充重复成功。）
-- [ ] T044 [P] [US2] 在 `tests/us2_conflict_test.go` 编写US2-A3和冲突优先级：结构安全可比较但金额越界/非CNY时，既有不同事实409、新意图400、定位失败500/503；验证只做当前接入方普通只读定位，无Mock、登记、写入或资格。（依赖：T041；验收：结构/类型错误仍直接拒绝，额外只读核对不调用会核实未知的GET流程。）
-- [ ] T045 [P] [US2] 在 `tests/us2_restart_test.go`、`tests/us2_replay_test.go` 编写US2-A1/A4/A5，覆盖成功/失败顺序重放两次及真实重启后重放，未知重放无第二次调用，换演示密钥但保持client_id不绕过原意图。（依赖：T041；验收：父观察器跨进程累计，无新增订单/效果，失败仍失败，原字段与身份关联不变。）
+- [x] T042 [P] [US2] 在 `internal/payment/idempotency_test.go` 编写成功/失败/未知相同参数重放、明确失败后不支持新支付尝试及当前结果不冻结首次响应的测试，以独立spy确认复用不再调用付款。（依赖：T041；验收：FR-009/011与SC-002/007断言明确，不因重试新建意图或重置资格。）
+- [x] T043 [P] [US2] 在 `internal/postgres/concurrency_test.go` 编写真实PG竞争登记、唯一冲突后独立SELECT、非业务键碰撞、原始事实不可覆盖及两请求最终同单测试，使用同步屏障而非sleep。（依赖：T041；验收：并发请求可返回不同瞬时快照，但最终单一订单、付款调用与效果均至多一次，数据库错误不冒充重复成功。）
+- [x] T044 [P] [US2] 在 `tests/us2_conflict_test.go` 编写US2-A3和冲突优先级：结构安全可比较但金额越界/非CNY时，既有不同事实409、新意图400、定位失败500/503；验证只做当前接入方普通只读定位，无Mock、登记、写入或资格。（依赖：T041；验收：结构/类型错误仍直接拒绝，额外只读核对不调用会核实未知的GET流程。）
+- [x] T045 [P] [US2] 在 `tests/us2_restart_test.go`、`tests/us2_replay_test.go` 编写US2-A1/A4/A5，覆盖成功/失败顺序重放两次及真实重启后重放，未知重放无第二次调用，换演示密钥但保持client_id不绕过原意图。（依赖：T041；验收：父观察器跨进程累计，无新增订单/效果，失败仍失败，原字段与身份关联不变。）
 
 ### Implementation for User Story 2
 
-- [ ] T046 [US2] 完善 `internal/postgres/orders.go` 的业务键冲突读取与并发错误分类，不把主键或其他唯一错误吞成业务复用；始终返回可靠现有事实，不从已存在UNKNOWN行反推资格。（依赖：T042,T043；验收：T043真实PG竞争断言成立，注册事务不跨Mock调用，独立语句快照语义符合读已提交。）
-- [ ] T047 [US2] 完善 `internal/payment/submit.go` 的相同意图参数复用及冲突保护，成功/失败/未知重放都不重新发起，失败后明确不支持再支付，返回可靠当前结果而非缓存首次HTTP答复。（依赖：T042,T045,T046；验收：T042通过，付款调用次数不依赖Mock自身防重兜底。）
-- [ ] T048 [US2] 在 `internal/payment/submit_validation.go`、`internal/postgres/lookup.go` 实现合同限定的冲突优先只读核对；可安全比较的结构合法输入才进入一次定位，找不到才判新意图无效，失败不推定无订单。（依赖：T044,T047；验收：T044通过，不扩大合法金额/币种、不新建核实记录或调用Mock，不将读取到订单当资格。）
-- [ ] T049 [US2] 完善 `internal/mock/transaction.go` 的独立防线：同关联号、金额和币种一致复用原交易，结果与processed_at不变；冲突调用被拒绝但不把原交易改成FAILED，入口观测仍计每次调用。（依赖：T043,T045,T047；验收：直接验证Mock可挡重复但不能替业务防重，不以交易一行推断一次调用。）
-- [ ] T050 [US2] 在 `tests/us2_concurrency_test.go` 接线实际双HTTP请求与真实PG屏障，复核US2-A2、冲突与相同提交交错的原事实保护；屏障需要放宽时同步调整上层有界预算并记差异。（依赖：T043,T046,T047,T048,T049；验收：同单、最终查询一致及调用/效果上限分别成立，观察器不按订单合并调用。）
-- [ ] T051 [US2] 在 `tests/us2_replay_test.go`、`tests/us2_conflict_test.go` 接线复用、换钥匙、非法可比较值与定位故障的全HTTP回归，确保401/400/409/500/503分支均不改原事实或补付。（依赖：T044,T045,T048,T049,T050；验收：失败与未知重放不产生新尝试，可靠取得的已有确认不被重放改写；追踪故障细测归T055/T057，不依赖US3夹具才能完成US2。）
-- [ ] T052 [US2] 执行 `internal/payment/idempotency_test.go`、`internal/postgres/concurrency_test.go` 和 `tests/us2_restart_test.go` 等本故事焦点检查，保存 `artifacts/<run_id>/us2.json`，含真实重启前后数据库状态及跨进程调用证据。（依赖：T045,T050,T051；验收：US2-A1–A5覆盖且无证据缺口，记录实际命令、退出码、失败摘录和未执行项，不自动运行其他无关套件。）
-- [ ] T053 [US2] 按T052真实结果更新 `specs/001-mock-payment/quickstart.md` 的重放、并发、冲突和失败不重付操作及限制，引用原HTTP合同而不复制新定义。（依赖：T052；验收：指南步骤与实际入口一致，不新增重新支付或重置订单能力，不宣称US3或发布已验收。）
+- [x] T046 [US2] 完善 `internal/postgres/orders.go` 的业务键冲突读取与并发错误分类，不把主键或其他唯一错误吞成业务复用；始终返回可靠现有事实，不从已存在UNKNOWN行反推资格。（依赖：T042,T043；验收：T043真实PG竞争断言成立，注册事务不跨Mock调用，独立语句快照语义符合读已提交。）
+- [x] T047 [US2] 完善 `internal/payment/submit.go` 的相同意图参数复用及冲突保护，成功/失败/未知重放都不重新发起，失败后明确不支持再支付，返回可靠当前结果而非缓存首次HTTP答复。（依赖：T042,T045,T046；验收：T042通过，付款调用次数不依赖Mock自身防重兜底。）
+- [x] T048 [US2] 在 `internal/payment/submit_validation.go`、`internal/postgres/lookup.go` 实现合同限定的冲突优先只读核对；可安全比较的结构合法输入才进入一次定位，找不到才判新意图无效，失败不推定无订单。（依赖：T044,T047；验收：T044通过，不扩大合法金额/币种、不新建核实记录或调用Mock，不将读取到订单当资格。）
+- [x] T049 [US2] 完善 `internal/mock/transaction.go` 的独立防线：同关联号、金额和币种一致复用原交易，结果与processed_at不变；冲突调用被拒绝但不把原交易改成FAILED，入口观测仍计每次调用。（依赖：T043,T045,T047；验收：直接验证Mock可挡重复但不能替业务防重，不以交易一行推断一次调用。）
+- [x] T050 [US2] 在 `tests/us2_concurrency_test.go` 接线实际双HTTP请求与真实PG屏障，复核US2-A2、冲突与相同提交交错的原事实保护；屏障需要放宽时同步调整上层有界预算并记差异。（依赖：T043,T046,T047,T048,T049；验收：同单、最终查询一致及调用/效果上限分别成立，观察器不按订单合并调用。）
+- [x] T051 [US2] 在 `tests/us2_replay_test.go`、`tests/us2_conflict_test.go` 接线复用、换钥匙、非法可比较值与定位故障的全HTTP回归，确保401/400/409/500/503分支均不改原事实或补付。（依赖：T044,T045,T048,T049,T050；验收：失败与未知重放不产生新尝试，可靠取得的已有确认不被重放改写；追踪故障细测归T055/T057，不依赖US3夹具才能完成US2。）
+- [x] T052 [US2] 执行 `internal/payment/idempotency_test.go`、`internal/postgres/concurrency_test.go` 和 `tests/us2_restart_test.go` 等本故事焦点检查，保存 `artifacts/<run_id>/us2.json`，含真实重启前后数据库状态及跨进程调用证据。（依赖：T045,T050,T051；验收：US2-A1–A5覆盖且无证据缺口，记录实际命令、退出码、失败摘录和未执行项，不自动运行其他无关套件。）
+- [x] T053 [US2] 按T052真实结果更新 `specs/001-mock-payment/quickstart.md` 的重放、并发、冲突和失败不重付操作及限制，引用原HTTP合同而不复制新定义。（依赖：T052；验收：指南步骤与实际入口一致，不新增重新支付或重置订单能力，不宣称US3或发布已验收。）
+
+**US2本机验收记录（2026-11-10）**：fresh run `813b3f4bed304b66a4e765d7dc6e7a7c`，18/18、四包、US2八场景及US1六场景PASS，夹具0/0/0，117项输入稳定及本次资源缺席；安全default/db/us1/us2导出和provenance通过。463项Python、真实metadata、untagged vet和default42复用命名空间修复前同批已通过的有效输入证据：修复只改变两个integration标签测试文件，不能宣称补验重跑全部。首轮run `c008b9900fe34c95bbed1673e4aab084`因US1/US2同名产物目录碰撞失败，原报告保留；新增真实产物并存红绿回归后改用US2独立内部命名空间，不算支付业务red。T048复用既有普通只读lookup实现；T049现有Mock生产防线已满足，以新增真实PG证明而非强改源码完成。T051的500是实际HTTP/router/Submitter加受控确定拒绝registrar的分层证据，不冒称正常二进制真实PG内部故障；503来自正常二进制加真实隔离PG锁。父接受记录：`artifacts/us2/final-validation-after-namespace/parent-acceptance.json`。漏洞扫描/取消实验本批未重跑（对应实现及依赖未变），US2远端CI未运行，已本地提交、尚未推送；T023例外、US3/CD边界不变。
+
+**审查P2修复补验（2026-11-10）**：原混合重放/冲突仅同时启动goroutine，不能证明服务端重叠，此前T050此部分的接受偏宽。本批给混合请求增加独立SHARE表锁/阻塞PID绑定屏障及必需`mixed_waiter_count`，与初始竞争`waiter_count`分开；两者实际均2才通过，旧报告不能替代。fresh run `7757e1e6fd034e75a5b7c0f09b778d8e`的18/18、四包、US1六/US2八场景通过，混合200/409且付款调用1、查询0、订单/Mock/处理记录1/1/1不增加。467项Python和真实metadata通过；untagged vet/default42复用输入未变的有效证据，安全导出与provenance无错误，117项输入稳定、夹具0/0/0及资源缺席已父独立核对。接受记录：`artifacts/us2/review-mixed-concurrency/validation/parent-acceptance.json`；原审查及旧run保留，T023历史缺证不变，已本地提交、尚未推送，也未进入US3/CD。
 
 **Checkpoint**: US2可用独立种子数据验收；创建查询基础沿用US1代码，不依赖US1先跑测试。US3尚未验收前仍不是完整MVP。
 

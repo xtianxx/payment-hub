@@ -4,7 +4,7 @@
 
 **Input**: 已批准的 `specs/001-mock-payment/spec.md` 与本次对话已确认的技术决策。
 
-**Status**: Approved design, US1 local runtime accepted — 当前范围技术设计于2026-11-06获用户确认；T001–T022及CI加固已合并，main `79a5736` 远端检查通过。US1真实HTTP/PG/成功及FAILED/两代重启和安全导出已本机独立验收，见quickstart 0.2与tasks最终记录；当前US1改动未提交/推送，T023原始测试先行缺证继续披露且未勾选。按既有规范增量实施，不重建Spec Kit产物。US2/US3、镜像、当前分支远端CI、CD及完整MVP未验收，真实发布未实施。
+**Status**: Approved design; US1 merged; US2 locally accepted — 当前范围技术设计于2026-11-06获用户确认；US1及CI防漂移已通过PR #6四项远端检查并合并到main `11369b9`。US2 T042–T053已按既定HTTP合同的严格语法/payment业务值与限定只读分层完成本机验收；fresh PG run `813b3f4bed304b66a4e765d7dc6e7a7c`的18项必需检查、US2八场景及US1六场景和安全导出已独立接受，详见tasks与quickstart。沿用既有规范增量实施，未重建Spec Kit产物。T023原始测试先行缺证继续披露且未勾选；US2已本地提交、尚未推送，也未进行远端CI验收，US3、镜像、CD及完整MVP不在本批交付范围；不自动提交、推送或发布。
 
 ## Summary
 
