@@ -1,12 +1,12 @@
 # 运行与验证指南：模拟商城一次性 Mock 支付闭环
 
-**Status**: Partial — 准备态、基础包及T012–T017数据库基础已实现并通过本机验证；可执行的局部入口见0.1。完整应用/HTTP/重启/发布流程仍是草案，不可据此宣称MVP可运行。
+**Status**: US1 locally verified — 基础阶段及US1真实HTTP/PG/成功与FAILED/重启已完成本机运行验收，见0.2。T023最早测试先行证据缺失仍披露；US2/US3、应用镜像、远端分支CI和发布/CD未验收，不代表完整MVP完成。
 
-**Date**: 2026-11-08
+**Date**: 2026-11-09
 
 **依据**: [plan.md](plan.md)、[spec.md](spec.md)、[data-model.md](data-model.md)、[HTTP 合同](contracts/http-api.md)。
 
-本文不新增业务能力。0.1只记录已有真实执行证据的数据库基础入口；第1–7节仍是完整应用后续操作顺序与失败边界，不表示这些业务步骤已经实现或验收。实际版本、命令和结果见[开发记录](../../docs/development.md#8-数据库基础批t012t017-与持续-ci-维护)。
+本文不新增业务能力。0.1记录基础入口与历史证据，0.2记录当前US1入口及实际验收；第1–7节还包含完整MVP/镜像发布的后续目标，不表示所有步骤已获验收。实际版本、命令和结果见[开发记录](../../docs/development.md)。
 
 所有业务与故障演示均使用模拟数据，不处理真实资金、真实支付凭据或个人信息。后续完整流程中的“应当”均为目标行为，不是本次执行结果。
 
@@ -14,7 +14,7 @@
 
 - 先确认本次目标是开发、测试还是演示环境，明确其独立 Compose 项目、命名卷和数据范围，不借用其他环境的数据或全局共享卷。
 - 按计划核对工具链、数据库和依赖版本；本机工具存在不代表版本符合，也不授权安装或升级。正式测试、构建和 CI 使用同一已批准 Go 工具链，避免隐式工具链切换。
-- 明确应用配置、演示 API key、可信接入方身份、数据库连接信息和访问地址的来源及校验要求；变量名和加载操作待实现确认，不提供默认密钥或免鉴权兜底。
+- 明确应用配置、演示 API key、可信接入方身份、数据库连接信息和访问地址的来源及校验要求；当前变量为`PAYMENT_HUB_CLIENT_ID`、`PAYMENT_HUB_API_KEY`、`PAYMENT_HUB_DATABASE_URL`、`PAYMENT_HUB_HTTP_ADDR`，不提供默认密钥或免鉴权兜底。不要把测试数据库URL原样转交生产入口；测试夹具会从已验证隔离目标重建最小连接配置。
 - 配置、命令输出和归档都不得泄露密钥、`Authorization`、带凭据的连接串或全部环境变量。只使用已校验的关联标识，时间按计划统一 UTC。
 - 应用宿主访问默认仅为 `127.0.0.1:8080`；演示数据库不发布宿主端口。测试数据库确需供宿主访问时，仅使用隔离的回环地址测试端口。
 - 真实镜像部署须先取得已验证的一对应用、迁移镜像摘要，核实来源、平台与拉取权限；不得只凭标签或源码测试绿灯选用另一份产物。
@@ -32,7 +32,7 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
   --artifact-root "$PWD/artifacts"
 ```
 
-- 范围：验证固定迁移工具镜像、安全入口、隔离PG16.15、两次显式迁移、三表约束与事务夹具；显式integration三包的vet/race还实际运行私有观察器、helper和当前应用二进制，核对回环readyz/SIGTERM、坏配置/缺迁移及启动超时/取消/端口占用诊断。当前仅readyz，没有支付提交或查询HTTP入口。
+- 当前范围：验证固定迁移工具镜像、安全入口、隔离PG16.15、两次显式迁移、三表约束与事务夹具；integration四包还运行私有观察器、helper、订单/Mock存储及US1真实应用HTTP/重启。旧readyz-only范围及下列历史计数仅适用于当次快照；当前范围和结果见0.2。
 - `--prepare-images` 明确允许缺失的固定镜像下载/构建；上述命令不下载应用模块。确需补齐模块缓存且已取得许可时另加 `--download-modules`；Goose不进入应用module。工具缺失或版本不符直接失败，不降级工具链或数据库。
 - 每轮新建独立项目/测试数据库/卷，Docker分配仅回环的随机端口。只有显式清理开关且重新核对归属后才删除本次卷，不碰开发/演示资源；省略开关则普通停止保留卷，不使用 `down -v`。
 - stdout提供固定安全摘要，完整报告在 `artifacts/<run_id>/db-foundation.json`，默认保留且不入Git；连接值只注入子进程，原Goose输出在容器内丢弃。日志/报告不包含凭据、原SQL或业务整行。
@@ -44,7 +44,43 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
 
 升级前固定govulncheck v1.9.0扫描发现7个可达ID并退出1，旧红灯保留于`artifacts/ci-hardening/final-validation/`。另获授权后已最小升级quic-go/x/net/x/text及必要闭包，Go1.27.3、Gin、pgx不变；最终同配置source/symbol/integration/test、CGO1扫描退出0，可达0、不可达3。测试参与不等于生产暴露，扫描通过也不保证所有依赖绝对无漏洞。
 
-整改后重新执行默认207根/766子测试及fresh PG run `7c89aa039bcc4149834b1004774c6354` 的4项必需结果均通过，证据在`artifacts/dependency-remediation/final-validation/`。新模块未重跑取消，不能混用旧报告冒充完整远端job。只归档重建的白名单JSON与provenance，不上传原始日志；没有执行远端Actions/实际上传或提交、推送、合并。完整T072/T077、应用镜像、付款流程和发布/CD尚未完成，US1仍暂停。
+依赖整改阶段重新执行默认207根/766子测试及fresh PG run `7c89aa039bcc4149834b1004774c6354` 的4项必需结果均通过，证据在`artifacts/dependency-remediation/final-validation/`；当时US1暂停，此段为历史记录。后续main合并结果与US1恢复另见开发记录和0.2，不沿用历史报告冒充当前分支的远端job。只归档重建的白名单JSON与provenance，不上传原始日志。
+
+### 0.2 当前已验收：US1真实提交、查询与重启
+
+当前正常二进制提供POST `/api/v1/payments`、GET `/api/v1/payments/{payment_id}`、GET `/api/v1/payments?business_order_no=...`，三入口鉴权，`/readyz`独立。详细字段、状态和输入规则仍以[HTTP合同](contracts/http-api.md)为准。
+
+在0.1所列工具与缓存已准备、并已授权隔离测试的前提下，可用以下入口。环境设置只作用于子shell，不更改全局Go配置；不自动安装依赖。镜像准备/本次资源清理的含义同0.1。
+
+```sh
+(
+  set -eu
+  cache="$HOME/.cache/payment-hub"
+  go="$cache/toolchains/go1.27.3/bin/go"
+  export PATH="$(dirname "$go"):$PATH"
+  export GOENV=off GOTOOLCHAIN=local GOWORK=off GOFLAGS=
+  export XDG_CONFIG_HOME="$cache/config" GOPATH="$cache/gopath"
+  export GOMODCACHE="$cache/gomod" GOCACHE="$cache/gobuild"
+  export CGO_ENABLED=1 GOMAXPROCS=2 GOPROXY=off GOSUMDB=off TMPDIR=/tmp/opencode
+  mkdir -p "$PWD/artifacts"
+  root="$(mktemp -d "$PWD/artifacts/us1-local.XXXXXX")"
+  python3 -B scripts/ci_checks.py run-default --go "$go" --report-dir "$root/reports" &&
+  python3 -B scripts/check-db-foundation.py --go "$go" --cache-dir "$cache" \
+    --prepare-images --cleanup-owned-resources --artifact-root "$root/db" &&
+  python3 -B scripts/ci_checks.py export-reports --report-dir "$root/reports" \
+    --db-artifact-root "$root/db" --expect default,db,us1
+)
+```
+
+- 默认门禁为38个必需根＋`TestPaymentRequestBoundary/POST_rejection_priority`焦点子测试，共39项必需检查；数据库入口显式选择`internal/postgres`、`internal/mock`、`tests/harness`、`tests`四包，11项必需结果。普通`go test ./...`不执行integration标签的真实US1测试。整批监督570秒、默认包90秒、integration包120秒，不为本指南放宽；超时后的kill/reap与报告时间不包含在570秒内。
+- 模块缓存准备好后，先运行`python3 -B scripts/check-ci-contract.py --go "$HOME/.cache/payment-hub/toolchains/go1.27.3/bin/go"`；它比较普通/integration两次真实`go list`元数据，拒绝新增integration文件所在包未被数据库启动器选择，并核对清单和工作流合同，不运行数据库或下载模块。嵌套`tests/**/*.go`、`scripts/*.py`、`migrations/*.sql`自动纳入输入清单；新增必需行为仍须维护明确测试绑定，不能仅靠文件扫描。
+- 工作流摘要用`check-ci-contract.py --summary default|db`从常量生成；默认摘要的`package-count`仅指必需项绑定包数，并非实际执行包总数。`CI gate`以`always()`收口三个执行job，只有全部success通过，失败/取消/跳过/缺失结果均失败。源码新增此job不等于远端已注册或成为required check：后续获授权提交/推送并完成首次运行后，仓库管理员须配置分支保护或ruleset要求`CI gate`，再核对实际阻断；本批不修改远端设置，也不启用CD。
+- `tests`包自行构建正常`cmd/payment-hub`，成功/FAILED各用独立实验，经真实POST、两种GET及PG逐列检查；重启场景停止并启动同一二进制，父Observer和数据库跨代保留，核对订单事实不变、付款调用仍1次。非法请求无业务效果，另核对真实TCP的4096接受、4097拒绝、无Content-Length的chunked超限及原始连接拒绝。
+- FAILED仅由可信testmode私有UDS的一次性结果指令建立，绑定实际订单/进程代次/call序号；实际Mock提交结果证明消费，未消费或Seal异常不通过。正常关闭testmode仍默认成功。业务请求不能指定失败，不使用预置FAILED行或另一fixture二进制，不支持本批未验收的“指令＋答复隐藏”组合。
+- 真实报告在`$root/db/<run_id>/us1.json`及受控scenario子目录；上传只使用`$root/reports/upload/`中的`go-default.safe.json`、`db-foundation.safe.json`、`us1.safe.json`和provenance。不要上传原始报文、凭据、DSN、动态SQL或原始工具日志。失败场景的固定阶段诊断不能当PASS。
+- 已独立接受的本机run为`3ed70eb46c0c48e68dc4725d706c66aa`：11/11、六场景PASS、夹具残留0/0/0、105项输入稳定、资源缺席；证据见`artifacts/us1-core/real-us1/acceptance/after-sql-evidence-fix/parent-acceptance.json`。默认38根和untagged vet复用此前已通过且输入未变的结果，不声称该轮重跑。正式PG/US1命令退出0，default/db/us1导出退出0；本轮未重复漏洞扫描或取消实验。
+- CI防漂移合流后的fresh run为`8498488b3ec44d70bdf474fbce08e68a`，11/11、六US1场景及资源清理通过；同期403项Python回归、真实metadata预检、vet、默认39项与安全导出通过，107项源码清单输入稳定。父独立接受记录见`artifacts/ci-code-sync/validation/parent-acceptance.json`；此轮未重跑漏洞扫描或取消实验，不替代远端实际job。
+- 之前的路径、DSN、raw响应解析及SQL证据字段适配失败均保留，不冒充产品行为red；T023最早测试先行证据缺失未补造，任务仍未勾选。US1本地运行验收不等于完整MVP、镜像或远端CI通过；当前未提交、推送、发布或启用CD。
 
 ## 1. 启动数据库
 
@@ -127,10 +163,10 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
 
 | 状态 | 判定依据 | 当前情况 |
 |------|----------|----------|
-| 设计写清楚 | 操作顺序、检查条件与失败边界已记录并评审 | 完整流程仍为设计，0.1为已验证的局部入口 |
-| 命令实际执行成功 | 对应实现存在，有实际命令、退出码及证据 | 仅准备态、基础包及数据库基础已通过；完整应用未执行 |
-| 业务验收通过 | 关键业务断言成立且证据完整，未执行项已披露 | 尚未开始，不能宣称通过 |
+| 设计写清楚 | 操作顺序、检查条件与失败边界已记录并评审 | 已批准设计；0.1/0.2区分历史基础与当前US1 |
+| 命令实际执行成功 | 对应实现存在，有实际命令、退出码及证据 | 基础与US1宿主正常二进制/真实PG/HTTP/重启已通过；镜像未验收 |
+| 业务验收通过 | 关键业务断言成立且证据完整，未执行项已披露 | US1本地运行范围通过；T023历史缺证保留，US2/US3及完整MVP未通过 |
 
-后续实施仍须补齐应用配置及安全加载、业务命令、配对应用镜像与发布CI等，并按影响范围保留实际结果。不得把数据库基础入口当作“一条命令运行完整支付”的交付。
+后续US2/US3、配对应用镜像及发布流程须另获授权、分别实施验收。不得把US1本机绿灯当作完整MVP、当前分支远端CI或部署产物已通过。
 
 本文件不授权安装、启动、迁移、构建、测试、发布、清理数据、创建外部资源、Git 提交或推送，也不授权进入 tasks 或 implement；实际执行仍需相应授权。
