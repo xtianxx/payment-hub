@@ -41,6 +41,46 @@ type PaymentResultControl interface {
 	PaymentEntryResult(context.Context, payment.PaymentOrderID) (PaymentEntryOutcome, error)
 }
 
+// QueryScenario is the closed set of trusted query-control scenarios.
+type QueryScenario string
+
+const (
+	QueryScenarioNormal              QueryScenario = "normal"
+	QueryScenarioFailure             QueryScenario = "failure"
+	QueryScenarioSubtimeout          QueryScenario = "subtimeout"
+	QueryScenarioNotVisible          QueryScenario = "notvisible"
+	QueryScenarioMismatchReference   QueryScenario = "mismatch_reference"
+	QueryScenarioMismatchAmount      QueryScenario = "mismatch_amount"
+	QueryScenarioMismatchCurrency    QueryScenario = "mismatch_currency"
+	QueryScenarioMismatchTransaction QueryScenario = "mismatch_transaction"
+)
+
+// QueryOutcome is the closed set of outcomes actually reached by one query.
+type QueryOutcome string
+
+const (
+	QueryOutcomeFound           QueryOutcome = "found"
+	QueryOutcomeNotFound        QueryOutcome = "not_found"
+	QueryOutcomeUnavailable     QueryOutcome = "unavailable"
+	QueryOutcomeSubtimeout      QueryOutcome = "subtimeout"
+	QueryOutcomeMismatchApplied QueryOutcome = "mismatch_applied"
+)
+
+// QueryEntryOutcome is one per-query scenario plus the callback proving the
+// outcome actually reached. OnApplied must be non-nil and is called exactly
+// once with the branch result, never with an expected scenario value.
+type QueryEntryOutcome struct {
+	Scenario  QueryScenario
+	OnApplied func(context.Context, QueryOutcome) error
+}
+
+// QueryResultControl is the optional trusted-test-mode extension for one query
+// scenario. A Control that implements it is observed only through
+// QueryEntryResult, not through the legacy QueryEntry method.
+type QueryResultControl interface {
+	QueryEntryResult(context.Context, payment.PaymentOrderID) (QueryEntryOutcome, error)
+}
+
 // Hooks forwards mock observation points to an optional Control. The zero value
 // and nil Control are safe no-ops.
 type Hooks struct {
@@ -126,6 +166,73 @@ func normalizeCommittedCallbackError(err error) error {
 }
 
 func noopCommitted(context.Context, payment.Result) error {
+	return nil
+}
+
+// QueryEntryResult performs the precommit query-entry observation and returns
+// the selected scenario plus the applied-proof callback. A nil/zero Hooks
+// returns the normal scenario with a non-nil no-op callback. A legacy Control
+// is called exactly once through QueryEntry; an optional QueryResultControl is
+// used exclusively.
+func (h *Hooks) QueryEntryResult(ctx context.Context, order payment.PaymentOrderID) (QueryEntryOutcome, error) {
+	if h == nil || isNilControl(h.control) {
+		return QueryEntryOutcome{Scenario: QueryScenarioNormal, OnApplied: noopQueryApplied}, nil
+	}
+
+	if optional, ok := h.control.(QueryResultControl); ok {
+		outcome, err := optional.QueryEntryResult(ctx, order)
+		if err != nil {
+			return QueryEntryOutcome{}, ErrControlFault
+		}
+		return normalizeQueryEntryOutcome(outcome)
+	}
+
+	if err := h.control.QueryEntry(ctx, order); err != nil {
+		return QueryEntryOutcome{}, ErrControlFault
+	}
+	return QueryEntryOutcome{Scenario: QueryScenarioNormal, OnApplied: noopQueryApplied}, nil
+}
+
+func normalizeQueryEntryOutcome(outcome QueryEntryOutcome) (QueryEntryOutcome, error) {
+	if !validQueryScenario(outcome.Scenario) || outcome.OnApplied == nil {
+		return QueryEntryOutcome{}, ErrControlFault
+	}
+	callback := outcome.OnApplied
+	outcome.OnApplied = func(ctx context.Context, actual QueryOutcome) error {
+		if !validQueryOutcome(actual) {
+			return ErrControlFault
+		}
+		if err := callback(ctx, actual); err != nil {
+			return ErrControlFault
+		}
+		return nil
+	}
+	return outcome, nil
+}
+
+func validQueryScenario(value QueryScenario) bool {
+	switch value {
+	case QueryScenarioNormal, QueryScenarioFailure, QueryScenarioSubtimeout,
+		QueryScenarioNotVisible, QueryScenarioMismatchReference,
+		QueryScenarioMismatchAmount, QueryScenarioMismatchCurrency,
+		QueryScenarioMismatchTransaction:
+		return true
+	default:
+		return false
+	}
+}
+
+func validQueryOutcome(value QueryOutcome) bool {
+	switch value {
+	case QueryOutcomeFound, QueryOutcomeNotFound, QueryOutcomeUnavailable,
+		QueryOutcomeSubtimeout, QueryOutcomeMismatchApplied:
+		return true
+	default:
+		return false
+	}
+}
+
+func noopQueryApplied(context.Context, QueryOutcome) error {
 	return nil
 }
 
