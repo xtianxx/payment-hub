@@ -1,5 +1,7 @@
 # 运行与验证指南：模拟商城一次性 Mock 支付闭环
 
+**Go安全补丁整改已本机接受（2026-11-11）**：PR #8的标准库`GO-2026-6859`通过固定Go1.27.4最小升级消除。独立复扫可达0、未可达3；538项Python、默认55、DB24/四包、US1六/US2八/US3二十四场景、取消门禁及七类严格安全导出通过，夹具最终`[0,0,0]`且隔离资源已清理。证据见`artifacts/go-1.27.4-remediation/parent-acceptance.json`。业务依赖、go.sum、扫描阻断和预算不变；历史Go1.27.3记录保留。未提交、推送或合并，远端CI须推送后另验，不把本机通过称为远端绿灯。
+
 **四项审查修复已本机接受（2026-11-11）**：当前结果见0.5及`artifacts/us3/review-fixes/parent-acceptance.json`。下文0.4与原接受记录保留为先前快照，不用旧run代替新增接缝验证；原审查及失败证据不删除。
 
 **Status**: US1/US2 merged; US3 review fixes locally accepted — US3 T054–T069及最终四项审查修复的本机验证通过；可执行入口沿用0.4，当前计数及证据以0.5为准。历史证据限制、T070+、应用镜像、发布/CD及远端CI边界不变；未提交、推送或合并。
@@ -24,11 +26,11 @@
 
 ### 0.1 当前可执行：数据库与运行基础验证
 
-已有Go1.27.3、C编译器、Python3、本地Docker unix daemon及Compose后，从仓库根运行。以下工具链/缓存路径对应已核实的本机准备，不授权在其他机器自动安装；其他机器传入已准备Go的绝对路径与仓库外缓存路径。`/tmp/opencode` 为本机已存在的临时目录，其他环境可使用其受控临时目录。
+已有Go1.27.4、C编译器、Python3、本地Docker unix daemon及Compose后，从仓库根运行。以下工具链/缓存路径对应本轮已核实的本机准备，不授权在其他机器自动安装；其他机器传入已准备Go的绝对路径与仓库外缓存路径。`/tmp/opencode` 为本机已存在的临时目录，其他环境可使用其受控临时目录。
 
 ```sh
 TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
-  --go "$HOME/.cache/payment-hub/toolchains/go1.27.3/bin/go" \
+  --go "$HOME/.cache/payment-hub/toolchains/go1.27.4/bin/go" \
   --cache-dir "$HOME/.cache/payment-hub" \
   --prepare-images --cleanup-owned-resources \
   --artifact-root "$PWD/artifacts"
@@ -58,7 +60,7 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
 (
   set -eu
   cache="$HOME/.cache/payment-hub"
-  go="$cache/toolchains/go1.27.3/bin/go"
+  go="$cache/toolchains/go1.27.4/bin/go"
   export PATH="$(dirname "$go"):$PATH"
   export GOENV=off GOTOOLCHAIN=local GOWORK=off GOFLAGS=
   export XDG_CONFIG_HOME="$cache/config" GOPATH="$cache/gopath"
@@ -76,7 +78,7 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
 ```
 
 - US1合并时默认门禁为38个必需根＋R1焦点子测试，共39项；DB四包、11项。本批US2接线后的当前清单为40个根＋2个焦点子测试，共42项，DB仍选择`internal/postgres`、`internal/mock`、`tests/harness`、`tests`四包，增加至18项；这些是必需项而非全套测试总数，执行结果须以当前合流验收为准。普通`go test ./...`不执行integration标签的真实故事测试。整批监督570秒、默认包90秒、integration包120秒不变；超时后的kill/reap与报告时间不包含在570秒内。
-- 模块缓存准备好后，先运行`python3 -B scripts/check-ci-contract.py --go "$HOME/.cache/payment-hub/toolchains/go1.27.3/bin/go"`；它比较普通/integration两次真实`go list`元数据，拒绝新增integration文件所在包未被数据库启动器选择，并核对清单和工作流合同，不运行数据库或下载模块。嵌套`tests/**/*.go`、`scripts/*.py`、`migrations/*.sql`自动纳入输入清单；新增必需行为仍须维护明确测试绑定，不能仅靠文件扫描。
+- 模块缓存准备好后，先运行`python3 -B scripts/check-ci-contract.py --go "$HOME/.cache/payment-hub/toolchains/go1.27.4/bin/go"`；它比较普通/integration两次真实`go list`元数据，拒绝新增integration文件所在包未被数据库启动器选择，并核对清单和工作流合同，不运行数据库或下载模块。嵌套`tests/**/*.go`、`scripts/*.py`、`migrations/*.sql`自动纳入输入清单；新增必需行为仍须维护明确测试绑定，不能仅靠文件扫描。
 - 工作流摘要用`check-ci-contract.py --summary default|db`从常量生成；默认摘要的`package-count`仅指必需项绑定包数，并非实际执行包总数。`CI gate`以`always()`收口三个执行job，只有全部success通过，失败/取消/跳过/缺失结果均失败。源码新增此job不等于远端已注册或成为required check：后续获授权提交/推送并完成首次运行后，仓库管理员须配置分支保护或ruleset要求`CI gate`，再核对实际阻断；本批不修改远端设置，也不启用CD。
 - `tests`包自行构建正常`cmd/payment-hub`，成功/FAILED各用独立实验，经真实POST、两种GET及PG逐列检查；重启场景停止并启动同一二进制，父Observer和数据库跨代保留，核对订单事实不变、付款调用仍1次。非法请求无业务效果，另核对真实TCP的4096接受、4097拒绝、无Content-Length的chunked超限及原始连接拒绝。
 - FAILED仅由可信testmode私有UDS的一次性结果指令建立，绑定实际订单/进程代次/call序号；实际Mock提交结果证明消费，未消费或Seal异常不通过。正常关闭testmode仍默认成功。业务请求不能指定失败，不使用预置FAILED行或另一fixture二进制，不支持本批未验收的“指令＋答复隐藏”组合。
@@ -110,7 +112,7 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
 (
 set -eu
 cache="$HOME/.cache/payment-hub"
-go="$cache/toolchains/go1.27.3/bin/go"
+go="$cache/toolchains/go1.27.4/bin/go"
 export PATH="$(dirname "$go"):$PATH"
 export GOENV=off GOTOOLCHAIN=local GOWORK=off GOFLAGS= GOTELEMETRY=off
 export XDG_CONFIG_HOME="$cache/config" GOPATH="$cache/gopath"

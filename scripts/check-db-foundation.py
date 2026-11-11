@@ -52,7 +52,7 @@ _CI_CHECKS_SPEC = importlib.util.spec_from_file_location(
 ci_checks = importlib.util.module_from_spec(_CI_CHECKS_SPEC)
 _CI_CHECKS_SPEC.loader.exec_module(ci_checks)
 
-EXPECTED_GO_VERSION = "go1.27.3"
+EXPECTED_GO_VERSION = "go1.27.4"
 EXPECTED_GOOS = "linux"
 EXPECTED_GOARCH = "amd64"
 EXPECTED_GOTOOLCHAIN = "local"
@@ -62,7 +62,7 @@ EXPECTED_PG_VERSION = "16.15"
 EXPECTED_GOOSE_VERSION = "goose version: v3.29.0"
 
 EXPECTED_MODULE = "payment-hub"
-EXPECTED_GO_DIRECTIVE = "1.27.3"
+EXPECTED_GO_DIRECTIVE = "1.27.4"
 APPROVED_DIRECT = {
     "github.com/gin-gonic/gin": "v1.12.0",
     "github.com/jackc/pgx/v5": "v5.11.0",
@@ -73,8 +73,8 @@ POSTGRES_IMAGE = (
     "@sha256:5983db9a9c6ad225a48a46cfe2e03e6680b1826662befd0465eb05b34cb1c64e"
 )
 GO_BUILDER_IMAGE = (
-    "docker.io/library/golang:1.27.3-bookworm"
-    "@sha256:025eefc1e8dbe63201734a72aaa0a55d7a077f2d8410432f8ae2f3e939f32871"
+    "docker.io/library/golang:1.27.4-bookworm"
+    "@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea"
 )
 MIGRATION_RUNTIME_IMAGE = (
     "docker.io/library/debian:bookworm-slim"
@@ -3112,7 +3112,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--go",
         required=True,
-        help="Absolute path to the existing Go 1.27.3 executable; never installs.",
+        help="Absolute path to the existing Go 1.27.4 executable; never installs.",
     )
     parser.add_argument(
         "--cache-dir",

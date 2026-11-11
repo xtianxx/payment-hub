@@ -39,7 +39,7 @@ TOOL_PACKAGE = "golang.org/x/vuln/cmd/govulncheck"
 TOOL_VERSION = "v1.9.0"
 TOOL_COMMIT = "e672cbe8fbc8c76e28fcb6db0efd9ce354e0dac5"
 
-EXPECTED_GO_VERSION = "go1.27.3"
+EXPECTED_GO_VERSION = "go1.27.4"
 EXPECTED_GOOS = "linux"
 EXPECTED_GOARCH = "amd64"
 EXPECTED_CGO_ENABLED = "1"
@@ -301,7 +301,9 @@ def _verify_go(go_path: Path, work_dir: Path, env: Mapping[str, str]) -> str:
     except (CommandTimeout, CommandOSError):
         raise CheckFailure("go_toolchain_mismatch") from None
     output = (result.stdout or "").strip()
-    match = re.match(r"^go version (go1\.27\.3)(?:\s|$)", output)
+    match = re.match(
+        rf"^go version ({re.escape(EXPECTED_GO_VERSION)})(?:\s|$)", output
+    )
     if result.returncode != 0 or match is None:
         raise CheckFailure("go_toolchain_mismatch")
     return match.group(1)
@@ -325,9 +327,20 @@ def _verify_tool(
     if result.returncode != 0:
         raise CheckFailure("tool_version_mismatch")
 
+    lines = (result.stdout or "").splitlines()
+    if not lines:
+        raise CheckFailure("tool_version_mismatch")
+    tool_prefix, separator, build_go = lines[0].rpartition(": ")
+    if (
+        not separator
+        or build_go != EXPECTED_GO_VERSION
+        or tool_prefix != str(tool_path)
+    ):
+        raise CheckFailure("tool_version_mismatch")
+
     path_ok = False
     module_ok = False
-    for line in (result.stdout or "").splitlines():
+    for line in lines[1:]:
         if re.match(
             r"^\s*path\s+golang\.org/x/vuln/cmd/govulncheck\s*$", line
         ):

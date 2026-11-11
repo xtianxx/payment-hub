@@ -1,5 +1,7 @@
 # Implementation Plan: 模拟商城一次性 Mock 支付闭环
 
+**当前工具链安全补丁范围**：用户已批准为`GO-2026-6859`将固定Go升级到1.27.4，迁移builder摘要同步，业务require版本及go.sum不变。下文旧Go1.27.3与历史run记录保留；本轮复验在`artifacts/go-1.27.4-remediation/`独立取证，不自动升级其它依赖或放宽门禁。
+
 **四项审查修复已收口（2026-11-11）**：Submit/HTTP生产接缝、重启核实必需证明及v1原始ACK严格性已取得反例回归、独立复核与fresh PG接受；权威记录为`artifacts/us3/review-fixes/parent-acceptance.json`。先前接受及本轮夹具残留失败均保留，不用旧绿灯替代本轮验证；资格、依赖、期限和T070+边界未扩大。
 
 **Branch**: `001-mock-payment` | **Date**: 2026-11-06 | **Spec**: [spec.md](spec.md)

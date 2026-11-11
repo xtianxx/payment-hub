@@ -49,7 +49,7 @@ CANCELLATION_CLEANUP_RESULTS = frozenset(
     {"pass", "fail", "skipped", "unknown"}
 )
 CANCELLATION_PASS_FAILURE = {"stage": "interrupted", "kind": "sigterm"}
-EXPECTED_VULNERABILITY_GO = "go1.27.3"
+EXPECTED_VULNERABILITY_GO = "go1.27.4"
 GO_ID_RE = re.compile(r"^GO-[0-9]{4}-[0-9]{4,}$")
 FAILURE_CLASS_RE = re.compile(r"^[a-z0-9_-]{1,80}$")
 REPORT_FILENAMES = {

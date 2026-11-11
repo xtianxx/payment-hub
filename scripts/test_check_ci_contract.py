@@ -185,7 +185,7 @@ class WorkflowContractTests(unittest.TestCase):
         for job_id in ("setup-check", "database-foundation", "vulnerability-check"):
             for step in _steps(self.workflow, job_id):
                 if step.get("uses") == SETUP_GO:
-                    self.assertEqual(step["with"]["go-version"], "1.27.3")
+                    self.assertEqual(step["with"]["go-version"], "1.27.4")
 
     def test_preflight_is_after_setup_and_before_foundation_units(self):
         names = [step.get("name") for step in _steps(self.workflow, "setup-check")]

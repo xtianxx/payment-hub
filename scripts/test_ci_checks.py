@@ -1362,6 +1362,9 @@ class DefaultInventoryTests(unittest.TestCase):
             getattr(MOD, "GO_TEST_BATCH_TIMEOUT_SECONDS", None), 570
         )
 
+    def test_vulnerability_go_pin_is_1_27_4(self):
+        self.assertEqual(MOD.EXPECTED_VULNERABILITY_GO, "go1.27.4")
+
     def test_proc_result_has_optional_trailing_wait_elapsed(self):
         self.assertIn("wait_elapsed_seconds", MOD.ProcResult._fields)
         self.assertEqual(
@@ -3088,7 +3091,7 @@ class ExportReportsTests(unittest.TestCase):
                 "compose_down_exit": 0,
             },
             "versions": {
-                "go": "go1.27.3",
+                "go": "go1.27.4",
                 "postgres": "16.15",
                 "goose": "v3.29.0",
             },
@@ -7992,8 +7995,8 @@ class ExportReportsTests(unittest.TestCase):
                 "commit": "e672cbe8fbc8c76e28fcb6db0efd9ce354e0dac5",
             },
             "tool_verified": trusted,
-            "expected_go_version": "go1.27.3",
-            "go_version": "go1.27.3" if trusted else None,
+            "expected_go_version": "go1.27.4",
+            "go_version": "go1.27.4" if trusted else None,
             "source_hash": {
                 "go.mod": "b" * 64,
                 "go.sum": "c" * 64,

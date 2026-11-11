@@ -2198,6 +2198,18 @@ class SharedSetupLauncherConfigurationTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertEqual(launcher_value, setup_value)
 
+    def test_go_1_27_4_pins_and_verified_builder_digest(self):
+        self.assertEqual(MOD.EXPECTED_GO_VERSION, "go1.27.4")
+        self.assertEqual(SETUP_MOD.EXPECTED_GO_VERSION, "go1.27.4")
+        self.assertEqual(MOD.EXPECTED_GO_DIRECTIVE, "1.27.4")
+        self.assertEqual(SETUP_MOD.EXPECTED_GO_DIRECTIVE, "1.27.4")
+        self.assertEqual(
+            MOD.GO_BUILDER_IMAGE,
+            "docker.io/library/golang:1.27.4-bookworm"
+            "@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea",
+        )
+        self.assertNotIn("1.27.3", MOD.GO_BUILDER_IMAGE)
+
 
 class SetupWorkflowBatchBudgetTests(unittest.TestCase):
     """Static PyYAML and bash -n checks for the frozen workflow contract."""
