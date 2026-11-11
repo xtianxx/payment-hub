@@ -108,10 +108,30 @@ EXPECTED_US2_DEFAULT_REQUIRED = {
     "TestPaymentSubmitConflictPriority": PAYMENT,
     US2_FOCUS_SUBTEST: HTTPAPI,
 }
+# US3 default additions frozen by the parent in this order. The roots cover
+# payment reconciliation/trace/cancellation, observation retry semantics,
+# query-scenario protocol/client/consumer wiring, and observer query-directive
+# plus controlled-termination safety.
+EXPECTED_US3_DEFAULT_REQUIRED = {
+    "TestPaymentReconciliation": PAYMENT,
+    "TestQueryTraceFailureProtection": PAYMENT,
+    "TestPaymentCancellationBounds": PAYMENT,
+    "TestObservationRecordRetrySemantics": POSTGRES,
+    "TestQueryScenarioProtocol": TESTCONTROL,
+    "TestQueryScenarioClient": TESTCONTROL,
+    "TestMockQueryScenarios": MOCK,
+    "TestQueryScenarioAdapter": APP,
+    "TestObserverQueryDirectiveSafety": HARNESS,
+    "TestControlledTerminationProof": HARNESS,
+    "TestNextCommittedPointBarrier": HARNESS,
+    "TestSubmitTraceFailureProtection": PAYMENT,
+    "TestTraceSaveIssueVariants": HTTPAPI,
+}
 EXPECTED_DEFAULT_REQUIRED_TOTAL = {
     **EXPECTED_DEFAULT_REQUIRED,
     **EXPECTED_US1_DEFAULT_REQUIRED,
     **EXPECTED_US2_DEFAULT_REQUIRED,
+    **EXPECTED_US3_DEFAULT_REQUIRED,
 }
 
 PAYMENT_DIRECTIVE_DEFAULT_ROOTS = (
@@ -143,6 +163,12 @@ EXPECTED_DB_REQUIRED = {
     "TestUS2Concurrency": TESTS,
     "TestUS2Restart": TESTS,
     "TestUS2ReportSafety": TESTS,
+    "TestObservationFaultIntegration": POSTGRES,
+    "TestUS3Query": TESTS,
+    "TestUS3Protection": TESTS,
+    "TestUS3Restart": TESTS,
+    "TestUS3Lifecycle": TESTS,
+    "TestUS3ReportSafety": TESTS,
 }
 EXPECTED_PR3_DB_REQUIRED = {
     name: package
@@ -1064,13 +1090,20 @@ class DefaultInventoryTests(unittest.TestCase):
             EXPECTED_US2_DEFAULT_REQUIRED,
         )
         self.assertEqual(
+            {
+                name: MOD.DEFAULT_REQUIRED_TESTS.get(name)
+                for name in EXPECTED_US3_DEFAULT_REQUIRED
+            },
+            EXPECTED_US3_DEFAULT_REQUIRED,
+        )
+        self.assertEqual(
             MOD.DEFAULT_REQUIRED_TESTS, EXPECTED_DEFAULT_REQUIRED_TOTAL
         )
         self.assertEqual(
             len(MOD.DEFAULT_REQUIRED_TESTS),
             len(EXPECTED_DEFAULT_REQUIRED_TOTAL),
         )
-        self.assertEqual(len(EXPECTED_DEFAULT_REQUIRED_TOTAL), 42)
+        self.assertEqual(len(EXPECTED_DEFAULT_REQUIRED_TOTAL), 55)
         roots = {
             name.split("/", 1)[0]
             for name in MOD.DEFAULT_REQUIRED_TESTS
@@ -1080,7 +1113,7 @@ class DefaultInventoryTests(unittest.TestCase):
             for name in EXPECTED_DEFAULT_REQUIRED_TOTAL
         }
         self.assertEqual(roots, expected_roots)
-        self.assertEqual(len(roots), 40)
+        self.assertEqual(len(roots), 53)
         subtests = [
             name
             for name in MOD.DEFAULT_REQUIRED_TESTS
@@ -1125,6 +1158,70 @@ class DefaultInventoryTests(unittest.TestCase):
         for name in EXPECTED_US2_DEFAULT_REQUIRED:
             with self.subTest(name=name):
                 self.assertNotIn(name, MOD.DB_REQUIRED_TEST_KEYS)
+
+    def test_us3_default_roots_bind_to_exact_packages(self):
+        self.assertEqual(
+            tuple(EXPECTED_US3_DEFAULT_REQUIRED),
+            (
+                "TestPaymentReconciliation",
+                "TestQueryTraceFailureProtection",
+                "TestPaymentCancellationBounds",
+                "TestObservationRecordRetrySemantics",
+                "TestQueryScenarioProtocol",
+                "TestQueryScenarioClient",
+                "TestMockQueryScenarios",
+                "TestQueryScenarioAdapter",
+                "TestObserverQueryDirectiveSafety",
+                "TestControlledTerminationProof",
+                "TestNextCommittedPointBarrier",
+                "TestSubmitTraceFailureProtection",
+                "TestTraceSaveIssueVariants",
+            ),
+        )
+        for name, package in EXPECTED_US3_DEFAULT_REQUIRED.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    MOD.DEFAULT_REQUIRED_TESTS.get(name), package
+                )
+                self.assertNotIn(name, MOD.DB_REQUIRED_TEST_KEYS)
+        for name in (
+            "TestPaymentReconciliation",
+            "TestQueryTraceFailureProtection",
+            "TestPaymentCancellationBounds",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    MOD.DEFAULT_REQUIRED_TESTS.get(name), PAYMENT
+                )
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get(
+                "TestObservationRecordRetrySemantics"
+            ),
+            POSTGRES,
+        )
+        for name in (
+            "TestQueryScenarioProtocol",
+            "TestQueryScenarioClient",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    MOD.DEFAULT_REQUIRED_TESTS.get(name), TESTCONTROL
+                )
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get("TestMockQueryScenarios"), MOCK
+        )
+        self.assertEqual(
+            MOD.DEFAULT_REQUIRED_TESTS.get("TestQueryScenarioAdapter"), APP
+        )
+        for name in (
+            "TestObserverQueryDirectiveSafety",
+            "TestControlledTerminationProof",
+            "TestNextCommittedPointBarrier",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    MOD.DEFAULT_REQUIRED_TESTS.get(name), HARNESS
+                )
 
     def test_default_required_covers_d1_d2_and_helper(self):
         for name in (
@@ -1191,7 +1288,7 @@ class DefaultInventoryTests(unittest.TestCase):
                 self.assertIn(name, MOD.DB_REQUIRED_TEST_KEYS)
                 self.assertNotIn(name, MOD.DEFAULT_REQUIRED_TESTS)
 
-    def test_db_required_keys_are_the_eighteen_explicit_bindings(self):
+    def test_db_required_keys_are_the_twenty_four_explicit_bindings(self):
         self.assertEqual(
             MOD.DB_REQUIRED_TEST_KEYS,
             (
@@ -1213,11 +1310,18 @@ class DefaultInventoryTests(unittest.TestCase):
                 "TestUS2Concurrency",
                 "TestUS2Restart",
                 "TestUS2ReportSafety",
+                "TestObservationFaultIntegration",
+                "TestUS3Query",
+                "TestUS3Protection",
+                "TestUS3Restart",
+                "TestUS3Lifecycle",
+                "TestUS3ReportSafety",
             ),
         )
         self.assertEqual(
             tuple(MOD.DB_REQUIRED_TEST_KEYS), tuple(EXPECTED_DB_REQUIRED)
         )
+        self.assertEqual(len(MOD.DB_REQUIRED_TEST_KEYS), 24)
 
     def test_db_required_keys_are_the_eleven_explicit_bindings(self):
         # Historical 11-entry subset remains the exact prefix of the frozen
@@ -1244,12 +1348,22 @@ class DefaultInventoryTests(unittest.TestCase):
             MOD.SAFE_FILENAMES.get("us2"), "us2.safe.json"
         )
 
+    def test_us3_safe_report_kind_is_registered(self):
+        self.assertIn("us3", MOD.EXPECT_NAMES)
+        self.assertEqual(MOD.REPORT_FILENAMES.get("us3"), "us3.json")
+        self.assertEqual(
+            MOD.SAFE_FILENAMES.get("us3"), "us3.safe.json"
+        )
+
     def test_shared_batch_timeout_constant_is_570(self):
         # One shared whole-batch budget; the 180+360+30 split is capacity
         # planning only and must not become staged reservations.
         self.assertEqual(
             getattr(MOD, "GO_TEST_BATCH_TIMEOUT_SECONDS", None), 570
         )
+
+    def test_vulnerability_go_pin_is_1_27_4(self):
+        self.assertEqual(MOD.EXPECTED_VULNERABILITY_GO, "go1.27.4")
 
     def test_proc_result_has_optional_trailing_wait_elapsed(self):
         self.assertIn("wait_elapsed_seconds", MOD.ProcResult._fields)
@@ -1302,10 +1416,24 @@ class DefaultInventoryTests(unittest.TestCase):
         self.assertEqual(
             EXPECTED_DB_REQUIRED["TestMockIdempotencyIntegration"], MOCK
         )
+        self.assertEqual(
+            EXPECTED_DB_REQUIRED["TestObservationFaultIntegration"], POSTGRES
+        )
+        for name in (
+            "TestUS3Query",
+            "TestUS3Protection",
+            "TestUS3Restart",
+            "TestUS3Lifecycle",
+            "TestUS3ReportSafety",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(EXPECTED_DB_REQUIRED[name], TESTS)
+                self.assertNotEqual(EXPECTED_DB_REQUIRED[name], HARNESS)
+                self.assertIn(name, MOD.DB_REQUIRED_TEST_KEYS)
 
 
 class DbRequiredParserTests(unittest.TestCase):
-    """Parser-level DB launcher inventory for the eighteen explicit bindings."""
+    """Parser-level DB launcher inventory for the twenty-four explicit bindings."""
 
     def parse(self, stdout, required=None):
         mapping = {
@@ -1326,7 +1454,7 @@ class DbRequiredParserTests(unittest.TestCase):
             (POSTGRES, MOCK, HARNESS, TESTS), EXPECTED_DB_REQUIRED
         )
 
-    def test_full_eighteen_binding_stream_is_green(self):
+    def test_full_twenty_four_binding_stream_is_green(self):
         result = self.parse(self.full_stream())
         self.assertEqual(result["problems"], [])
         self.assertEqual(
@@ -1376,6 +1504,12 @@ class DbRequiredParserTests(unittest.TestCase):
             "TestUS2Concurrency",
             "TestUS2Restart",
             "TestUS2ReportSafety",
+            "TestObservationFaultIntegration",
+            "TestUS3Query",
+            "TestUS3Protection",
+            "TestUS3Restart",
+            "TestUS3Lifecycle",
+            "TestUS3ReportSafety",
         ):
             with self.subTest(target=target):
                 result = self.parse(
@@ -1483,6 +1617,93 @@ class DbRequiredParserTests(unittest.TestCase):
                 )
                 self.assertNotEqual(package, HARNESS)
 
+    def test_us3_db_bindings_are_exact(self):
+        for name, package in (
+            ("TestObservationFaultIntegration", POSTGRES),
+            ("TestUS3Query", TESTS),
+            ("TestUS3Protection", TESTS),
+            ("TestUS3Restart", TESTS),
+            ("TestUS3Lifecycle", TESTS),
+            ("TestUS3ReportSafety", TESTS),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(EXPECTED_DB_REQUIRED[name], package)
+                self.assertIn(name, MOD.DB_REQUIRED_TEST_KEYS)
+                self.assertEqual(
+                    MOD.DB_REQUIRED_TEST_KEYS[
+                        MOD.DB_REQUIRED_TEST_KEYS.index(name)
+                    ],
+                    name,
+                )
+                self.assertNotEqual(package, HARNESS)
+
+    def test_us3_db_roots_mutations_are_not_green(self):
+        targets = (
+            "TestObservationFaultIntegration",
+            "TestUS3Query",
+            "TestUS3Protection",
+            "TestUS3Restart",
+            "TestUS3Lifecycle",
+            "TestUS3ReportSafety",
+        )
+        for target in targets:
+            package = EXPECTED_DB_REQUIRED[target]
+            with self.subTest(target=target, mutation="missing"):
+                result = self.parse(
+                    without_test_events(self.full_stream(), target)
+                )
+                self.assertEqual(
+                    result["required_test_results"].get(target), "missing"
+                )
+                self.assertIn("required-test-missing", result["problems"])
+            for action in ("skip", "fail"):
+                with self.subTest(target=target, mutation=action):
+                    result = self.parse(
+                        replace_test_terminal(
+                            self.full_stream(), package, target, action
+                        )
+                    )
+                    self.assertEqual(
+                        result["required_test_results"].get(target), action
+                    )
+                    self.assertIn(
+                        "required-test-" + action, result["problems"]
+                    )
+            with self.subTest(target=target, mutation="wrong-package"):
+                wrong_package = HARNESS if package != HARNESS else APP
+                stdout = without_test_events(self.full_stream(), target)
+                stdout += event("run", wrong_package, target)
+                stdout += event("pass", wrong_package, target, elapsed=0.01)
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target),
+                    "wrong-package",
+                )
+                self.assertIn(
+                    "required-test-wrong-package", result["problems"]
+                )
+            with self.subTest(target=target, mutation="duplicate"):
+                stdout = self.full_stream()
+                stdout += event("run", package, target)
+                stdout += event("pass", package, target, elapsed=0.01)
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target), "duplicate"
+                )
+            with self.subTest(target=target, mutation="output-spoof"):
+                stdout = without_test_events(self.full_stream(), target)
+                stdout += event(
+                    "output",
+                    package,
+                    test=target,
+                    output="--- PASS: " + target + " (0.00s)\n",
+                )
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target), "missing"
+                )
+                self.assertIn("required-test-missing", result["problems"])
+
     def test_us2_db_roots_skip_and_fail_are_not_green(self):
         for target in (
             "TestOrderRegistrationConcurrencyIntegration",
@@ -1580,7 +1801,16 @@ class DbRequiredParserTests(unittest.TestCase):
 class Us2DefaultRequiredParserTests(unittest.TestCase):
     """Parser-level default inventory for the three frozen US2 additions."""
 
-    PACKAGES = (APP, HARNESS, CMD, PAYMENT, HTTPAPI, MOCK, TESTCONTROL)
+    PACKAGES = (
+        APP,
+        HARNESS,
+        CMD,
+        PAYMENT,
+        HTTPAPI,
+        MOCK,
+        TESTCONTROL,
+        POSTGRES,
+    )
 
     def parse(self, stdout):
         return MOD.parse_go_test_json(
@@ -1595,7 +1825,7 @@ class Us2DefaultRequiredParserTests(unittest.TestCase):
     def full_stream(self):
         return default_stream(self.PACKAGES, MOD.DEFAULT_REQUIRED_TESTS)
 
-    def test_full_forty_two_binding_stream_is_green(self):
+    def test_full_fifty_five_binding_stream_is_green(self):
         result = self.parse(self.full_stream())
         self.assertEqual(result["problems"], [])
         self.assertEqual(
@@ -1677,6 +1907,110 @@ class Us2DefaultRequiredParserTests(unittest.TestCase):
                 self.assertIn("required-test-missing", result["problems"])
 
 
+class Us3DefaultRequiredParserTests(unittest.TestCase):
+    """Parser-level default inventory for the eleven frozen US3 additions."""
+
+    PACKAGES = (
+        APP,
+        HARNESS,
+        CMD,
+        PAYMENT,
+        HTTPAPI,
+        MOCK,
+        TESTCONTROL,
+        POSTGRES,
+    )
+
+    def parse(self, stdout):
+        return MOD.parse_go_test_json(
+            stdout,
+            "",
+            0,
+            self.PACKAGES,
+            MOD.DEFAULT_REQUIRED_TESTS,
+            allowed_no_test_files=(CMD,),
+        )
+
+    def full_stream(self):
+        return default_stream(self.PACKAGES, MOD.DEFAULT_REQUIRED_TESTS)
+
+    def test_full_fifty_five_binding_stream_is_green(self):
+        result = self.parse(self.full_stream())
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(
+            set(result["required_test_results"]),
+            set(EXPECTED_DEFAULT_REQUIRED_TOTAL),
+        )
+
+    def test_us3_default_roots_missing_skip_fail_are_not_green(self):
+        for target in EXPECTED_US3_DEFAULT_REQUIRED:
+            package = EXPECTED_US3_DEFAULT_REQUIRED[target]
+            with self.subTest(target=target, mutation="missing"):
+                result = self.parse(
+                    without_test_events(self.full_stream(), target)
+                )
+                self.assertEqual(
+                    result["required_test_results"].get(target), "missing"
+                )
+                self.assertIn("required-test-missing", result["problems"])
+            for action in ("skip", "fail"):
+                with self.subTest(target=target, mutation=action):
+                    result = self.parse(
+                        replace_test_terminal(
+                            self.full_stream(), package, target, action
+                        )
+                    )
+                    self.assertEqual(
+                        result["required_test_results"].get(target), action
+                    )
+                    self.assertIn(
+                        "required-test-" + action, result["problems"]
+                    )
+
+    def test_us3_default_roots_wrong_package_are_not_green(self):
+        for target, package in EXPECTED_US3_DEFAULT_REQUIRED.items():
+            wrong_package = HARNESS if package != HARNESS else APP
+            with self.subTest(target=target):
+                stdout = without_test_events(self.full_stream(), target)
+                stdout += event("run", wrong_package, target)
+                stdout += event("pass", wrong_package, target, elapsed=0.01)
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target),
+                    "wrong-package",
+                )
+                self.assertIn(
+                    "required-test-wrong-package", result["problems"]
+                )
+
+    def test_us3_default_roots_duplicate_are_not_green(self):
+        for target, package in EXPECTED_US3_DEFAULT_REQUIRED.items():
+            with self.subTest(target=target):
+                stdout = self.full_stream()
+                stdout += event("run", package, target)
+                stdout += event("pass", package, target, elapsed=0.01)
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target), "duplicate"
+                )
+
+    def test_us3_default_roots_output_spoof_is_not_a_pass(self):
+        for target, package in EXPECTED_US3_DEFAULT_REQUIRED.items():
+            with self.subTest(target=target):
+                stdout = without_test_events(self.full_stream(), target)
+                stdout += event(
+                    "output",
+                    package,
+                    test=target,
+                    output="--- PASS: " + target + " (0.00s)\n",
+                )
+                result = self.parse(stdout)
+                self.assertEqual(
+                    result["required_test_results"].get(target), "missing"
+                )
+                self.assertIn("required-test-missing", result["problems"])
+
+
 class RunDefaultTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ci-checks-run-")
@@ -1690,6 +2024,7 @@ class RunDefaultTests(unittest.TestCase):
             HTTPAPI,
             MOCK,
             PAYMENT,
+            POSTGRES,
             TESTCONTROL,
             HARNESS,
         ]
@@ -2642,6 +2977,14 @@ class ExportReportsTests(unittest.TestCase):
         self.db_root = self.root / "db-artifacts"
         self.db_root.mkdir()
         self.run_id = "a" * 32
+        self.us3_epoch = "f" * 32
+        self.us3_order_id = "123e4567-e89b-42d3-a456-426614174000"
+        self.us3_mock_id = "223e4567-e89b-42d3-a456-426614174001"
+        self.us3_record_id = "323e4567-e89b-42d3-a456-426614174002"
+        self.us3_request_id = self.us3_request_id_n(1)
+
+    def us3_request_id_n(self, index):
+        return "423e4567-e89b-42d3-a456-426614174" + f"{400 + index:03d}"
 
     def write(self, path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2748,7 +3091,7 @@ class ExportReportsTests(unittest.TestCase):
                 "compose_down_exit": 0,
             },
             "versions": {
-                "go": "go1.27.3",
+                "go": "go1.27.4",
                 "postgres": "16.15",
                 "goose": "v3.29.0",
             },
@@ -3463,7 +3806,7 @@ class ExportReportsTests(unittest.TestCase):
 
     def test_export_db_old_fail_report_backfills_eleven_non_green(self):
         # Historical 11-entry report remains non-green and backfills the old
-        # subset; the full 18-key assertion lives in the next test.
+        # subset; the full 24-key assertion lives in the next test.
         value = self.db_report(result="fail")
         value["tests"]["required_test_results"] = {
             name: "pass" for name in EXPECTED_PR3_DB_REQUIRED
@@ -3486,7 +3829,7 @@ class ExportReportsTests(unittest.TestCase):
                     safe["required_test_results"].get(name), "missing"
                 )
 
-    def test_export_db_old_fail_report_backfills_eighteen_non_green(self):
+    def test_export_db_old_fail_report_backfills_twenty_four_non_green(self):
         value = self.db_report(result="fail")
         value["tests"]["required_test_results"] = {
             name: "pass" for name in EXPECTED_PR3_DB_REQUIRED
@@ -3520,6 +3863,12 @@ class ExportReportsTests(unittest.TestCase):
             "TestUS2Concurrency",
             "TestUS2Restart",
             "TestUS2ReportSafety",
+            "TestObservationFaultIntegration",
+            "TestUS3Query",
+            "TestUS3Protection",
+            "TestUS3Restart",
+            "TestUS3Lifecycle",
+            "TestUS3ReportSafety",
         ):
             with self.subTest(name=name):
                 self.assertEqual(
@@ -3527,18 +3876,18 @@ class ExportReportsTests(unittest.TestCase):
                 )
 
     def test_export_db_required_results_cover_eleven_bindings(self):
-        # Historical 11-entry subset remains present in the 18-entry report.
+        # Historical 11-entry subset remains present in the 24-entry report.
         required = self.db_report()["tests"]["required_test_results"]
         for name in EXPECTED_LEGACY_DB_REQUIRED:
             with self.subTest(name=name):
                 self.assertIn(name, required)
 
-    def test_export_db_required_results_cover_eighteen_bindings(self):
+    def test_export_db_required_results_cover_twenty_four_bindings(self):
         self.assertEqual(
             set(self.db_report()["tests"]["required_test_results"]),
             set(EXPECTED_DB_REQUIRED),
         )
-        self.assertEqual(len(EXPECTED_DB_REQUIRED), 18)
+        self.assertEqual(len(EXPECTED_DB_REQUIRED), 24)
 
     def test_export_db_digest_mismatch_fails_without_raw_fields(self):
         value = self.db_report()
@@ -4424,6 +4773,2430 @@ class ExportReportsTests(unittest.TestCase):
         self.assertTrue(path.is_file(), "us2 safe report is missing")
         return json.loads(path.read_text())
 
+    def us3_counts(self, payment, query, order, mock, trace):
+        return {
+            "payment_calls": payment,
+            "query_calls": query,
+            "order_rows": order,
+            "mock_rows": mock,
+            "trace_rows": trace,
+        }
+
+    def us3_fact(self, result="SUCCEEDED"):
+        value = {
+            "payment_id": self.us3_order_id,
+            "client_ref_sha256": "a" * 64,
+            "business_ref_sha256": "b" * 64,
+            "amount": 100,
+            "currency": "CNY",
+            "result": result,
+            "registered_at": "2026-11-11T00:00:00Z",
+        }
+        if result == "SUCCEEDED":
+            value["confirmed_at"] = "2026-11-11T00:00:01Z"
+        return value
+
+    def us3_http(
+        self,
+        kind="PRIMARY",
+        status=200,
+        result="SUCCEEDED",
+        issues=None,
+        request_id=None,
+        generation=1,
+    ):
+        return {
+            "kind": kind,
+            "generation": generation,
+            "status": status,
+            "request_id": self.us3_request_id if request_id is None else request_id,
+            "payment_id": self.us3_order_id,
+            "result": result,
+            "issues": [] if issues is None else issues,
+        }
+
+    def us3_binding(self, generation=1, call_seq=1):
+        return {
+            "run_id": self.run_id,
+            "epoch": self.us3_epoch,
+            "generation": generation,
+            "call_seq": call_seq,
+            "event_id": self.us3_epoch + ":" + str(call_seq),
+            "order_id": self.us3_order_id,
+        }
+
+    def us3_query(
+        self,
+        directive="normal",
+        outcome="found",
+        decision="ACCEPT_CONFIRMATION",
+        before="UNKNOWN",
+        after="SUCCEEDED",
+        trace_outcome="SAVED",
+        applied=True,
+        generation=1,
+        call_seq=1,
+        trusted=True,
+        path="BY_BUSINESS_ORDER_NO",
+        request_id=None,
+        confirmed_returned=True,
+    ):
+        return {
+            "generation": generation,
+            "path": path,
+            "query_call_seq": call_seq,
+            "request_id": self.us3_request_id if request_id is None else request_id,
+            "directive": directive,
+            "outcome": outcome,
+            "applied": applied,
+            "apply_count": 1 if applied else 0,
+            "decision": decision,
+            "result_before": before,
+            "result_after": after,
+            "trace_outcome": trace_outcome,
+            "confirmed_returned": confirmed_returned,
+            "new_mock_calls": 0,
+            "binding": self.us3_binding(generation, call_seq),
+            "trusted": trusted,
+        }
+
+    def us3_record(
+        self,
+        decision="ACCEPT_CONFIRMATION",
+        before="UNKNOWN",
+        after="SUCCEEDED",
+        reason="",
+        differences=None,
+        source="QUERY",
+        request_id=None,
+    ):
+        evidence = {"differences": [] if differences is None else differences}
+        if decision == "ACCEPT_CONFIRMATION":
+            evidence.update(
+                {
+                    "platform_reference_id": self.us3_mock_id,
+                    "mock_transaction_id": self.us3_mock_id,
+                    "amount": 100,
+                    "currency": "CNY",
+                    "result": "SUCCEEDED",
+                }
+            )
+        return {
+            "record_id": self.us3_record_id,
+            "request_id": self.us3_request_id if request_id is None else request_id,
+            "source": source,
+            "decision": decision,
+            "result_before": before,
+            "result_after": after,
+            "reason_code": reason,
+            "evidence": evidence,
+        }
+
+    def us3_complete_proof(self, generation=1, last_seq=1):
+        return {
+            "generation": generation,
+            "mode": "complete",
+            "sealed": True,
+            "trusted": True,
+            "receipt": {
+                "run_id": self.run_id,
+                "epoch": self.us3_epoch,
+                "generation": generation,
+                "last_seq": last_seq,
+            },
+            "counts": self.us3_counts(0, 0, 0, 0, 0),
+            "exact_counts": True,
+        }
+
+    def us3_controlled(self, point="REGISTERED"):
+        return {
+            "binding": {
+                "run_id": self.run_id,
+                "epoch": self.us3_epoch,
+                "generation": 1,
+                "point": point,
+                "order_id": self.us3_order_id,
+                "call_seq": 1,
+                "event_id": self.us3_epoch + ":1",
+                "prefix_count": 0,
+            },
+            "exit": {
+                "code": -1,
+                "canceled": True,
+                "reaped": True,
+                "group_gone": True,
+                "output_complete": True,
+            },
+            "controlled_truncated": True,
+            "no_receipt": True,
+            "exact_counts": False,
+            "observed_prefix": self.us3_counts(0, 0, 0, 0, 0),
+        }
+
+    def us3_scenario(self, name):
+        scenario = {
+            "name": name,
+            "result": "PASS",
+            "generations": [1],
+            "transport": "RESPONSE",
+            "http": [self.us3_http()],
+            "pg": [
+                {"state": "ORDER", "rows": 1},
+                {"state": "MOCK", "rows": 1},
+                {"state": "TRACE", "rows": 1},
+            ],
+            "calls": [
+                {
+                    "generation": 1,
+                    "exact": True,
+                    "payment_calls": 1,
+                    "query_calls": 0,
+                }
+            ],
+            "records": [],
+            "queries": [],
+            "faults": [],
+            "facts": {
+                "before": self.us3_fact("SUCCEEDED"),
+                "after": self.us3_fact("SUCCEEDED"),
+                "transition": "UNCHANGED",
+                "stable_facts": True,
+            },
+            "checks": {
+                "counts_before": self.us3_counts(0, 0, 1, 1, 1),
+                "counts_after": self.us3_counts(1, 0, 1, 1, 1),
+                "counts_exact": True,
+                "stable_facts": True,
+            },
+            "generation_proofs": [self.us3_complete_proof(1)],
+            "budgets": [],
+            "commands": [
+                {"kind": "build", "exit": 0, "not_run": False},
+                {"kind": "process_stop", "exit": 0, "not_run": False},
+            ],
+        }
+        if name == "submit_unknown_no_transaction":
+            scenario["http"] = [
+                self.us3_http(status=200, result="UNKNOWN", issues=["MOCK_RESULT_UNCONFIRMED"])
+            ]
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 1},
+                {"state": "MOCK", "rows": 0},
+                {"state": "TRACE", "rows": 0},
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    decision="KEEP_UNKNOWN",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    reason="MOCK_RESULT_UNCONFIRMED",
+                    source="PAYMENT",
+                )
+            ]
+            scenario["facts"] = {
+                "after": self.us3_fact("UNKNOWN"),
+                "transition": "CREATED_UNKNOWN",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_before"] = self.us3_counts(0, 0, 0, 0, 0)
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 0, 1, 0, 0)
+            scenario["budgets"] = [
+                {
+                    "class": "CONTROLLED",
+                    "kind": "MOCK_DB_SUBTIMEOUT",
+                    "source": "APP",
+                    "pass_budget": False,
+                    "limit_ms": 2000,
+                    "elapsed_ms": 1500,
+                },
+                {
+                    "class": "NORMAL",
+                    "kind": "MOCK",
+                    "source": "MOCK",
+                    "pass_budget": True,
+                    "limit_ms": 3000,
+                    "elapsed_ms": 1500,
+                },
+            ]
+        elif name == "submit_commit_unknown":
+            scenario["http"] = [
+                self.us3_http(status=200, result="UNKNOWN", issues=["RESULT_SAVE_ERROR"])
+            ]
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 1},
+                {"state": "MOCK", "rows": 0},
+                {"state": "TRACE", "rows": 0},
+            ]
+            scenario["records"] = []
+            scenario["facts"] = {
+                "after": self.us3_fact("UNKNOWN"),
+                "transition": "CREATED_UNKNOWN",
+                "stable_facts": False,
+            }
+            scenario["checks"] = {
+                "counts_before": self.us3_counts(0, 0, 0, 0, 0),
+                "counts_after": self.us3_counts(0, 0, 1, 0, 0),
+                "counts_exact": True,
+                "stable_facts": False,
+            }
+            scenario["faults"] = [
+                {
+                    "kind": "REGISTRATION_COMMIT_REPLY_LOST",
+                    "sqlstate": "",
+                    "sqlstate_source": "none",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "UDS_SCENARIO",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["save"] = {
+                "attempts": 1,
+                "record_id": "",
+                "commit_state": "INDETERMINATE",
+                "application_readback": "ORDER_ONLY",
+                "external_pg_readback": "NONE",
+                "readback_verified": True,
+                "readback_scope": "APPLICATION_ORDER_ONLY",
+                "readback_source": "APP",
+                "created_claimed": False,
+                "rollback_claimed": False,
+                "candidate_id_leaked": False,
+            }
+        elif name == "query_unknown_confirmed":
+            scenario["queries"] = [self.us3_query()]
+            scenario["records"] = [self.us3_record()]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact("SUCCEEDED"),
+                "transition": "UNKNOWN_TO_CONFIRMED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 1, 1, 1, 1)
+            scenario["trace"] = {
+                "outcome": "SAVED",
+                "issue": "",
+                "sqlstate": "00000",
+                "sqlstate_source": "application_observed",
+                "confirmed_fact_returned": True,
+                "new_lookup": False,
+                "proof_source": "OBSERVER",
+            }
+        elif name == "query_unknown_failure":
+            scenario["queries"] = [
+                self.us3_query(
+                    directive="failure",
+                    outcome="unavailable",
+                    decision="KEEP_UNKNOWN",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    trace_outcome="SAVED",
+                )
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    decision="KEEP_UNKNOWN",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    reason="MOCK_RESULT_UNCONFIRMED",
+                )
+            ]
+            scenario["http"][0]["issues"] = ["MOCK_RESULT_UNCONFIRMED"]
+            scenario["faults"] = [
+                {
+                    "kind": "MOCK_QUERY_FAILURE",
+                    "sqlstate": "08006",
+                    "sqlstate_source": "application_observed",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "UDS_SCENARIO",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact("UNKNOWN"),
+                "transition": "UNCHANGED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 1, 1, 1, 0)
+        elif name == "query_unknown_subtimeout":
+            scenario["queries"] = [
+                self.us3_query(
+                    directive="subtimeout",
+                    outcome="subtimeout",
+                    decision="KEEP_UNKNOWN",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    trace_outcome="SAVED",
+                )
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    decision="KEEP_UNKNOWN",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    reason="MOCK_RESULT_UNCONFIRMED",
+                )
+            ]
+            scenario["http"][0]["issues"] = ["MOCK_RESULT_UNCONFIRMED"]
+            scenario["faults"] = [
+                {
+                    "kind": "MOCK_QUERY_SUBTIMEOUT_250MS",
+                    "sqlstate": "57014",
+                    "sqlstate_source": "application_observed",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "UDS_SCENARIO",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["budgets"] = [
+                {
+                    "class": "CONTROLLED",
+                    "kind": "QUERY_SUBTIMEOUT",
+                    "source": "APP",
+                    "pass_budget": False,
+                    "limit_ms": 250,
+                    "elapsed_ms": 251,
+                },
+                {
+                    "class": "NORMAL",
+                    "kind": "MOCK",
+                    "source": "MOCK",
+                    "pass_budget": True,
+                    "limit_ms": 3000,
+                    "elapsed_ms": 251,
+                },
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact("UNKNOWN"),
+                "transition": "UNCHANGED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 1, 1, 1, 0)
+        elif name == "query_unknown_not_visible":
+            scenario["queries"] = [
+                self.us3_query(
+                    directive="notvisible",
+                    outcome="not_found",
+                    decision="KEEP_UNKNOWN",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_query(
+                    call_seq=2, request_id=self.us3_request_id_n(2)
+                ),
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    decision="KEEP_UNKNOWN",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    reason="MOCK_RESULT_NOT_FOUND",
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_record(request_id=self.us3_request_id_n(2)),
+            ]
+            scenario["http"] = [
+                self.us3_http(
+                    status=200,
+                    result="UNKNOWN",
+                    issues=["MOCK_RESULT_NOT_FOUND"],
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_http(request_id=self.us3_request_id_n(2)),
+            ]
+            scenario["faults"] = [
+                {
+                    "kind": "MOCK_QUERY_NOT_VISIBLE",
+                    "sqlstate": "",
+                    "sqlstate_source": "none",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "UDS_SCENARIO",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact("SUCCEEDED"),
+                "transition": "UNKNOWN_TO_CONFIRMED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 1, 1, 1, 1)
+            scenario["trace"] = {
+                "outcome": "SAVED",
+                "issue": "",
+                "sqlstate": "00000",
+                "sqlstate_source": "application_observed",
+                "confirmed_fact_returned": True,
+                "new_lookup": False,
+                "proof_source": "OBSERVER",
+            }
+        elif name == "query_unknown_no_mock_match":
+            scenario["queries"] = [
+                self.us3_query(
+                    outcome="not_found",
+                    decision="KEEP_UNKNOWN",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    trace_outcome="SAVED",
+                )
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    decision="KEEP_UNKNOWN",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    reason="MOCK_RESULT_NOT_FOUND",
+                )
+            ]
+            scenario["http"][0]["issues"] = ["MOCK_RESULT_NOT_FOUND"]
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 1},
+                {"state": "MOCK", "rows": 0},
+                {"state": "TRACE", "rows": 0},
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact("UNKNOWN"),
+                "transition": "UNCHANGED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 1, 1, 0, 0)
+        elif name.startswith("query_mismatch_"):
+            difference = {
+                "query_mismatch_reference": "platform_reference_id",
+                "query_mismatch_amount": "amount",
+                "query_mismatch_currency": "currency",
+                "query_mismatch_transaction": "mock_transaction_id",
+            }[name]
+            directive = {
+                "platform_reference_id": "mismatch_reference",
+                "amount": "mismatch_amount",
+                "currency": "mismatch_currency",
+                "mock_transaction_id": "mismatch_transaction",
+            }[difference]
+            scenario["queries"] = [
+                self.us3_query(
+                    directive=directive,
+                    outcome="mismatch_applied",
+                    decision="REJECT_EVIDENCE",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    trace_outcome="SAVED",
+                )
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    decision="REJECT_EVIDENCE",
+                    before="UNKNOWN",
+                    after="UNKNOWN",
+                    reason="MOCK_EVIDENCE_MISMATCH",
+                    differences=[difference],
+                )
+            ]
+            scenario["http"][0]["issues"] = ["MOCK_EVIDENCE_REJECTED"]
+            scenario["faults"] = [
+                {
+                    "kind": {
+                        "platform_reference_id": "MISMATCH_REFERENCE",
+                        "amount": "MISMATCH_AMOUNT",
+                        "currency": "MISMATCH_CURRENCY",
+                        "mock_transaction_id": "MISMATCH_TRANSACTION",
+                    }[difference],
+                    "sqlstate": "",
+                    "sqlstate_source": "none",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "UDS_SCENARIO",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact("UNKNOWN"),
+                "transition": "UNCHANGED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 1, 1, 1, 0)
+        elif name == "query_not_found":
+            scenario["http"] = [
+                self.us3_http(status=404, result="")
+            ]
+            scenario["http"][0]["payment_id"] = ""
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 0},
+                {"state": "MOCK", "rows": 0},
+                {"state": "TRACE", "rows": 0},
+            ]
+            scenario["calls"] = [
+                {
+                    "generation": 1,
+                    "exact": True,
+                    "payment_calls": 0,
+                    "query_calls": 0,
+                }
+            ]
+            scenario["records"] = []
+            scenario["queries"] = []
+            scenario["facts"] = {"transition": "NONE", "stable_facts": True}
+            scenario["checks"] = {
+                "counts_before": self.us3_counts(0, 0, 0, 0, 0),
+                "counts_after": self.us3_counts(0, 0, 0, 0, 0),
+                "counts_exact": True,
+                "stable_facts": True,
+            }
+            scenario["generation_proofs"] = [
+                self.us3_complete_proof(1, last_seq=0)
+            ]
+        elif name == "query_confirmed_plain":
+            scenario["queries"] = []
+            scenario["records"] = []
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 1},
+                {"state": "MOCK", "rows": 1},
+                {"state": "TRACE", "rows": 0},
+            ]
+            scenario["calls"] = [
+                {
+                    "generation": 1,
+                    "exact": True,
+                    "payment_calls": 0,
+                    "query_calls": 0,
+                }
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("SUCCEEDED"),
+                "after": self.us3_fact("SUCCEEDED"),
+                "transition": "UNCHANGED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_before"] = self.us3_counts(0, 0, 1, 1, 0)
+            scenario["checks"]["counts_after"] = self.us3_counts(0, 0, 1, 1, 0)
+            scenario["checks"]["stable_facts"] = True
+            scenario["generation_proofs"] = [
+                self.us3_complete_proof(1, last_seq=0)
+            ]
+        elif name == "query_confirmed_trace_failure":
+            scenario["queries"] = [
+                self.us3_query(
+                    path="BY_ID",
+                    directive="failure",
+                    outcome="unavailable",
+                    decision="NOT_RECORDED",
+                    before="",
+                    after="",
+                    trace_outcome="FAILED",
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_query(
+                    call_seq=2, request_id=self.us3_request_id_n(2)
+                ),
+            ]
+            scenario["records"] = [
+                self.us3_record(request_id=self.us3_request_id_n(2))
+            ]
+            scenario["http"] = [
+                self.us3_http(
+                    status=200,
+                    result="SUCCEEDED",
+                    issues=["MOCK_RESULT_UNCONFIRMED", "TRACE_SAVE_ERROR"],
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_http(request_id=self.us3_request_id_n(2)),
+            ]
+            scenario["faults"] = [
+                {
+                    "kind": "TRACE_INSERT_SQL",
+                    "target_id": "order-1",
+                    "sqlstate": "P0001",
+                    "sqlstate_source": "fixture_probe",
+                    "fixture_copy": True,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "TRIGGER_FUNCTION",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact("SUCCEEDED"),
+                "transition": "UNKNOWN_TO_CONFIRMED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 2, 1, 1, 1)
+            scenario["trace"] = {
+                "outcome": "FAILED",
+                "issue": "TRACE_SAVE_ERROR",
+                "sqlstate": "P0001",
+                "sqlstate_source": "fixture_probe",
+                "confirmed_fact_returned": True,
+                "new_lookup": False,
+                "proof_source": "APPLICATION_OBSERVED",
+            }
+        elif name == "query_result_commit_unknown":
+            scenario["queries"] = [self.us3_query()]
+            scenario["records"] = [self.us3_record()]
+            scenario["http"][0]["issues"] = ["RESULT_SAVE_ERROR"]
+            scenario["faults"] = [
+                {
+                    "kind": "RESULT_COMMIT_REPLY_HIDDEN",
+                    "sqlstate": "",
+                    "sqlstate_source": "none",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "UDS_SCENARIO",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact("SUCCEEDED"),
+                "transition": "UNKNOWN_TO_CONFIRMED",
+                "stable_facts": False,
+            }
+            scenario["checks"]["counts_before"] = self.us3_counts(0, 0, 1, 1, 0)
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 1, 1, 1, 0)
+            scenario["checks"]["stable_facts"] = False
+            scenario["save"] = {
+                "attempts": 1,
+                "record_id": self.us3_record_id,
+                "commit_state": "INDETERMINATE",
+                "application_readback": "ORDER_ONLY",
+                "external_pg_readback": "ORDER_AND_RECORD",
+                "readback_verified": True,
+                "readback_scope": "INDEPENDENT_ORDER_AND_RECORD",
+                "readback_source": "APP_AND_EXTERNAL",
+                "created_claimed": False,
+                "rollback_claimed": False,
+                "candidate_id_leaked": False,
+            }
+        elif name == "protection_inflight_failure":
+            scenario["queries"] = [
+                self.us3_query(
+                    decision="KEEP_CONFIRMED",
+                    before="SUCCEEDED",
+                    after="SUCCEEDED",
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_query(
+                    call_seq=2, request_id=self.us3_request_id_n(2)
+                ),
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    decision="KEEP_CONFIRMED",
+                    before="SUCCEEDED",
+                    after="SUCCEEDED",
+                    reason="CONFIRMED_RESULT_PRESERVED",
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_record(request_id=self.us3_request_id_n(2)),
+            ]
+            scenario["http"] = [
+                self.us3_http(
+                    issues=["MOCK_RESULT_UNCONFIRMED"],
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_http(request_id=self.us3_request_id_n(2)),
+            ]
+            scenario["faults"] = [
+                {
+                    "kind": "MOCK_QUERY_FAILURE",
+                    "sqlstate": "08006",
+                    "sqlstate_source": "application_observed",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "UDS_SCENARIO",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("SUCCEEDED"),
+                "after": self.us3_fact("SUCCEEDED"),
+                "transition": "UNCHANGED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 2, 1, 1, 1)
+            scenario["protection"] = {
+                "kind": "INFLIGHT_FAILURE",
+                "initial_result": "UNKNOWN",
+                "confirmed_result": "SUCCEEDED",
+                "protected_result": "SUCCEEDED",
+                "first_applied": "KEEP_CONFIRMED",
+                "second_applied": "ACCEPT_CONFIRMATION",
+                "post_confirmation_mock_calls": 0,
+                "original_fact_preserved": True,
+            }
+            scenario["trace"] = {
+                "outcome": "SAVED",
+                "issue": "",
+                "sqlstate": "00000",
+                "sqlstate_source": "application_observed",
+                "confirmed_fact_returned": True,
+                "new_lookup": False,
+                "proof_source": "OBSERVER",
+            }
+        elif name == "protection_inflight_mismatch":
+            scenario["queries"] = [
+                self.us3_query(
+                    directive="mismatch_reference",
+                    outcome="mismatch_applied",
+                    decision="REJECT_EVIDENCE",
+                    before="SUCCEEDED",
+                    after="SUCCEEDED",
+                    trace_outcome="SAVED",
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_query(
+                    call_seq=2, request_id=self.us3_request_id_n(2)
+                ),
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    decision="REJECT_EVIDENCE",
+                    before="SUCCEEDED",
+                    after="SUCCEEDED",
+                    reason="MOCK_EVIDENCE_MISMATCH",
+                    differences=["platform_reference_id"],
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_record(request_id=self.us3_request_id_n(2)),
+            ]
+            scenario["http"] = [
+                self.us3_http(
+                    issues=["MOCK_EVIDENCE_REJECTED"],
+                    request_id=self.us3_request_id_n(1),
+                ),
+                self.us3_http(request_id=self.us3_request_id_n(2)),
+            ]
+            scenario["faults"] = [
+                {
+                    "kind": "MISMATCH_REFERENCE",
+                    "sqlstate": "",
+                    "sqlstate_source": "none",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "UDS_SCENARIO",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("SUCCEEDED"),
+                "after": self.us3_fact("SUCCEEDED"),
+                "transition": "UNCHANGED",
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(1, 2, 1, 1, 1)
+            scenario["protection"] = {
+                "kind": "INFLIGHT_MISMATCH",
+                "initial_result": "UNKNOWN",
+                "confirmed_result": "SUCCEEDED",
+                "protected_result": "SUCCEEDED",
+                "first_applied": "REJECT_EVIDENCE",
+                "second_applied": "ACCEPT_CONFIRMATION",
+                "post_confirmation_mock_calls": 0,
+                "original_fact_preserved": True,
+            }
+            scenario["trace"] = {
+                "outcome": "SAVED",
+                "issue": "",
+                "sqlstate": "00000",
+                "sqlstate_source": "application_observed",
+                "confirmed_fact_returned": True,
+                "new_lookup": False,
+                "proof_source": "OBSERVER",
+            }
+        elif name in {
+            "restart_registered_unpaid",
+            "restart_mock_committed_reply_lost",
+        }:
+            point = (
+                "REGISTERED"
+                if name == "restart_registered_unpaid"
+                else "MOCK_COMMITTED"
+            )
+            controlled = self.us3_controlled(point)
+            second_proof = self.us3_complete_proof(2)
+            second_proof["counts"] = self.us3_counts(0, 1, 0, 0, 0)
+            replay_id = self.us3_request_id_n(1)
+            get_id = self.us3_request_id_n(2)
+            mock_rows = 0 if point == "REGISTERED" else 1
+            get_result = "UNKNOWN" if point == "REGISTERED" else "SUCCEEDED"
+            get_issues = (
+                ["MOCK_RESULT_NOT_FOUND"] if point == "REGISTERED" else []
+            )
+            scenario["generations"] = [1, 2]
+            scenario["http"] = [
+                self.us3_http(
+                    generation=2,
+                    status=200,
+                    result="UNKNOWN",
+                    request_id=replay_id,
+                ),
+                self.us3_http(
+                    generation=2,
+                    status=200,
+                    result=get_result,
+                    request_id=get_id,
+                    issues=get_issues,
+                ),
+            ]
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 1},
+                {"state": "MOCK", "rows": mock_rows},
+                {"state": "TRACE", "rows": 1},
+            ]
+            scenario["calls"] = [
+                {
+                    "generation": 1,
+                    "exact": False,
+                    "payment_calls": 0,
+                    "query_calls": 0,
+                },
+                {
+                    "generation": 2,
+                    "exact": True,
+                    "payment_calls": 0,
+                    "query_calls": 1,
+                },
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact(get_result),
+                "transition": (
+                    "UNCHANGED"
+                    if point == "REGISTERED"
+                    else "UNKNOWN_TO_CONFIRMED"
+                ),
+                "stable_facts": point == "REGISTERED",
+            }
+            scenario["checks"]["counts_before"] = self.us3_counts(0, 0, 0, 0, 0)
+            scenario["checks"]["counts_after"] = self.us3_counts(
+                0, 1, 1, mock_rows, 1
+            )
+            scenario["checks"]["counts_exact"] = False
+            scenario["checks"]["stable_facts"] = point == "REGISTERED"
+            scenario["queries"] = [
+                self.us3_query(
+                    generation=2,
+                    call_seq=1,
+                    request_id=get_id,
+                    decision=(
+                        "ACCEPT_CONFIRMATION"
+                        if point == "MOCK_COMMITTED"
+                        else "KEEP_UNKNOWN"
+                    ),
+                    before="UNKNOWN",
+                    after=get_result,
+                    trace_outcome="SAVED",
+                    confirmed_returned=point == "MOCK_COMMITTED",
+                )
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    request_id=get_id,
+                    decision=(
+                        "ACCEPT_CONFIRMATION"
+                        if point == "MOCK_COMMITTED"
+                        else "KEEP_UNKNOWN"
+                    ),
+                    before="UNKNOWN",
+                    after=get_result,
+                    reason=(
+                        ""
+                        if point == "MOCK_COMMITTED"
+                        else "MOCK_RESULT_NOT_FOUND"
+                    ),
+                )
+            ]
+            scenario["generation_proofs"] = [
+                {
+                    "generation": 1,
+                    "mode": "controlled_truncated",
+                    "sealed": False,
+                    "trusted": False,
+                    "exact_counts": False,
+                    "controlled_termination": controlled,
+                },
+                second_proof,
+            ]
+            scenario["faults"] = [
+                {
+                    "kind": "PROCESS_TERMINATED",
+                    "sqlstate": "",
+                    "sqlstate_source": "none",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "PROCESS_TERMINAL",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["joint"] = {
+                "kind": "CONTROLLED_TRUNCATED_RESTART",
+                "first_generation": 1,
+                "second_generation": 2,
+                "first_mode": "controlled_truncated",
+                "second_mode": "complete",
+                "first_exact_counts": False,
+                "second_exact_counts": True,
+                "second_receipt": second_proof["receipt"],
+                "held_point": point,
+                "held_binding": controlled["binding"],
+                "process_exit": controlled["exit"],
+                "observed_prefix": controlled["observed_prefix"],
+                "no_extra_payment_effect": True,
+                "no_new_payment_call_after_restart": True,
+                "original_intent_same": True,
+                "limitation": "CROSS_GENERATION_EXACT_COUNTS_NOT_PROVABLE",
+            }
+        elif name in {
+            "restart_unknown_no_confirm",
+            "restart_unknown_then_confirmed",
+        }:
+            confirmed = name == "restart_unknown_then_confirmed"
+            scenario["generations"] = [1, 2]
+            scenario["http"] = [
+                self.us3_http(
+                    status=200,
+                    result="SUCCEEDED" if confirmed else "UNKNOWN",
+                )
+            ]
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 1},
+                {"state": "MOCK", "rows": 1 if confirmed else 0},
+                {"state": "TRACE", "rows": 1 if confirmed else 0},
+            ]
+            scenario["calls"] = [
+                {
+                    "generation": 1,
+                    "exact": True,
+                    "payment_calls": 1,
+                    "query_calls": 1,
+                },
+                {
+                    "generation": 2,
+                    "exact": True,
+                    "payment_calls": 1,
+                    "query_calls": 1,
+                },
+            ]
+            scenario["generation_proofs"] = [
+                self.us3_complete_proof(1),
+                self.us3_complete_proof(2),
+            ]
+            scenario["queries"] = [
+                self.us3_query(
+                    decision=(
+                        "ACCEPT_CONFIRMATION" if confirmed else "KEEP_UNKNOWN"
+                    ),
+                    before="UNKNOWN",
+                    after="SUCCEEDED" if confirmed else "UNKNOWN",
+                    trace_outcome="SAVED" if confirmed else "NOT_ATTEMPTED",
+                )
+            ]
+            scenario["records"] = [
+                self.us3_record(
+                    decision=(
+                        "ACCEPT_CONFIRMATION" if confirmed else "KEEP_UNKNOWN"
+                    ),
+                    before="UNKNOWN",
+                    after="SUCCEEDED" if confirmed else "UNKNOWN",
+                    reason="" if confirmed else "MOCK_RESULT_NOT_FOUND",
+                )
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact(
+                    "SUCCEEDED" if confirmed else "UNKNOWN"
+                ),
+                "transition": (
+                    "UNKNOWN_TO_CONFIRMED" if confirmed else "UNCHANGED"
+                ),
+                "stable_facts": True,
+            }
+            scenario["checks"]["counts_after"] = self.us3_counts(
+                1, 1, 1, 1 if confirmed else 0, 1 if confirmed else 0
+            )
+        elif name == "lifecycle_cancel_before_mock":
+            scenario["transport"] = "CLIENT_CANCELED"
+            scenario["http"] = []
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 0},
+                {"state": "MOCK", "rows": 0},
+                {"state": "TRACE", "rows": 0},
+            ]
+            scenario["calls"] = [
+                {
+                    "generation": 1,
+                    "exact": True,
+                    "payment_calls": 0,
+                    "query_calls": 0,
+                }
+            ]
+            scenario["facts"] = {"transition": "NONE", "stable_facts": True}
+            scenario["checks"] = {
+                "counts_before": self.us3_counts(0, 0, 0, 0, 0),
+                "counts_after": self.us3_counts(0, 0, 0, 0, 0),
+                "counts_exact": True,
+                "stable_facts": True,
+            }
+            scenario["generation_proofs"] = [
+                self.us3_complete_proof(1, last_seq=0)
+            ]
+            scenario["faults"] = [
+                {
+                    "kind": "REGISTRATION_INSERT_HOLD",
+                    "sqlstate": "",
+                    "sqlstate_source": "",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "TABLE_SHARE_LOCK",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["cancel"] = {
+                "phase": "BEFORE_MOCK",
+                "post_cancel_payment_calls": 0,
+                "post_cancel_query_calls": 0,
+                "finish_checked_mock": False,
+                "rollback_claimed": False,
+            }
+        elif name == "lifecycle_cancel_after_mock":
+            scenario["transport"] = "CLIENT_CANCELED"
+            scenario["http"] = []
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 1},
+                {"state": "MOCK", "rows": 1},
+                {"state": "TRACE", "rows": 0},
+            ]
+            scenario["calls"] = [
+                {
+                    "generation": 1,
+                    "exact": True,
+                    "payment_calls": 1,
+                    "query_calls": 0,
+                }
+            ]
+            scenario["facts"] = {
+                "before": self.us3_fact("UNKNOWN"),
+                "after": self.us3_fact("UNKNOWN"),
+                "transition": "NONE",
+                "stable_facts": True,
+            }
+            scenario["checks"] = {
+                "counts_before": self.us3_counts(0, 0, 0, 0, 0),
+                "counts_after": self.us3_counts(1, 0, 1, 1, 0),
+                "counts_exact": True,
+                "stable_facts": True,
+            }
+            scenario["faults"] = [
+                {
+                    "kind": "RESULT_HANDLING_INSERT_HOLD",
+                    "sqlstate": "",
+                    "sqlstate_source": "",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "TABLE_SHARE_LOCK",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["cancel"] = {
+                "phase": "AFTER_MOCK",
+                "post_cancel_payment_calls": 0,
+                "post_cancel_query_calls": 0,
+                "finish_checked_mock": False,
+                "rollback_claimed": False,
+            }
+        elif name == "lifecycle_exit_budget":
+            scenario["transport"] = "CLIENT_CANCELED"
+            scenario["http"] = [
+                self.us3_http(
+                    kind="SHUTDOWN_PROBE",
+                    status=503,
+                    result="",
+                )
+            ]
+            scenario["http"][0]["request_id"] = ""
+            scenario["http"][0]["payment_id"] = ""
+            scenario["pg"] = [
+                {"state": "ORDER", "rows": 0},
+                {"state": "MOCK", "rows": 0},
+                {"state": "TRACE", "rows": 0},
+            ]
+            scenario["calls"] = [
+                {
+                    "generation": 1,
+                    "exact": True,
+                    "payment_calls": 0,
+                    "query_calls": 0,
+                }
+            ]
+            scenario["facts"] = {"transition": "NONE", "stable_facts": True}
+            scenario["checks"] = {
+                "counts_before": self.us3_counts(0, 0, 0, 0, 0),
+                "counts_after": self.us3_counts(0, 0, 0, 0, 0),
+                "counts_exact": True,
+                "stable_facts": True,
+            }
+            scenario["generation_proofs"] = [
+                self.us3_complete_proof(1, last_seq=0)
+            ]
+            scenario["faults"] = [
+                {
+                    "kind": "REGISTRATION_INSERT_HOLD",
+                    "sqlstate": "",
+                    "sqlstate_source": "",
+                    "fixture_copy": False,
+                    "platform_table_read": False,
+                    "cleanup": {
+                        "kind": "TABLE_SHARE_LOCK",
+                        "removed": True,
+                        "verified": True,
+                    },
+                }
+            ]
+            scenario["budgets"] = [
+                {
+                    "class": "NORMAL",
+                    "kind": "EXIT",
+                    "source": "APP",
+                    "pass_budget": True,
+                    "limit_ms": 20000,
+                    "elapsed_ms": 10000,
+                },
+                {
+                    "class": "NORMAL",
+                    "kind": "PROCESS_GRACE",
+                    "source": "HARNESS",
+                    "pass_budget": False,
+                    "limit_ms": 25000,
+                    "elapsed_ms": 0,
+                },
+            ]
+            scenario["shutdown"] = {
+                "post_shutdown_payment_calls": 0,
+                "post_shutdown_query_calls": 0,
+                "rollback_claimed": False,
+                "no_unmanaged_goroutine": True,
+                "no_unmanaged_goroutine_source": "APP_UNIT_PLUS_GROUP_GONE",
+                "pool_closed_after_users": True,
+                "pool_closed_after_users_source": "APP_UNIT_EVIDENCE",
+                "exit_elapsed_ms": 10000,
+                "exit_upper_bound_ms": 20000,
+                "observation_tolerance_ms": 250,
+                "host_grace_ms": 25000,
+                "host_grace_pass_budget": False,
+            }
+        return scenario
+
+    def us3_report(self):
+        return {
+            "schema": "payment-hub.us3.v1",
+            "run_id": self.run_id,
+            "scenarios": [
+                self.us3_scenario(name) for name in MOD.US3_SCENARIO_NAMES
+            ],
+        }
+
+    def write_us3(self, value, run_id=None):
+        run_id = value.get("run_id", self.run_id) if run_id is None else run_id
+        path = self.db_root / run_id / "us3.json"
+        self.write(path, value)
+        return path
+
+    def export_db_us3(self):
+        return self.export(["db", "us3"])
+
+    def read_us3_safe(self):
+        path = self.report_dir / "upload" / "us3.safe.json"
+        self.assertTrue(path.is_file(), "us3 safe report is missing")
+        return json.loads(path.read_text())
+
+    def test_export_us3_complete_pass_rebuilds_safe_report(self):
+        self.write_db(self.db_report())
+        self.write_us3(self.us3_report())
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe["schema"], "payment-hub.ci-safe.us3.v1")
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe.get("result"), "pass")
+        self.assertEqual(len(safe["scenarios"]), 24)
+        self.assertEqual(
+            [item["name"] for item in safe["scenarios"]],
+            list(MOD.US3_SCENARIO_NAMES),
+        )
+        text = json.dumps(safe)
+        for forbidden in ("SECRET", "Authorization", "postgres://", "client_id", "business_order_no"):
+            self.assertNotIn(forbidden, text)
+        provenance = json.loads(
+            (self.report_dir / "upload" / "provenance.json").read_text()
+        )
+        record = next(
+            entry for entry in provenance["reports"] if entry["name"] == "us3"
+        )
+        self.assertEqual(record["source"], self.run_id + "/us3.json")
+        self.assertEqual(record["export"], "us3.safe.json")
+        self.assertRegex(record["source_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(record["export_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_export_us3_missing_file_is_missing_nonzero(self):
+        self.write_db(self.db_report())
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe["status"], "missing")
+
+    def test_export_us3_missing_scenario_is_non_green(self):
+        value = self.us3_report()
+        value["scenarios"].pop()
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-missing-scenario", safe["problems"])
+
+    def test_export_us3_requires_each_required_scenario(self):
+        for index, name in enumerate(MOD.US3_SCENARIO_NAMES):
+            with self.subTest(name=name):
+                value = self.us3_report()
+                value["scenarios"].pop(index)
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe.get("result"), "fail")
+                self.assertIn("us3-missing-scenario", safe["problems"])
+                self.assertIn(name, safe["missing_scenarios"])
+
+    def test_export_us3_wrong_run_id_rejected(self):
+        value = self.us3_report()
+        value["run_id"] = "f" * 32
+        self.write_db(self.db_report())
+        self.write_us3(value, run_id=self.run_id)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us3_safe()["status"], "error")
+        self.assertEqual(
+            self.read_us3_safe()["error"], "us3-run-id-mismatch"
+        )
+
+    def test_export_us3_db_not_green_non_green(self):
+        self.write_db(self.db_report(result="fail"))
+        self.write_us3(self.us3_report())
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-db-not-green", safe["problems"])
+
+    def test_export_us3_unknown_fields_rejected(self):
+        for mutation in ("top", "scenario", "record"):
+            with self.subTest(mutation=mutation):
+                value = self.us3_report()
+                if mutation == "top":
+                    value["raw_log"] = "SECRET"
+                elif mutation == "scenario":
+                    value["scenarios"][0]["reason_message"] = "SECRET"
+                else:
+                    value["scenarios"][2]["records"][0]["reason_message"] = "SECRET"
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe["status"], "error")
+                self.assertIn("unsafe-field", safe["error"])
+                self.assertNotIn("SECRET", json.dumps(safe))
+
+    def test_export_us3_unsafe_identity_rejected(self):
+        value = self.us3_report()
+        value["scenarios"][2]["facts"]["before"]["client_id"] = "raw-client"
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe["status"], "error")
+
+    def test_export_us3_fake_partial_rejected_outside_windows(self):
+        value = self.us3_report()
+        scenario = value["scenarios"][2]
+        controlled = self.us3_controlled()
+        scenario["generation_proofs"][0] = {
+            "generation": 1,
+            "mode": "controlled_truncated",
+            "sealed": False,
+            "trusted": False,
+            "exact_counts": False,
+            "controlled_termination": controlled,
+        }
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn(
+            "us3-controlled-proof-outside-window", safe["problems"]
+        )
+
+    def test_export_us3_missing_query_applied_proof_non_green(self):
+        value = self.us3_report()
+        value["scenarios"][2]["queries"] = []
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-missing-query-applied", safe["problems"])
+
+    def test_export_us3_mismatch_scenarios_are_independent(self):
+        for index, name in enumerate(
+            (
+                "query_mismatch_reference",
+                "query_mismatch_amount",
+                "query_mismatch_currency",
+                "query_mismatch_transaction",
+            )
+        ):
+            with self.subTest(name=name):
+                value = self.us3_report()
+                value["scenarios"].pop(
+                    MOD.US3_SCENARIO_NAMES.index(name)
+                )
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe.get("result"), "fail")
+                self.assertIn(name, safe["missing_scenarios"])
+
+    def test_export_us3_over_limit_http_rejected(self):
+        value = self.us3_report()
+        entry = dict(value["scenarios"][0]["http"][0])
+        value["scenarios"][0]["http"] = [entry] * 17
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us3_safe()["status"], "error")
+
+    def test_export_us3_missing_fault_cleanup_rejected(self):
+        value = self.us3_report()
+        value["scenarios"][3]["faults"][0]["cleanup"]["verified"] = False
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us3_safe()["status"], "error")
+
+    def test_export_us3_wrong_lifecycle_combinations(self):
+        cases = []
+        value = self.us3_report()
+        value["scenarios"][22]["http"] = [
+            self.us3_http(kind="SHUTDOWN_PROBE", status=503, result="")
+        ]
+        cases.append(("before-cancel-probe", value))
+        value = self.us3_report()
+        value["scenarios"][22]["http"] = [
+            self.us3_http(status=503, result="UNKNOWN")
+        ]
+        cases.append(("cancel-primary-503", value))
+        value = self.us3_report()
+        value["scenarios"][23]["http"] = [
+            self.us3_http(kind="SHUTDOWN_PROBE", status=200, result="")
+        ]
+        cases.append(("probe-200", value))
+        value = self.us3_report()
+        value["scenarios"][0]["http"] = [
+            self.us3_http(kind="SHUTDOWN_PROBE", status=503, result="")
+        ]
+        cases.append(("response-only-probe", value))
+        value = self.us3_report()
+        value["scenarios"][23]["checks"]["counts_after"] = self.us3_counts(
+            0, 0, 1, 1, 1
+        )
+        cases.append(("exit-after-rows", value))
+        for name, value in cases:
+            with self.subTest(case=name):
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_us3_exit_primary_cancel_with_probe_is_valid(self):
+        value = self.us3_report()
+        value["scenarios"][23]["transport"] = "CLIENT_CANCELED"
+        value["scenarios"][23]["http"] = [
+            self.us3_http(kind="SHUTDOWN_PROBE", status=503, result="")
+        ]
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "pass")
+
+    def test_export_us3_exit_primary_no_response_without_probe_is_valid(self):
+        index = MOD.US3_SCENARIO_NAMES.index("lifecycle_exit_budget")
+        value = self.us3_report()
+        value["scenarios"][index]["transport"] = "NO_RESPONSE"
+        value["scenarios"][index]["http"] = []
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_us3_safe().get("result"), "pass")
+
+    def test_export_us3_exit_without_probe_still_requires_shutdown_proof(self):
+        index = MOD.US3_SCENARIO_NAMES.index("lifecycle_exit_budget")
+        value = self.us3_report()
+        value["scenarios"][index]["transport"] = "NO_RESPONSE"
+        value["scenarios"][index]["http"] = []
+        del value["scenarios"][index]["shutdown"]
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-lifecycle-shutdown-missing", safe["problems"])
+
+    def test_export_us3_multiple_exit_probes_rejected(self):
+        index = MOD.US3_SCENARIO_NAMES.index("lifecycle_exit_budget")
+        value = self.us3_report()
+        value["scenarios"][index]["http"] = [
+            self.us3_http(kind="SHUTDOWN_PROBE", status=503, result=""),
+            self.us3_http(kind="SHUTDOWN_PROBE", status=503, result=""),
+        ]
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-shutdown-probe-count", safe["problems"])
+
+    def test_export_us3_exit_requires_unmanaged_goroutine_source(self):
+        index = MOD.US3_SCENARIO_NAMES.index("lifecycle_exit_budget")
+        for mutation in ("missing", "wrong"):
+            with self.subTest(mutation=mutation):
+                value = self.us3_report()
+                shutdown = value["scenarios"][index]["shutdown"]
+                if mutation == "missing":
+                    del shutdown["no_unmanaged_goroutine_source"]
+                else:
+                    shutdown["no_unmanaged_goroutine_source"] = "OBSERVED"
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe["status"], "error")
+                expected = (
+                    "unsafe-field-us3.shutdown"
+                    if mutation == "missing"
+                    else "unsafe-field-us3.shutdown.no_unmanaged_goroutine_source"
+                )
+                self.assertEqual(safe["error"], expected)
+
+    def test_export_us3_exit_unmanaged_goroutine_requires_group_proof(self):
+        index = MOD.US3_SCENARIO_NAMES.index("lifecycle_exit_budget")
+        value = self.us3_report()
+        value["scenarios"][index]["commands"] = [
+            command
+            for command in value["scenarios"][index]["commands"]
+            if command["kind"] != "process_stop"
+        ]
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-lifecycle-goroutine-proof", safe["problems"])
+
+    def test_export_us3_symlink_source_rejected(self):
+        self.write_db(self.db_report())
+        target = self.root / "outside-us3.json"
+        target.write_text(json.dumps(self.us3_report()), encoding="utf-8")
+        link = self.db_root / self.run_id / "us3.json"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe["status"], "error")
+        self.assertEqual(safe["error"], "unsafe-source-path")
+
+    def test_export_us3_no_mock_match_and_not_visible_are_distinct(self):
+        cases = []
+        value = self.us3_report()
+        value["scenarios"][
+            MOD.US3_SCENARIO_NAMES.index("query_unknown_no_mock_match")
+        ]["pg"] = [
+            {"state": "ORDER", "rows": 1},
+            {"state": "MOCK", "rows": 1},
+            {"state": "TRACE", "rows": 0},
+        ]
+        cases.append(("no-mock-match-with-mock", value))
+        value = self.us3_report()
+        value["scenarios"][
+            MOD.US3_SCENARIO_NAMES.index("query_unknown_not_visible")
+        ]["pg"] = [
+            {"state": "ORDER", "rows": 1},
+            {"state": "MOCK", "rows": 0},
+            {"state": "TRACE", "rows": 1},
+        ]
+        cases.append(("not-visible-without-mock", value))
+        for name, value in cases:
+            with self.subTest(case=name):
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe.get("result"), "fail")
+
+    def test_export_us3_trace_failure_requires_explicit_sqlstate_source(self):
+        value = self.us3_report()
+        scenario = value["scenarios"][
+            MOD.US3_SCENARIO_NAMES.index("query_confirmed_trace_failure")
+        ]
+        scenario["trace"]["sqlstate_source"] = "application_observed"
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-trace-failure-sqlstate", safe["problems"])
+
+    def test_export_us3_save_readback_scope_and_source_pair(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_result_commit_unknown")
+        value = self.us3_report()
+        value["scenarios"][index]["save"].update(
+            {
+                "readback_scope": "INDEPENDENT_ORDER_AND_RECORD",
+                "readback_source": "APP_AND_EXTERNAL",
+            }
+        )
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_us3_safe().get("result"), "pass")
+
+        value["scenarios"][index]["save"]["readback_source"] = "APP"
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-save-readback-source", safe["problems"])
+
+    def test_export_us3_scenario_limit_rejected(self):
+        value = self.us3_report()
+        value["scenarios"].extend(
+            [value["scenarios"][0]] * (MOD.US3_SCENARIO_MAX + 1)
+        )
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us3_safe()["status"], "error")
+
+    def test_export_us3_lifecycle_after_mock_confirmed_shape_is_valid(self):
+        index = MOD.US3_SCENARIO_NAMES.index("lifecycle_cancel_after_mock")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        scenario["pg"] = [
+            {"state": "ORDER", "rows": 1},
+            {"state": "MOCK", "rows": 1},
+            {"state": "TRACE", "rows": 1},
+        ]
+        scenario["checks"]["counts_after"] = self.us3_counts(1, 0, 1, 1, 1)
+        scenario["facts"] = {
+            "before": self.us3_fact("UNKNOWN"),
+            "after": self.us3_fact("SUCCEEDED"),
+            "transition": "UNKNOWN_TO_CONFIRMED",
+            "stable_facts": True,
+        }
+        scenario["records"] = [
+            self.us3_record(
+                decision="ACCEPT_CONFIRMATION",
+                before="UNKNOWN",
+                after="SUCCEEDED",
+                source="PAYMENT",
+            )
+        ]
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_us3_safe().get("result"), "pass")
+
+    def test_export_us3_producer_query_not_found_shape_rejects_fake_query(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_not_found")
+        value = self.us3_report()
+        value["scenarios"][index]["queries"] = [
+            self.us3_query(
+                outcome="not_found",
+                decision="KEEP_UNKNOWN",
+                before="UNKNOWN",
+                after="UNKNOWN",
+                trace_outcome="NOT_ATTEMPTED",
+                applied=False,
+            )
+        ]
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-query-not-found-queries", safe["problems"])
+
+    def test_export_us3_producer_confirmed_plain_shape_rejects_new_work(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_confirmed_plain")
+        cases = ("query", "trace", "save")
+        for case in cases:
+            with self.subTest(case=case):
+                value = self.us3_report()
+                scenario = value["scenarios"][index]
+                if case == "query":
+                    scenario["queries"] = [self.us3_query(applied=False)]
+                elif case == "trace":
+                    scenario["trace"] = {
+                        "outcome": "SAVED",
+                        "issue": "",
+                        "sqlstate": "00000",
+                        "sqlstate_source": "application_observed",
+                        "confirmed_fact_returned": True,
+                        "new_lookup": False,
+                        "proof_source": "OBSERVER",
+                    }
+                else:
+                    scenario["save"] = {
+                        "attempts": 1,
+                        "record_id": self.us3_record_id,
+                        "commit_state": "INDETERMINATE",
+                        "application_readback": "ORDER_ONLY",
+                        "external_pg_readback": "NONE",
+                        "readback_verified": True,
+                        "readback_scope": "APPLICATION_ORDER_ONLY",
+                        "readback_source": "APP",
+                        "created_claimed": False,
+                        "rollback_claimed": False,
+                        "candidate_id_leaked": False,
+                    }
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe.get("result"), "fail")
+
+    def test_export_us3_producer_result_commit_unknown_shape_accepts_no_trace(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_result_commit_unknown")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        self.assertNotIn("trace", scenario)
+        self.assertEqual(scenario["save"]["record_id"], self.us3_record_id)
+        self.assertEqual(
+            scenario["save"]["readback_scope"],
+            "INDEPENDENT_ORDER_AND_RECORD",
+        )
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_us3_safe().get("result"), "pass")
+
+    def test_export_us3_producer_result_commit_unknown_rejects_trace_claim(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_result_commit_unknown")
+        value = self.us3_report()
+        value["scenarios"][index]["trace"] = {
+            "outcome": "FAILED",
+            "issue": "TRACE_SAVE_ERROR",
+            "sqlstate": "P0001",
+            "sqlstate_source": "fixture_probe",
+            "confirmed_fact_returned": True,
+            "new_lookup": False,
+            "proof_source": "APPLICATION_OBSERVED",
+        }
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-trace-claim", safe["problems"])
+
+    def test_export_us3_producer_submit_commit_unknown_accepts_empty_record(self):
+        index = MOD.US3_SCENARIO_NAMES.index("submit_commit_unknown")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        self.assertEqual(scenario["save"]["record_id"], "")
+        self.assertEqual(scenario["records"], [])
+        self.assertEqual(scenario["queries"], [])
+        self.assertNotIn("trace", scenario)
+        self.assertEqual(
+            scenario["faults"][0]["kind"], "REGISTRATION_COMMIT_REPLY_LOST"
+        )
+        self.assertEqual(
+            scenario["faults"][0]["cleanup"]["kind"], "UDS_SCENARIO"
+        )
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_us3_safe().get("result"), "pass")
+
+    def test_export_us3_producer_submit_commit_unknown_rejects_fake_record(self):
+        index = MOD.US3_SCENARIO_NAMES.index("submit_commit_unknown")
+        for mutation in ("uuid", "records"):
+            with self.subTest(mutation=mutation):
+                value = self.us3_report()
+                scenario = value["scenarios"][index]
+                if mutation == "uuid":
+                    scenario["save"]["record_id"] = self.us3_record_id
+                else:
+                    scenario["records"] = [
+                        self.us3_record(
+                            decision="KEEP_UNKNOWN",
+                            before="UNKNOWN",
+                            after="UNKNOWN",
+                            reason="MOCK_RESULT_UNCONFIRMED",
+                            source="PAYMENT",
+                        )
+                    ]
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe.get("result"), "fail")
+
+    def test_export_us3_producer_result_save_rejects_empty_or_unbound_record(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_result_commit_unknown")
+        for mutation in ("empty", "unbound"):
+            with self.subTest(mutation=mutation):
+                value = self.us3_report()
+                scenario = value["scenarios"][index]
+                if mutation == "empty":
+                    scenario["save"]["record_id"] = ""
+                else:
+                    scenario["save"]["record_id"] = (
+                        "523e4567-e89b-42d3-a456-426614174004"
+                    )
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                if mutation == "empty":
+                    self.assertEqual(safe["status"], "error")
+                else:
+                    self.assertEqual(safe.get("result"), "fail")
+                    self.assertIn(
+                        "us3-save-record-binding", safe["problems"]
+                    )
+
+    def test_export_us3_query_subtimeout_budget_contract(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_unknown_subtimeout")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        self.assertEqual(
+            scenario["budgets"][0]["pass_budget"], False
+        )
+        self.assertEqual(scenario["budgets"][0]["limit_ms"], 250)
+        self.assertEqual(scenario["budgets"][0]["elapsed_ms"], 251)
+        self.assertEqual(scenario["budgets"][1]["kind"], "MOCK")
+        self.assertEqual(scenario["budgets"][1]["limit_ms"], 3000)
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+
+        for mutation in ("no-companion", "short-elapsed", "wall-pass"):
+            with self.subTest(mutation=mutation):
+                value = self.us3_report()
+                scenario = value["scenarios"][index]
+                if mutation == "no-companion":
+                    scenario["budgets"] = scenario["budgets"][:1]
+                elif mutation == "short-elapsed":
+                    scenario["budgets"][0]["elapsed_ms"] = 249
+                    scenario["budgets"][1]["elapsed_ms"] = 249
+                else:
+                    scenario["budgets"][0]["pass_budget"] = True
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_us3_mock_db_subtimeout_budget_contract(self):
+        index = MOD.US3_SCENARIO_NAMES.index(
+            "submit_unknown_no_transaction"
+        )
+        value = self.us3_report()
+        value["scenarios"][index]["budgets"] = value["scenarios"][index][
+            "budgets"
+        ][:1]
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-mock-db-subtimeout-companion", safe["problems"])
+
+        value = self.us3_report()
+        value["scenarios"][index]["budgets"][0]["pass_budget"] = True
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us3_safe()["status"], "error")
+
+    def test_export_us3_trace_failure_not_recorded_shape(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_confirmed_trace_failure")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        self.assertEqual(
+            scenario["queries"][0]["decision"], "NOT_RECORDED"
+        )
+        self.assertEqual(scenario["queries"][0]["result_before"], "")
+        self.assertEqual(scenario["queries"][0]["result_after"], "")
+        self.assertEqual(
+            scenario["queries"][0]["trace_outcome"], "FAILED"
+        )
+        self.assertEqual(
+            scenario["records"][0]["decision"], "ACCEPT_CONFIRMATION"
+        )
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+
+        cases = []
+        value = self.us3_report()
+        value["scenarios"][index]["queries"][0]["result_before"] = "SUCCEEDED"
+        cases.append(("nonempty-before", value, "fail"))
+        value = self.us3_report()
+        value["scenarios"][index]["queries"][1]["decision"] = "NOT_RECORDED"
+        cases.append(("second-not-recorded", value, "fail"))
+        value = self.us3_report()
+        value["scenarios"][
+            MOD.US3_SCENARIO_NAMES.index("query_mismatch_reference")
+        ]["queries"][0]["decision"] = "NOT_RECORDED"
+        cases.append(("mismatch-not-recorded", value, "fail"))
+        value = self.us3_report()
+        value["scenarios"][index]["records"][0]["decision"] = "NOT_RECORDED"
+        cases.append(("record-not-recorded", value, "error"))
+        for name, value, expected in cases:
+            with self.subTest(case=name):
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                if expected == "error":
+                    self.assertEqual(safe["status"], "error")
+                else:
+                    self.assertEqual(safe.get("result"), "fail")
+
+    def test_export_us3_protection_first_second_request_order(self):
+        for name in (
+            "protection_inflight_failure",
+            "protection_inflight_mismatch",
+        ):
+            index = MOD.US3_SCENARIO_NAMES.index(name)
+            value = self.us3_report()
+            protection = value["scenarios"][index]["protection"]
+            self.assertNotEqual(
+                protection["first_applied"], "ACCEPT_CONFIRMATION"
+            )
+            self.assertEqual(
+                protection["second_applied"], "ACCEPT_CONFIRMATION"
+            )
+            self.write_db(self.db_report())
+            self.write_us3(value)
+            code, _ = self.export_db_us3()
+            self.assertEqual(code, 0)
+
+            value = self.us3_report()
+            protection = value["scenarios"][index]["protection"]
+            protection["first_applied"] = "ACCEPT_CONFIRMATION"
+            protection["second_applied"] = (
+                "KEEP_CONFIRMED"
+                if name == "protection_inflight_failure"
+                else "REJECT_EVIDENCE"
+            )
+            self.write_db(self.db_report())
+            self.write_us3(value)
+            code, _ = self.export_db_us3()
+            self.assertEqual(code, 1)
+            safe = self.read_us3_safe()
+            self.assertEqual(safe.get("result"), "fail")
+            self.assertIn(
+                "us3-protection-first-applied", safe["problems"]
+            )
+
+    def test_export_us3_query_request_id_identity(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_unknown_confirmed")
+        value = self.us3_report()
+        value["scenarios"][index]["queries"][0].pop("request_id")
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_us3_safe()["status"], "error")
+
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        scenario["queries"][0]["request_id"] = self.us3_request_id_n(9)
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-query-request-http", safe["problems"])
+
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        scenario["queries"].append(dict(scenario["queries"][0]))
+        scenario["http"].append(
+            self.us3_http(request_id=scenario["queries"][0]["request_id"])
+        )
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-query-request-id-duplicate", safe["problems"])
+
+    def test_export_us3_restart_query_proof_required(self):
+        for name in (
+            "restart_registered_unpaid",
+            "restart_mock_committed_reply_lost",
+        ):
+            index = MOD.US3_SCENARIO_NAMES.index(name)
+            with self.subTest(name=name, case="baseline"):
+                self.write_db(self.db_report())
+                self.write_us3(self.us3_report())
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 0)
+                self.assertEqual(self.read_us3_safe()["result"], "pass")
+
+            cases = {}
+            value = self.us3_report()
+            scenario = value["scenarios"][index]
+            scenario["queries"] = []
+            scenario["records"] = []
+            scenario["calls"][1]["query_calls"] = 0
+            scenario["checks"]["counts_after"] = self.us3_counts(
+                0, 0, 1, scenario["pg"][1]["rows"], 0
+            )
+            scenario["pg"][2]["rows"] = 0
+            scenario["generation_proofs"][1]["counts"] = self.us3_counts(
+                0, 0, 0, 0, 0
+            )
+            scenario["generation_proofs"][1]["receipt"]["last_seq"] = 0
+            cases["missing-query-record-zero-calls-trace-seq"] = value
+
+            value = self.us3_report()
+            value["scenarios"][index]["http"] = value["scenarios"][index][
+                "http"
+            ][:1]
+            cases["replay-http-only"] = value
+
+            value = self.us3_report()
+            value["scenarios"][index]["records"] = []
+            cases["missing-saved-record"] = value
+
+            value = self.us3_report()
+            scenario = value["scenarios"][index]
+            scenario["queries"][0]["request_id"] = scenario["http"][0][
+                "request_id"
+            ]
+            cases["swapped-request-id"] = value
+
+            value = self.us3_report()
+            value["scenarios"][index]["queries"][0]["trusted"] = False
+            cases["untrusted-query"] = value
+
+            value = self.us3_report()
+            value["scenarios"][index]["queries"][0]["generation"] = 1
+            cases["bad-query-generation"] = value
+
+            for case, value in cases.items():
+                with self.subTest(name=name, case=case):
+                    self.write_db(self.db_report())
+                    self.write_us3(value)
+                    code, _ = self.export_db_us3()
+                    self.assertEqual(code, 1)
+                    safe = self.read_us3_safe()
+                    self.assertTrue(
+                        safe.get("result") == "fail"
+                        or safe.get("status") == "error"
+                    )
+
+    def test_export_us3_query_request_must_match_primary_not_probe(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_unknown_confirmed")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        probe_id = self.us3_request_id_n(7)
+        scenario["queries"][0]["request_id"] = probe_id
+        scenario["http"].append(
+            self.us3_http(
+                kind="SHUTDOWN_PROBE",
+                status=503,
+                result="",
+                request_id=probe_id,
+            )
+        )
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-query-request-http", safe["problems"])
+
+    def test_export_us3_query_record_identity_must_match_saved_query(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_unknown_confirmed")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        scenario["records"][0]["request_id"] = self.us3_request_id_n(8)
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-query-record", safe["problems"])
+
+    def test_export_us3_trace_failure_accept_record_binds_second_request(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_confirmed_trace_failure")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        scenario["records"][0]["request_id"] = self.us3_request_id_n(9)
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-trace-failure-accept-binding", safe["problems"])
+
+    def test_export_us3_http_array_order_is_not_business_relation(self):
+        index = MOD.US3_SCENARIO_NAMES.index("protection_inflight_failure")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        scenario["http"] = list(reversed(scenario["http"]))
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_us3_safe().get("result"), "pass")
+
+    def test_export_us3_seed_historical_record_not_in_http_allowed(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_unknown_confirmed")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        scenario["records"].append(
+            self.us3_record(
+                decision="KEEP_UNKNOWN",
+                before="UNKNOWN",
+                after="UNKNOWN",
+                reason="MOCK_RESULT_NOT_FOUND",
+                source="PAYMENT",
+                request_id=self.us3_request_id_n(9),
+            )
+        )
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_us3_safe().get("result"), "pass")
+
+    def test_export_us3_zero_receipts_allow_only_zero_business_events(self):
+        for name in (
+            "query_not_found",
+            "query_confirmed_plain",
+            "lifecycle_cancel_before_mock",
+            "lifecycle_exit_budget",
+        ):
+            index = MOD.US3_SCENARIO_NAMES.index(name)
+            value = self.us3_report()
+            scenario = value["scenarios"][index]
+            self.assertEqual(
+                scenario["generation_proofs"][0]["receipt"]["last_seq"], 0
+            )
+            self.assertEqual(
+                scenario["calls"][0]["payment_calls"], 0
+            )
+            self.assertEqual(scenario["calls"][0]["query_calls"], 0)
+            self.assertEqual(scenario["queries"], [])
+            self.write_db(self.db_report())
+            self.write_us3(value)
+            code, _ = self.export_db_us3()
+            self.assertEqual(code, 0)
+
+    def test_export_us3_zero_receipt_rejects_nonzero_calls(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_not_found")
+        value = self.us3_report()
+        value["scenarios"][index]["calls"][0]["payment_calls"] = 1
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-zero-receipt-calls", safe["problems"])
+
+    def test_export_us3_zero_receipt_rejects_query_application(self):
+        index = MOD.US3_SCENARIO_NAMES.index("lifecycle_cancel_before_mock")
+        value = self.us3_report()
+        scenario = value["scenarios"][index]
+        scenario["http"] = [
+            self.us3_http(request_id=self.us3_request_id_n(1))
+        ]
+        scenario["queries"] = [
+            self.us3_query(
+                outcome="not_found",
+                decision="KEEP_UNKNOWN",
+                before="UNKNOWN",
+                after="UNKNOWN",
+                trace_outcome="NOT_ATTEMPTED",
+                applied=False,
+                request_id=self.us3_request_id_n(1),
+            )
+        ]
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-zero-receipt-queries", safe["problems"])
+
+    def test_export_us3_receipt_seq_bounds_and_generation(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_not_found")
+        for mutation, expected in (
+            ("negative", "unsafe-field-us3.receipt.last_seq"),
+            ("overlimit", "unsafe-field-us3.receipt.last_seq"),
+            ("generation", "unsafe-field-us3.receipt.generation"),
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us3_report()
+                receipt = value["scenarios"][index]["generation_proofs"][0][
+                    "receipt"
+                ]
+                if mutation == "negative":
+                    receipt["last_seq"] = -1
+                elif mutation == "overlimit":
+                    receipt["last_seq"] = 4097
+                else:
+                    receipt["generation"] = 2
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe["status"], "error")
+                self.assertEqual(safe["error"], expected)
+
+    def test_export_us3_controlled_truncated_receipt_rejected(self):
+        index = MOD.US3_SCENARIO_NAMES.index("restart_registered_unpaid")
+        value = self.us3_report()
+        value["scenarios"][index]["generation_proofs"][0]["receipt"] = {
+            "run_id": self.run_id,
+            "epoch": self.us3_epoch,
+            "generation": 1,
+            "last_seq": 0,
+        }
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 1)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "fail")
+        self.assertIn("us3-controlled-proof", safe["problems"])
+
+    def test_export_us3_trace_proof_source_exact_literal_is_canonicalized(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_confirmed_trace_failure")
+        value = self.us3_report()
+        value["scenarios"][index]["trace"]["proof_source"] = (
+            MOD.US3_TRACE_PROOF_SOURCE_LITERAL
+        )
+        self.write_db(self.db_report())
+        self.write_us3(value)
+        code, _ = self.export_db_us3()
+        self.assertEqual(code, 0)
+        safe = self.read_us3_safe()
+        self.assertEqual(safe.get("result"), "pass")
+        trace = next(
+            scenario["trace"]
+            for scenario in safe["scenarios"]
+            if scenario["name"] == "query_confirmed_trace_failure"
+        )
+        self.assertEqual(
+            trace["proof_source"],
+            MOD.US3_TRACE_PROOF_SOURCE_CANONICAL,
+        )
+        self.assertNotIn(
+            "actual first-request HTTP TRACE_SAVE_ERROR",
+            json.dumps(safe),
+        )
+
+    def test_export_us3_trace_proof_source_arbitrary_prose_rejected(self):
+        index = MOD.US3_SCENARIO_NAMES.index("query_confirmed_trace_failure")
+        for mutation in (
+            "arbitrary prose with spaces",
+            MOD.US3_TRACE_PROOF_SOURCE_LITERAL + " SECRET_CANARY",
+            "sk_live_" + "A" * 100,
+        ):
+            with self.subTest(mutation=mutation[:24]):
+                value = self.us3_report()
+                value["scenarios"][index]["trace"]["proof_source"] = mutation
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe["status"], "error")
+                self.assertEqual(
+                    safe["error"],
+                    "unsafe-field-us3.trace.proof_source",
+                )
+                self.assertNotIn("SECRET_CANARY", json.dumps(safe))
+
+    def test_export_us3_tablelock_fault_empty_source_canonicalizes_to_none(self):
+        for name in (
+            "lifecycle_cancel_before_mock",
+            "lifecycle_cancel_after_mock",
+            "lifecycle_exit_budget",
+        ):
+            index = MOD.US3_SCENARIO_NAMES.index(name)
+            value = self.us3_report()
+            scenario = value["scenarios"][index]
+            self.assertEqual(
+                scenario["faults"][0]["sqlstate_source"], ""
+            )
+            self.assertEqual(scenario["faults"][0]["sqlstate"], "")
+            self.assertEqual(
+                scenario["faults"][0]["cleanup"]["kind"],
+                "TABLE_SHARE_LOCK",
+            )
+            self.write_db(self.db_report())
+            self.write_us3(value)
+            code, _ = self.export_db_us3()
+            self.assertEqual(code, 0)
+            safe = self.read_us3_safe()
+            projected = next(
+                item for item in safe["scenarios"] if item["name"] == name
+            )
+            self.assertEqual(
+                projected["faults"][0]["sqlstate_source"], "none"
+            )
+
+    def test_export_us3_empty_fault_source_rejects_other_shapes(self):
+        index = MOD.US3_SCENARIO_NAMES.index("lifecycle_cancel_before_mock")
+        for mutation in (
+            "sqlstate",
+            "sql-fault",
+            "other-kind",
+            "wrong-cleanup",
+            "missing-key",
+            "none-with-sqlstate",
+        ):
+            with self.subTest(mutation=mutation):
+                value = self.us3_report()
+                fault = value["scenarios"][index]["faults"][0]
+                if mutation == "sqlstate":
+                    fault["sqlstate"] = "P0001"
+                elif mutation == "sql-fault":
+                    fault["kind"] = "TRACE_INSERT_SQL"
+                    fault["sqlstate"] = "P0001"
+                elif mutation == "other-kind":
+                    fault["kind"] = "MOCK_QUERY_FAILURE"
+                elif mutation == "wrong-cleanup":
+                    fault["cleanup"]["kind"] = "UDS_SCENARIO"
+                elif mutation == "missing-key":
+                    del fault["sqlstate_source"]
+                else:
+                    fault["sqlstate"] = "P0001"
+                    fault["sqlstate_source"] = "none"
+                self.write_db(self.db_report())
+                self.write_us3(value)
+                code, _ = self.export_db_us3()
+                self.assertEqual(code, 1)
+                safe = self.read_us3_safe()
+                self.assertEqual(safe["status"], "error")
+                expected = (
+                    "unsafe-field-us3.fault"
+                    if mutation == "missing-key"
+                    else "unsafe-field-us3.fault.sqlstate_source"
+                )
+                self.assertEqual(safe["error"], expected)
+
     def test_export_us2_complete_pass_rebuilds_safe_report(self):
         self.write_db(self.db_report())
         self.write_us2(self.us2_report())
@@ -5222,8 +7995,8 @@ class ExportReportsTests(unittest.TestCase):
                 "commit": "e672cbe8fbc8c76e28fcb6db0efd9ce354e0dac5",
             },
             "tool_verified": trusted,
-            "expected_go_version": "go1.27.3",
-            "go_version": "go1.27.3" if trusted else None,
+            "expected_go_version": "go1.27.4",
+            "go_version": "go1.27.4" if trusted else None,
             "source_hash": {
                 "go.mod": "b" * 64,
                 "go.sum": "c" * 64,

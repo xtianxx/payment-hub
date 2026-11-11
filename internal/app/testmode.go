@@ -12,11 +12,12 @@ import (
 )
 
 const (
-	testModeEnv       = "PAYMENT_HUB_TEST_MODE"
-	testModeSocketEnv = "PAYMENT_HUB_TEST_CONTROL_SOCKET"
-	testModeRunEnv    = "PAYMENT_HUB_TEST_RUN_ID"
-	testModeEpochEnv  = "PAYMENT_HUB_TEST_OBSERVER_EPOCH"
-	testModeGenEnv    = "PAYMENT_HUB_TEST_GENERATION"
+	testModeEnv        = "PAYMENT_HUB_TEST_MODE"
+	testModeSocketEnv  = "PAYMENT_HUB_TEST_CONTROL_SOCKET"
+	testModeRunEnv     = "PAYMENT_HUB_TEST_RUN_ID"
+	testModeEpochEnv   = "PAYMENT_HUB_TEST_OBSERVER_EPOCH"
+	testModeGenEnv     = "PAYMENT_HUB_TEST_GENERATION"
+	testModeVersionEnv = "PAYMENT_HUB_TEST_CONTROL_VERSION"
 )
 
 var (
@@ -29,13 +30,21 @@ var (
 // TestModeConfig is the parsed test-mode switch and observer session.
 type TestModeConfig struct {
 	Enabled bool
+	// Version is the explicit protocol opt-in. Zero keeps the legacy v1
+	// boundary; v2 is required for query-control.
+	Version int
 	Session testcontrol.Session
+
+	// lookup is retained only so OpenTestMode can read the explicit version
+	// variable after mode has already been enabled. It is never serialized.
+	lookup func(string) (string, bool)
 }
 
 // TestMode owns one private test-control Client and its consumer adapters.
 // It is only constructed when test mode is enabled.
 type TestMode struct {
 	client        *testcontrol.Client
+	version       int
 	mockHooks     *mock.Hooks
 	postgresHooks *postgres.Hooks
 }
@@ -86,7 +95,29 @@ func LoadTestModeConfig(lookup func(string) (string, bool)) (TestModeConfig, err
 			Epoch:      epoch,
 			Generation: generation,
 		},
+		lookup: lookup,
 	}, nil
+}
+
+// LoadTestModeControlVersion reads only the explicit protocol opt-in variable.
+// It is called only after test mode is enabled, so a version value can never
+// enable test mode by itself. An unset value keeps the zero-value v1 default.
+func LoadTestModeControlVersion(lookup func(string) (string, bool)) (int, error) {
+	if lookup == nil {
+		return 0, ErrTestModeConfig
+	}
+	value, ok := lookup(testModeVersionEnv)
+	if !ok {
+		return 0, nil
+	}
+	switch value {
+	case "1":
+		return testcontrol.Version, nil
+	case "2":
+		return testcontrol.Version2, nil
+	default:
+		return 0, ErrTestModeConfig
+	}
 }
 
 // OpenTestMode validates an enabled configuration and performs the private UDS
@@ -99,7 +130,23 @@ func OpenTestMode(ctx context.Context, cfg TestModeConfig) (*TestMode, error) {
 		!validTestModeLowerHex32(cfg.Session.Epoch) || cfg.Session.Generation == 0 {
 		return nil, ErrTestModeConfig
 	}
-	client, err := testcontrol.Dial(ctx, cfg.Session)
+	version := cfg.Version
+	if version == 0 && cfg.lookup != nil {
+		loaded, err := LoadTestModeControlVersion(cfg.lookup)
+		if err != nil {
+			return nil, ErrTestModeConfig
+		}
+		version = loaded
+	}
+	if version == 0 {
+		version = testcontrol.Version
+	}
+	if version != testcontrol.Version && version != testcontrol.Version2 {
+		return nil, ErrTestModeConfig
+	}
+	session := cfg.Session
+	session.Version = version
+	client, err := testcontrol.Dial(ctx, session)
 	if err != nil {
 		if client != nil {
 			_ = client.Close()
@@ -108,7 +155,8 @@ func OpenTestMode(ctx context.Context, cfg TestModeConfig) (*TestMode, error) {
 	}
 	return &TestMode{
 		client:        client,
-		mockHooks:     mock.NewHooks(&testModeMockControl{client: client}),
+		version:       version,
+		mockHooks:     mock.NewHooks(&testModeMockControl{client: client, version: version}),
 		postgresHooks: postgres.NewHooks(&testModePostgresControl{client: client}),
 	}, nil
 }
@@ -151,7 +199,8 @@ func (tm *TestMode) Close() error {
 }
 
 type testModeMockControl struct {
-	client *testcontrol.Client
+	client  *testcontrol.Client
+	version int
 }
 
 func (control *testModeMockControl) PaymentEntry(ctx context.Context, order payment.PaymentOrderID) error {
@@ -200,6 +249,92 @@ func (control *testModeMockControl) PaymentEntryResult(ctx context.Context, orde
 			return nil
 		},
 	}, nil
+}
+
+// QueryEntryResult records one query entry. In v2 it uses the private
+// QueryCall token and returns the selected scenario plus the exactly-once
+// applied callback. In v1 it keeps the legacy Enter observation with a no-op
+// applied callback.
+func (control *testModeMockControl) QueryEntryResult(ctx context.Context, order payment.PaymentOrderID) (mock.QueryEntryOutcome, error) {
+	if control == nil || control.client == nil {
+		return mock.QueryEntryOutcome{}, mock.ErrControlFault
+	}
+	if control.version != testcontrol.Version2 {
+		if err := control.client.Enter(ctx, testcontrol.KindQuery, string(order)); err != nil {
+			return mock.QueryEntryOutcome{}, mock.ErrControlFault
+		}
+		return mock.QueryEntryOutcome{
+			Scenario:  mock.QueryScenarioNormal,
+			OnApplied: func(context.Context, mock.QueryOutcome) error { return nil },
+		}, nil
+	}
+
+	client := control.client
+	token, err := client.QueryEntry(ctx, string(order))
+	if err != nil {
+		return mock.QueryEntryOutcome{}, mock.ErrControlFault
+	}
+	scenario := mock.QueryScenarioNormal
+	if directive, ok := token.Directive(); ok {
+		mapped, valid := testModeQueryScenario(directive)
+		if !valid {
+			return mock.QueryEntryOutcome{}, mock.ErrControlFault
+		}
+		scenario = mapped
+	}
+	return mock.QueryEntryOutcome{
+		Scenario: scenario,
+		OnApplied: func(ctx context.Context, actual mock.QueryOutcome) error {
+			mapped, valid := testModeQueryOutcome(actual)
+			if !valid {
+				return mock.ErrControlFault
+			}
+			if err := client.QueryApplied(ctx, token, mapped); err != nil {
+				return mock.ErrControlFault
+			}
+			return nil
+		},
+	}, nil
+}
+
+func testModeQueryScenario(value testcontrol.QueryScenario) (mock.QueryScenario, bool) {
+	switch value {
+	case testcontrol.QueryScenarioNormal:
+		return mock.QueryScenarioNormal, true
+	case testcontrol.QueryScenarioFailure:
+		return mock.QueryScenarioFailure, true
+	case testcontrol.QueryScenarioSubtimeout:
+		return mock.QueryScenarioSubtimeout, true
+	case testcontrol.QueryScenarioNotVisible:
+		return mock.QueryScenarioNotVisible, true
+	case testcontrol.QueryScenarioMismatchReference:
+		return mock.QueryScenarioMismatchReference, true
+	case testcontrol.QueryScenarioMismatchAmount:
+		return mock.QueryScenarioMismatchAmount, true
+	case testcontrol.QueryScenarioMismatchCurrency:
+		return mock.QueryScenarioMismatchCurrency, true
+	case testcontrol.QueryScenarioMismatchTransaction:
+		return mock.QueryScenarioMismatchTransaction, true
+	default:
+		return "", false
+	}
+}
+
+func testModeQueryOutcome(value mock.QueryOutcome) (testcontrol.QueryOutcome, bool) {
+	switch value {
+	case mock.QueryOutcomeFound:
+		return testcontrol.QueryOutcomeFound, true
+	case mock.QueryOutcomeNotFound:
+		return testcontrol.QueryOutcomeNotFound, true
+	case mock.QueryOutcomeUnavailable:
+		return testcontrol.QueryOutcomeUnavailable, true
+	case mock.QueryOutcomeSubtimeout:
+		return testcontrol.QueryOutcomeSubtimeout, true
+	case mock.QueryOutcomeMismatchApplied:
+		return testcontrol.QueryOutcomeMismatchApplied, true
+	default:
+		return "", false
+	}
 }
 
 func testModePaymentResult(directive testcontrol.Directive) (payment.Result, bool) {

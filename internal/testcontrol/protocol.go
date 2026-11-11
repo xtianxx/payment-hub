@@ -12,9 +12,43 @@ import (
 
 const (
 	Version        = 1
+	Version2       = 2
 	MaxFrameBytes  = 4096
 	MaxRecords     = 4096
 	MaxGenerations = 64
+
+	// CapabilityQueryControl is the only v2 begin capability. It is not a
+	// free-form set: v2 negotiation succeeds only with this exact value.
+	CapabilityQueryControl = "query-control-v1"
+)
+
+// QueryScenario is the closed set of trusted query-control scenarios. It is
+// transported in the v2-only query_directive field; it is never a script or
+// free-form payload.
+type QueryScenario string
+
+const (
+	QueryScenarioNormal              QueryScenario = "normal"
+	QueryScenarioFailure             QueryScenario = "failure"
+	QueryScenarioSubtimeout          QueryScenario = "subtimeout"
+	QueryScenarioNotVisible          QueryScenario = "notvisible"
+	QueryScenarioMismatchReference   QueryScenario = "mismatch_reference"
+	QueryScenarioMismatchAmount      QueryScenario = "mismatch_amount"
+	QueryScenarioMismatchCurrency    QueryScenario = "mismatch_currency"
+	QueryScenarioMismatchTransaction QueryScenario = "mismatch_transaction"
+)
+
+// QueryOutcome is the closed set of outcomes actually reached by one Mock
+// query. The consumer reports the branch it observed, never the expected
+// scenario value.
+type QueryOutcome string
+
+const (
+	QueryOutcomeFound           QueryOutcome = "found"
+	QueryOutcomeNotFound        QueryOutcome = "not_found"
+	QueryOutcomeUnavailable     QueryOutcome = "unavailable"
+	QueryOutcomeSubtimeout      QueryOutcome = "subtimeout"
+	QueryOutcomeMismatchApplied QueryOutcome = "mismatch_applied"
 )
 
 type Type string
@@ -42,6 +76,7 @@ const (
 	PointMockCommitted   Point = "MOCK_COMMITTED"
 	PointSavingResult    Point = "SAVING_RESULT"
 	PointResultCommitted Point = "RESULT_COMMITTED"
+	PointQueryApplied    Point = "QUERY_APPLIED"
 )
 
 type Action string
@@ -75,6 +110,9 @@ var (
 )
 
 type Session struct {
+	// Version is the explicit protocol opt-in. Zero keeps the legacy v1
+	// boundary; v2 is required for query-control.
+	Version    int
 	Socket     string
 	RunID      string
 	Epoch      string
@@ -106,6 +144,12 @@ type Frame struct {
 	Directive       *Directive `json:"directive,omitempty"`
 	PaymentCallSeq  *uint64    `json:"payment_call_seq,omitempty"`
 	AppliedResult   *Directive `json:"applied_result,omitempty"`
+
+	// v2 query-control extension. These fields are rejected in v1 frames.
+	Capability     string         `json:"capability,omitempty"`
+	QueryDirective *QueryScenario `json:"query_directive,omitempty"`
+	QueryCallSeq   *uint64        `json:"query_call_seq,omitempty"`
+	QueryOutcome   *QueryOutcome  `json:"query_outcome,omitempty"`
 }
 
 var errFrame = errors.New("invalid frame")
@@ -200,7 +244,7 @@ func parseObject(body []byte) (map[string]json.RawMessage, error) {
 
 func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 	version, err := decodeIntField(fields, "v")
-	if err != nil || version != Version {
+	if err != nil || (version != Version && version != Version2) {
 		return Frame{}, errFrame
 	}
 	typeValue, err := decodeStringField(fields, "type")
@@ -208,6 +252,7 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 		return Frame{}, errFrame
 	}
 	frameType := Type(typeValue)
+	v2 := version == Version2
 
 	if frameType == TypeFault {
 		if err := requireExactKeys(fields, "v", "type", "code"); err != nil {
@@ -217,7 +262,7 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 		if err != nil {
 			return Frame{}, errFrame
 		}
-		frame := Frame{Version: Version, Type: TypeFault, Code: FaultCode(codeValue)}
+		frame := Frame{Version: version, Type: TypeFault, Code: FaultCode(codeValue)}
 		if err := validateFrame(frame); err != nil {
 			return Frame{}, errFrame
 		}
@@ -226,7 +271,11 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 
 	switch frameType {
 	case TypeBegin:
-		if err := requireExactKeys(fields, identityKeys...); err != nil {
+		keys := append([]string{}, identityKeys...)
+		if v2 {
+			keys = append(keys, "capability")
+		}
+		if err := requireExactKeys(fields, keys...); err != nil {
 			return Frame{}, errFrame
 		}
 	case TypeCall:
@@ -234,7 +283,11 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 			return Frame{}, errFrame
 		}
 	case TypeReach:
-		if err := requireExactOrOptionalKeys(fields, append(append([]string{}, identityKeys...), "seq", "point", "order_id"), "payment_call_seq", "applied_result"); err != nil {
+		optional := []string{"payment_call_seq", "applied_result"}
+		if v2 {
+			optional = append(optional, "query_call_seq", "query_outcome")
+		}
+		if err := requireExactOrOptionalKeys(fields, append(append([]string{}, identityKeys...), "seq", "point", "order_id"), optional...); err != nil {
 			return Frame{}, errFrame
 		}
 	case TypeSeal:
@@ -248,11 +301,19 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 		}
 		switch Type(forValue) {
 		case TypeBegin:
-			if err := requireExactKeys(fields, append(append([]string{}, identityKeys...), "for")...); err != nil {
+			keys := append(append([]string{}, identityKeys...), "for")
+			if v2 {
+				keys = append(keys, "capability")
+			}
+			if err := requireExactKeys(fields, keys...); err != nil {
 				return Frame{}, errFrame
 			}
 		case TypeCall:
-			if err := requireExactOrOptionalKeys(fields, append(append([]string{}, identityKeys...), "seq", "for"), "directive"); err != nil {
+			optional := []string{"directive"}
+			if v2 {
+				optional = append(optional, "query_directive")
+			}
+			if err := requireExactOrOptionalKeys(fields, append(append([]string{}, identityKeys...), "seq", "for"), optional...); err != nil {
 				return Frame{}, errFrame
 			}
 		case TypeReach:
@@ -287,7 +348,7 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 		return Frame{}, errFrame
 	}
 	frame := Frame{
-		Version:    Version,
+		Version:    version,
 		Type:       frameType,
 		RunID:      runID,
 		Epoch:      epoch,
@@ -297,6 +358,13 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 
 	switch frameType {
 	case TypeBegin:
+		if v2 {
+			capability, err := decodeStringField(fields, "capability")
+			if err != nil {
+				return Frame{}, errFrame
+			}
+			frame.Capability = capability
+		}
 	case TypeCall:
 		seq, err := decodeUintField(fields, "seq")
 		if err != nil {
@@ -346,6 +414,25 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 			frame.PaymentCallSeq = &callSeq
 			frame.AppliedResult = &applied
 		}
+		if v2 {
+			rawQuerySeq, hasQuerySeq := fields["query_call_seq"]
+			rawQueryOutcome, hasQueryOutcome := fields["query_outcome"]
+			if hasQuerySeq != hasQueryOutcome {
+				return Frame{}, errFrame
+			}
+			if hasQuerySeq {
+				queryCallSeq, err := decodeUintRaw(rawQuerySeq)
+				if err != nil {
+					return Frame{}, errFrame
+				}
+				outcome, err := decodeQueryOutcomeRaw(rawQueryOutcome)
+				if err != nil {
+					return Frame{}, errFrame
+				}
+				frame.QueryCallSeq = &queryCallSeq
+				frame.QueryOutcome = &outcome
+			}
+		}
 	case TypeSeal:
 		expected, err := decodeUintField(fields, "expected_last_seq")
 		if err != nil {
@@ -357,6 +444,13 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 		frame.For = Type(forValue)
 		switch frame.For {
 		case TypeBegin:
+			if v2 {
+				capability, err := decodeStringField(fields, "capability")
+				if err != nil {
+					return Frame{}, errFrame
+				}
+				frame.Capability = capability
+			}
 		case TypeCall:
 			seq, err := decodeUintField(fields, "seq")
 			if err != nil {
@@ -369,6 +463,15 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 					return Frame{}, errFrame
 				}
 				frame.Directive = &directive
+			}
+			if v2 {
+				if raw, ok := fields["query_directive"]; ok {
+					scenario, err := decodeQueryScenarioRaw(raw)
+					if err != nil {
+						return Frame{}, errFrame
+					}
+					frame.QueryDirective = &scenario
+				}
 			}
 		case TypeReach:
 			seq, err := decodeUintField(fields, "seq")
@@ -397,9 +500,10 @@ func frameFromFields(fields map[string]json.RawMessage) (Frame, error) {
 }
 
 func validateFrame(frame Frame) error {
-	if frame.Version != Version {
+	if frame.Version != Version && frame.Version != Version2 {
 		return errFrame
 	}
+	v2 := frame.Version == Version2
 	if frame.Type == TypeFault {
 		if !validFaultCode(frame.Code) {
 			return errFrame
@@ -408,7 +512,9 @@ func validateFrame(frame Frame) error {
 			frame.Seq != 0 || frame.EventID != "" || frame.Kind != "" ||
 			frame.Point != "" || frame.OrderID != "" || frame.ExpectedLastSeq != nil ||
 			frame.For != "" || frame.Action != "" || frame.Directive != nil ||
-			frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
+			frame.PaymentCallSeq != nil || frame.AppliedResult != nil ||
+			frame.Capability != "" || frame.QueryDirective != nil ||
+			frame.QueryCallSeq != nil || frame.QueryOutcome != nil {
 			return errFrame
 		}
 		return nil
@@ -426,15 +532,27 @@ func validateFrame(frame Frame) error {
 		!utf8.ValidString(frame.EventID) || !utf8.ValidString(frame.OrderID) {
 		return errFrame
 	}
+	if !v2 && (frame.Capability != "" || frame.QueryDirective != nil ||
+		frame.QueryCallSeq != nil || frame.QueryOutcome != nil) {
+		return errFrame
+	}
 
 	switch frame.Type {
 	case TypeBegin:
 		if !validLowerHex32(frame.EventID) {
 			return errFrame
 		}
+		if v2 {
+			if frame.Capability != CapabilityQueryControl {
+				return errFrame
+			}
+		} else if frame.Capability != "" {
+			return errFrame
+		}
 		if frame.Seq != 0 || frame.Kind != "" || frame.Point != "" || frame.OrderID != "" ||
 			frame.ExpectedLastSeq != nil || frame.For != "" || frame.Action != "" || frame.Code != "" ||
-			frame.Directive != nil || frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
+			frame.Directive != nil || frame.PaymentCallSeq != nil || frame.AppliedResult != nil ||
+			frame.QueryDirective != nil || frame.QueryCallSeq != nil || frame.QueryOutcome != nil {
 			return errFrame
 		}
 	case TypeCall:
@@ -444,16 +562,19 @@ func validateFrame(frame Frame) error {
 		}
 		if frame.Point != "" || frame.ExpectedLastSeq != nil || frame.For != "" ||
 			frame.Action != "" || frame.Code != "" || frame.Directive != nil ||
-			frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
+			frame.PaymentCallSeq != nil || frame.AppliedResult != nil ||
+			frame.Capability != "" || frame.QueryDirective != nil ||
+			frame.QueryCallSeq != nil || frame.QueryOutcome != nil {
 			return errFrame
 		}
 	case TypeReach:
-		if frame.Seq < 1 || frame.Seq > MaxRecords || !validPoint(frame.Point) ||
+		if frame.Seq < 1 || frame.Seq > MaxRecords || !validPointForVersion(frame.Version, frame.Point) ||
 			!validUUIDv4(frame.OrderID) || !validCallEventID(frame.EventID, frame.Seq) {
 			return errFrame
 		}
 		if frame.Kind != "" || frame.ExpectedLastSeq != nil || frame.For != "" ||
-			frame.Action != "" || frame.Code != "" || frame.Directive != nil {
+			frame.Action != "" || frame.Code != "" || frame.Directive != nil ||
+			frame.Capability != "" || frame.QueryDirective != nil {
 			return errFrame
 		}
 		if (frame.PaymentCallSeq == nil) != (frame.AppliedResult == nil) {
@@ -466,6 +587,22 @@ func validateFrame(frame Frame) error {
 				return errFrame
 			}
 		}
+		if (frame.QueryCallSeq == nil) != (frame.QueryOutcome == nil) {
+			return errFrame
+		}
+		if frame.QueryCallSeq != nil {
+			if !v2 || frame.Point != PointQueryApplied ||
+				*frame.QueryCallSeq < 1 || *frame.QueryCallSeq >= frame.Seq ||
+				!validQueryOutcome(*frame.QueryOutcome) {
+				return errFrame
+			}
+		}
+		if v2 && frame.Point == PointQueryApplied && frame.QueryCallSeq == nil {
+			return errFrame
+		}
+		if v2 && frame.Point != PointQueryApplied && frame.QueryCallSeq != nil {
+			return errFrame
+		}
 	case TypeSeal:
 		if frame.ExpectedLastSeq == nil || *frame.ExpectedLastSeq > MaxRecords ||
 			!validSealEventID(frame.EventID) {
@@ -473,11 +610,24 @@ func validateFrame(frame Frame) error {
 		}
 		if frame.Seq != 0 || frame.Kind != "" || frame.Point != "" || frame.OrderID != "" ||
 			frame.For != "" || frame.Action != "" || frame.Code != "" ||
-			frame.Directive != nil || frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
+			frame.Directive != nil || frame.PaymentCallSeq != nil || frame.AppliedResult != nil ||
+			frame.Capability != "" || frame.QueryDirective != nil ||
+			frame.QueryCallSeq != nil || frame.QueryOutcome != nil {
 			return errFrame
 		}
 	case TypeAck:
 		if !validAckTarget(frame.For) {
+			return errFrame
+		}
+		if v2 {
+			if frame.For == TypeBegin {
+				if frame.Capability != CapabilityQueryControl {
+					return errFrame
+				}
+			} else if frame.Capability != "" {
+				return errFrame
+			}
+		} else if frame.Capability != "" {
 			return errFrame
 		}
 		switch frame.For {
@@ -487,7 +637,8 @@ func validateFrame(frame Frame) error {
 			}
 			if frame.Seq != 0 || frame.Action != "" || frame.ExpectedLastSeq != nil ||
 				frame.Kind != "" || frame.Point != "" || frame.OrderID != "" || frame.Code != "" ||
-				frame.Directive != nil || frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
+				frame.Directive != nil || frame.PaymentCallSeq != nil || frame.AppliedResult != nil ||
+				frame.QueryDirective != nil || frame.QueryCallSeq != nil || frame.QueryOutcome != nil {
 				return errFrame
 			}
 		case TypeCall:
@@ -496,10 +647,17 @@ func validateFrame(frame Frame) error {
 			}
 			if frame.Action != "" || frame.ExpectedLastSeq != nil || frame.Kind != "" ||
 				frame.Point != "" || frame.OrderID != "" || frame.Code != "" ||
-				frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
+				frame.PaymentCallSeq != nil || frame.AppliedResult != nil ||
+				frame.QueryCallSeq != nil || frame.QueryOutcome != nil {
 				return errFrame
 			}
 			if frame.Directive != nil && !validDirective(*frame.Directive) {
+				return errFrame
+			}
+			if frame.QueryDirective != nil && !validQueryScenario(*frame.QueryDirective) {
+				return errFrame
+			}
+			if frame.Directive != nil && frame.QueryDirective != nil {
 				return errFrame
 			}
 		case TypeReach:
@@ -509,7 +667,8 @@ func validateFrame(frame Frame) error {
 			}
 			if frame.ExpectedLastSeq != nil || frame.Kind != "" || frame.Point != "" ||
 				frame.OrderID != "" || frame.Code != "" || frame.Directive != nil ||
-				frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
+				frame.PaymentCallSeq != nil || frame.AppliedResult != nil ||
+				frame.QueryDirective != nil || frame.QueryCallSeq != nil || frame.QueryOutcome != nil {
 				return errFrame
 			}
 		case TypeSeal:
@@ -519,12 +678,76 @@ func validateFrame(frame Frame) error {
 			}
 			if frame.Seq != 0 || frame.Action != "" || frame.Kind != "" || frame.Point != "" ||
 				frame.OrderID != "" || frame.Code != "" || frame.Directive != nil ||
-				frame.PaymentCallSeq != nil || frame.AppliedResult != nil {
+				frame.PaymentCallSeq != nil || frame.AppliedResult != nil ||
+				frame.QueryDirective != nil || frame.QueryCallSeq != nil || frame.QueryOutcome != nil {
 				return errFrame
 			}
 		}
 	}
 	return nil
+}
+
+func validPointForVersion(version int, value Point) bool {
+	switch value {
+	case PointRegistered, PointMockCommitted, PointSavingResult, PointResultCommitted:
+		return true
+	case PointQueryApplied:
+		return version == Version2
+	default:
+		return false
+	}
+}
+
+func validQueryScenario(value QueryScenario) bool {
+	switch value {
+	case QueryScenarioNormal, QueryScenarioFailure, QueryScenarioSubtimeout,
+		QueryScenarioNotVisible, QueryScenarioMismatchReference,
+		QueryScenarioMismatchAmount, QueryScenarioMismatchCurrency,
+		QueryScenarioMismatchTransaction:
+		return true
+	default:
+		return false
+	}
+}
+
+func validQueryOutcome(value QueryOutcome) bool {
+	switch value {
+	case QueryOutcomeFound, QueryOutcomeNotFound, QueryOutcomeUnavailable,
+		QueryOutcomeSubtimeout, QueryOutcomeMismatchApplied:
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeQueryScenarioRaw(raw json.RawMessage) (QueryScenario, error) {
+	var value *string
+	if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+		return "", errFrame
+	}
+	if !utf8.ValidString(*value) {
+		return "", errFrame
+	}
+	scenario := QueryScenario(*value)
+	if !validQueryScenario(scenario) {
+		return "", errFrame
+	}
+	return scenario, nil
+}
+
+func decodeQueryOutcomeRaw(raw json.RawMessage) (QueryOutcome, error) {
+	var value *string
+	if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+		return "", errFrame
+	}
+	if !utf8.ValidString(*value) {
+		return "", errFrame
+	}
+	outcome := QueryOutcome(*value)
+	if !validQueryOutcome(outcome) {
+		return "", errFrame
+	}
+	return outcome, nil
 }
 
 func requireExactKeys(fields map[string]json.RawMessage, keys ...string) error {

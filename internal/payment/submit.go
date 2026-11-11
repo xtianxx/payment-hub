@@ -276,8 +276,24 @@ func (s *Submitter) saveAndReport(
 		}, nil
 	}
 
-	// A save error never authorizes using the returned Order or Record as a
-	// committed fact. Read the current order with the same finish deadline.
+	if message, ok := queryTraceSaveFailureMessage(saveErr); ok {
+		if err := validateTraceFailureResult(order, saved); err != nil {
+			return SubmitResult{}, err
+		}
+		// The marker carries the recorder's locked original confirmation.
+		// Return it directly; another lookup is not a precondition. Created
+		// remains true because this request definitely created the order.
+		issues = appendIssue(issues, Issue{Code: IssueCodeTraceSaveError, Message: message})
+		return SubmitResult{
+			Order:   clonePaymentOrder(saved.Order),
+			Created: true,
+			Issues:  cloneIssues(issues),
+		}, nil
+	}
+
+	// An ordinary save error never authorizes using the returned Order or
+	// Record as a committed fact. Read the current order with the same finish
+	// deadline.
 	current, found, lookupErr := s.lookup.FindOrderByID(finishCtx, order.ClientID, order.ID)
 	if s.lifecycle.Err() != nil {
 		return SubmitResult{}, ErrUnavailable

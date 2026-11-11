@@ -29,14 +29,14 @@ from typing import Any, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-EXPECTED_GO_VERSION = "go1.27.3"
+EXPECTED_GO_VERSION = "go1.27.4"
 EXPECTED_GOOS = "linux"
 EXPECTED_GOARCH = "amd64"
 EXPECTED_GOTOOLCHAIN = "local"
 EXPECTED_GOTELEMETRY = "off"
 
 EXPECTED_MODULE = "payment-hub"
-EXPECTED_GO_DIRECTIVE = "1.27.3"
+EXPECTED_GO_DIRECTIVE = "1.27.4"
 APPROVED_DIRECT = {
     "github.com/gin-gonic/gin": "v1.12.0",
     "github.com/jackc/pgx/v5": "v5.11.0",

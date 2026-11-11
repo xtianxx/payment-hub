@@ -267,7 +267,7 @@ func t022AbsoluteTempDir(t *testing.T) string {
 
 func t022BuildApplication(t *testing.T, repoRoot string) string {
 	t.Helper()
-	if runtime.Version() != "go1.27.3" || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+	if runtime.Version() != "go1.27.4" || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		t.Fatal("application integration runtime is not the approved Go/linux/amd64 build")
 	}
 	goTool := filepath.Join(runtime.GOROOT(), "bin", "go")

@@ -91,6 +91,7 @@ EXPECTED_UPLOADS = {
         "${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json",
         "${{ runner.temp }}/payment-hub-db/reports/upload/us1.safe.json",
         "${{ runner.temp }}/payment-hub-db/reports/upload/us2.safe.json",
+        "${{ runner.temp }}/payment-hub-db/reports/upload/us3.safe.json",
         "${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json",
     ],
     "vulnerability-check": [
@@ -100,7 +101,7 @@ EXPECTED_UPLOADS = {
 }
 EXPECTED_EXPORTS = {
     "setup-check": "--expect default",
-    "database-foundation": "--expect db,cancellation,us1,us2",
+    "database-foundation": "--expect db,cancellation,us1,us2,us3",
     "vulnerability-check": "--expect vulnerability",
 }
 FORBIDDEN_WORKFLOW_TOKENS = (

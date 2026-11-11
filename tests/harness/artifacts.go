@@ -223,7 +223,7 @@ type Artifacts struct {
 }
 
 func BeginArtifacts(cfg ArtifactConfig) (*Artifacts, error) {
-	if runtime.Version() != "go1.27.3" || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+	if runtime.Version() != "go1.27.4" || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		return nil, ErrArtifacts
 	}
 	if !filepath.IsAbs(cfg.Root) || !filepath.IsAbs(cfg.SourceRoot) || !observerValidLowerHex32(cfg.RunID) {

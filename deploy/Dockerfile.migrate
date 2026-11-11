@@ -3,7 +3,7 @@
 #   docker build --platform linux/amd64 -f deploy/Dockerfile.migrate .
 # The application module, credentials, and .env files are never copied here.
 
-FROM docker.io/library/golang:1.27.3-bookworm@sha256:025eefc1e8dbe63201734a72aaa0a55d7a077f2d8410432f8ae2f3e939f32871 AS build
+FROM docker.io/library/golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS build
 
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=local \

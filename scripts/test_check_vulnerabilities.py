@@ -29,12 +29,12 @@ MOD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MOD)
 
 TOOL_BUILD_INFO = (
-    "/tmp/tool/govulncheck: go1.27.3\n"
+    "/tmp/tool/govulncheck: go1.27.4\n"
     "\tpath\tgolang.org/x/vuln/cmd/govulncheck\n"
     "\tmod\tgolang.org/x/vuln\tv1.9.0\th1:fixture\n"
 )
 
-FIXED_GO_VERSION = "go1.27.3"
+FIXED_GO_VERSION = "go1.27.4"
 FIXED_SCANNER_VERSION = "v1.9.0"
 FIXED_DB = "https://vuln.go.dev"
 
@@ -154,7 +154,14 @@ class FakeRunner:
                 f"go version {self.go_version} linux/amd64\n",
             )
         if len(argv) >= 3 and argv[1:3] == ["version", "-m"]:
-            return completed(argv, 0, self.tool_build_info)
+            info = self.tool_build_info
+            lines = info.splitlines()
+            if lines:
+                prefix, separator, version = lines[0].rpartition(": ")
+                if separator and prefix == "/tmp/tool/govulncheck":
+                    lines[0] = argv[3] + ": " + version
+                    info = "\n".join(lines) + "\n"
+            return completed(argv, 0, info)
         if len(argv) >= 2 and argv[1] == "install":
             if self.install_timeout:
                 raise MOD.CommandTimeout()
@@ -216,7 +223,7 @@ class CheckVulnerabilitiesMockTests(unittest.TestCase):
         self.repo = root / "repo"
         self.repo.mkdir()
         (self.repo / "go.mod").write_text(
-            "module example.com/app\n\ngo 1.27.3\n", encoding="utf-8"
+            "module example.com/app\n\ngo 1.27.4\n", encoding="utf-8"
         )
         (self.repo / "go.sum").write_text(
             "example.com/mod v1.0.0 h1:fixture\n", encoding="utf-8"
@@ -352,6 +359,27 @@ class CheckVulnerabilitiesMockTests(unittest.TestCase):
             version = MOD._verify_go(self.go, self.cache, {})
         self.assertEqual(version, FIXED_GO_VERSION)
 
+    def test_verify_go_rejects_previous_patch_version(self):
+        runner = FakeRunner(go_version="go1.27.3")
+        with mock.patch.object(MOD, "_run_bounded", side_effect=runner):
+            with self.assertRaises(MOD.CheckFailure) as raised:
+                MOD._verify_go(self.go, self.cache, {})
+        self.assertEqual(
+            raised.exception.failure_class, "go_toolchain_mismatch"
+        )
+
+    def test_verify_go_rejects_any_other_1_27_patch(self):
+        for value in ("go1.27.5", "go1.27.2"):
+            with self.subTest(value=value):
+                runner = FakeRunner(go_version=value)
+                with mock.patch.object(MOD, "_run_bounded", side_effect=runner):
+                    with self.assertRaises(MOD.CheckFailure) as raised:
+                        MOD._verify_go(self.go, self.cache, {})
+                self.assertEqual(
+                    raised.exception.failure_class,
+                    "go_toolchain_mismatch",
+                )
+
     def test_module_hashes_requires_go_mod_and_go_sum(self):
         for missing in ("go.mod", "go.sum"):
             with self.subTest(missing=missing):
@@ -377,7 +405,7 @@ class CheckVulnerabilitiesMockTests(unittest.TestCase):
         self.assertEqual(runner.scan_calls(), [])
         report = self.report()
         self.assertIn("expected_go_version", report)
-        self.assertEqual(report["expected_go_version"], "go1.27.3")
+        self.assertEqual(report["expected_go_version"], "go1.27.4")
         self.assertIsNone(report["go_version"])
         self.assertIn("tool_verified", report)
         self.assertFalse(report["tool_verified"])
@@ -396,7 +424,7 @@ class CheckVulnerabilitiesMockTests(unittest.TestCase):
         mismatch_runner = FakeRunner(
             scan_stdout=pass_stream(),
             tool_build_info=(
-                "/tmp/tool/govulncheck: go1.27.3\n"
+                "/tmp/tool/govulncheck: go1.27.4\n"
                 "\tpath\tgolang.org/x/vuln/cmd/govulncheck\n"
                 "\tmod\tgolang.org/x/vuln\tv1.8.0\th1:fixture\n"
             ),
@@ -553,7 +581,7 @@ class CheckVulnerabilitiesMockTests(unittest.TestCase):
         runner = FakeRunner(
             scan_stdout=pass_stream(),
             tool_build_info=(
-                "/tmp/tool/govulncheck: go1.27.3\n"
+                "/tmp/tool/govulncheck: go1.27.4\n"
                 "\tpath\tgolang.org/x/vuln/cmd/govulncheck\n"
                 "\tmod\tgolang.org/x/vuln\tv1.8.0\th1:fixture\n"
             ),
@@ -565,6 +593,46 @@ class CheckVulnerabilitiesMockTests(unittest.TestCase):
             self.stdout_fields(stdout)["error-class"], "tool_version_mismatch"
         )
         self.assertEqual(self.report()["failure_class"], "tool_version_mismatch")
+
+    def test_tool_build_go_version_is_strictly_verified(self):
+        cases = {
+            "old-go": (
+                "/tmp/tool/govulncheck: go1.27.3\n"
+                "\tpath\tgolang.org/x/vuln/cmd/govulncheck\n"
+                "\tmod\tgolang.org/x/vuln\tv1.9.0\th1:fixture\n"
+            ),
+            "missing-first-line": (
+                "\tpath\tgolang.org/x/vuln/cmd/govulncheck\n"
+                "\tmod\tgolang.org/x/vuln\tv1.9.0\th1:fixture\n"
+            ),
+            "fake-go-version": (
+                "/tmp/tool/govulncheck: go1.27.5\n"
+                "\tpath\tgolang.org/x/vuln/cmd/govulncheck\n"
+                "\tmod\tgolang.org/x/vuln\tv1.9.0\th1:fixture\n"
+            ),
+            "wrong-path": (
+                "/tmp/other: go1.27.4\n"
+                "\tpath\tgolang.org/x/vuln/cmd/govulncheck\n"
+                "\tmod\tgolang.org/x/vuln\tv1.9.0\th1:fixture\n"
+            ),
+        }
+        for name, build_info in cases.items():
+            with self.subTest(case=name):
+                runner = FakeRunner(
+                    scan_stdout=pass_stream(),
+                    tool_build_info=build_info,
+                )
+                code, stdout, _ = self.run_main(runner)
+                self.assertEqual(code, 2)
+                self.assertEqual(runner.scan_calls(), [])
+                self.assertEqual(
+                    self.stdout_fields(stdout)["error-class"],
+                    "tool_version_mismatch",
+                )
+                self.assertEqual(
+                    self.report()["failure_class"],
+                    "tool_version_mismatch",
+                )
 
     def test_go_version_mismatch_blocks_scan(self):
         runner = FakeRunner(go_version="go1.26.0", scan_stdout=pass_stream())
@@ -801,7 +869,7 @@ class CheckVulnerabilitiesMockTests(unittest.TestCase):
 
         def mutate_module():
             (self.repo / "go.mod").write_text(
-                "module example.com/app\n\ngo 1.27.3\n\nrequire example.com/x v1.0.0\n",
+                "module example.com/app\n\ngo 1.27.4\n\nrequire example.com/x v1.0.0\n",
                 encoding="utf-8",
             )
 
@@ -883,12 +951,13 @@ class CheckVulnerabilitiesMockTests(unittest.TestCase):
         fake_go.write_text(
             "#!/bin/sh\n"
             'if [ "$1" = "version" ] && [ "$2" = "-m" ]; then\n'
+            "  printf '%s: go1.27.4\\n' \"$3\"\n"
             "  printf '\\tpath\\tgolang.org/x/vuln/cmd/govulncheck\\n"
             "\\tmod\\tgolang.org/x/vuln\\tv1.9.0\\th1:fixture\\n'\n"
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = "version" ]; then\n'
-            "  echo 'go version go1.27.3 linux/amd64'\n"
+            "  echo 'go version go1.27.4 linux/amd64'\n"
             "  exit 0\n"
             "fi\n"
             "exit 1\n",

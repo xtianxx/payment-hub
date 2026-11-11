@@ -894,7 +894,7 @@ func TestArtifactsReportShapeAndValidRecords(t *testing.T) {
 	if len(report.Faults) != 0 {
 		t.Fatal("t020 complete report has faults")
 	}
-	if runtime.Version() != "go1.27.3" || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+	if runtime.Version() != "go1.27.4" || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		t.Fatal("t020 test environment is not the approved runtime")
 	}
 	if report.Versions.Go != runtime.Version() || report.Versions.Goos != runtime.GOOS || report.Versions.Goarch != runtime.GOARCH {
