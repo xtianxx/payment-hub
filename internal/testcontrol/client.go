@@ -27,6 +27,7 @@ var (
 // static boundary with Seal using that local sequence count.
 type Client struct {
 	session Session
+	version int
 	beginID string
 	valid   bool
 
@@ -40,6 +41,157 @@ type Client struct {
 	fault        bool
 	closed       bool
 	conns        map[net.Conn]struct{}
+	queryPending map[*queryCallState]struct{}
+}
+
+type queryCallState struct {
+	client    *Client
+	seq       uint64
+	eventID   string
+	orderID   string
+	directive *QueryScenario
+	consumed  bool
+}
+
+// QueryCall is the private, single-use association between one query entry
+// call and its later QUERY_APPLIED proof. The zero value is not usable.
+type QueryCall struct {
+	state *queryCallState
+}
+
+// Directive returns the selected query scenario as a value copy.
+func (q QueryCall) Directive() (QueryScenario, bool) {
+	if q.state == nil || q.state.directive == nil {
+		return "", false
+	}
+	return *q.state.directive, true
+}
+
+// QueryEntry records one v2 query call and returns a token carrying the
+// observer-selected scenario, if any.
+func (c *Client) QueryEntry(ctx context.Context, orderID string) (QueryCall, error) {
+	if c == nil || !c.valid || c.version != Version2 {
+		if c != nil {
+			c.latchFault()
+		}
+		return QueryCall{}, ErrControlFault
+	}
+	op, err := c.startOperation(ctx, func() bool {
+		return c.version == Version2 && validUUIDv4(orderID)
+	})
+	if err != nil {
+		return QueryCall{}, err
+	}
+	failed := true
+	defer func() {
+		c.finishOperation(failed)
+	}()
+
+	opCtx, cancel, ok := newClientOperationContext(ctx)
+	if !ok {
+		return QueryCall{}, ErrControlFault
+	}
+	defer cancel()
+
+	frame := Frame{
+		Version:    Version2,
+		Type:       TypeCall,
+		RunID:      c.session.RunID,
+		Epoch:      c.session.Epoch,
+		Generation: c.session.Generation,
+		Seq:        op.seq,
+		EventID:    op.eventID,
+		Kind:       KindQuery,
+		OrderID:    orderID,
+	}
+	ack, err := exchangeFrame(opCtx, c.session.Socket, frame, validateClientAck, c.trackConn, c.untrackConn)
+	if err != nil {
+		return QueryCall{}, ErrControlFault
+	}
+
+	var directive *QueryScenario
+	if ack.QueryDirective != nil {
+		value := *ack.QueryDirective
+		directive = &value
+	}
+	state := &queryCallState{
+		client:    c,
+		seq:       op.seq,
+		eventID:   op.eventID,
+		orderID:   orderID,
+		directive: directive,
+	}
+	c.mu.Lock()
+	if c.closed || c.fault || c.sealing || c.sealed {
+		c.fault = true
+		c.mu.Unlock()
+		return QueryCall{}, ErrControlFault
+	}
+	if c.queryPending == nil {
+		c.queryPending = make(map[*queryCallState]struct{})
+	}
+	c.queryPending[state] = struct{}{}
+	c.mu.Unlock()
+	failed = false
+	return QueryCall{state: state}, nil
+}
+
+// QueryApplied records the actual outcome for one QueryEntry token exactly
+// once. The token is consumed by the QUERY_APPLIED reach.
+func (c *Client) QueryApplied(ctx context.Context, token QueryCall, actual QueryOutcome) error {
+	op, err := c.startOperation(ctx, func() bool {
+		if c.version != Version2 || !validQueryOutcome(actual) {
+			return false
+		}
+		state := token.state
+		if state == nil || state.client != c || state.consumed {
+			return false
+		}
+		if state.seq < 1 || state.seq > MaxRecords || !validUUIDv4(state.orderID) {
+			return false
+		}
+		state.consumed = true
+		delete(c.queryPending, state)
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	failed := true
+	defer func() {
+		c.finishOperation(failed)
+	}()
+
+	opCtx, cancel, ok := newClientOperationContext(ctx)
+	if !ok {
+		return ErrControlFault
+	}
+	defer cancel()
+
+	callSeq := token.state.seq
+	outcome := actual
+	frame := Frame{
+		Version:      Version2,
+		Type:         TypeReach,
+		RunID:        c.session.RunID,
+		Epoch:        c.session.Epoch,
+		Generation:   c.session.Generation,
+		Seq:          op.seq,
+		EventID:      op.eventID,
+		Point:        PointQueryApplied,
+		OrderID:      token.state.orderID,
+		QueryCallSeq: &callSeq,
+		QueryOutcome: &outcome,
+	}
+	ack, err := exchangeFrame(opCtx, c.session.Socket, frame, validateClientAck, c.trackConn, c.untrackConn)
+	if err != nil {
+		return ErrControlFault
+	}
+	if ack.Action != ActionContinue {
+		return ErrControlFault
+	}
+	failed = false
+	return nil
 }
 
 type paymentCallState struct {
@@ -87,7 +239,7 @@ func (c *Client) PaymentEntry(ctx context.Context, orderID string) (PaymentCall,
 	defer cancel()
 
 	frame := Frame{
-		Version:    Version,
+		Version:    c.version,
 		Type:       TypeCall,
 		RunID:      c.session.RunID,
 		Epoch:      c.session.Epoch,
@@ -148,7 +300,7 @@ func (c *Client) MockCommitted(ctx context.Context, token PaymentCall, actual Di
 	defer cancel()
 
 	frame := Frame{
-		Version:    Version,
+		Version:    c.version,
 		Type:       TypeReach,
 		RunID:      c.session.RunID,
 		Epoch:      c.session.Epoch,
@@ -183,22 +335,33 @@ func Dial(ctx context.Context, session Session) (*Client, error) {
 	if ctx == nil || ctx.Err() != nil {
 		return nil, ErrControlFault
 	}
+	version := session.Version
+	if version == 0 {
+		version = Version
+	}
+	if version != Version && version != Version2 {
+		return nil, ErrControlFault
+	}
 	if session.Socket == "" || !validLowerHex32(session.RunID) ||
 		!validLowerHex32(session.Epoch) || session.Generation == 0 {
 		return nil, ErrControlFault
 	}
+	session.Version = version
 
 	beginID, err := newClientBeginID()
 	if err != nil {
 		return nil, ErrControlFault
 	}
 	begin := Frame{
-		Version:    Version,
+		Version:    version,
 		Type:       TypeBegin,
 		RunID:      session.RunID,
 		Epoch:      session.Epoch,
 		Generation: session.Generation,
 		EventID:    beginID,
+	}
+	if version == Version2 {
+		begin.Capability = CapabilityQueryControl
 	}
 
 	opCtx, cancel, ok := newClientOperationContext(ctx)
@@ -211,10 +374,12 @@ func Dial(ctx context.Context, session Session) (*Client, error) {
 	}
 
 	return &Client{
-		session: session,
-		beginID: beginID,
-		valid:   true,
-		conns:   make(map[net.Conn]struct{}),
+		session:      session,
+		version:      version,
+		beginID:      beginID,
+		valid:        true,
+		conns:        make(map[net.Conn]struct{}),
+		queryPending: make(map[*queryCallState]struct{}),
 	}, nil
 }
 
@@ -258,7 +423,7 @@ func (c *Client) call(ctx context.Context, typ Type, kind Kind, point Point, ord
 	defer cancel()
 
 	frame := Frame{
-		Version:    Version,
+		Version:    c.version,
 		Type:       typ,
 		RunID:      c.session.RunID,
 		Epoch:      c.session.Epoch,
@@ -281,6 +446,11 @@ func (c *Client) call(ctx context.Context, typ Type, kind Kind, point Point, ord
 	if typ == TypeCall && kind == KindPayment && ack.Directive != nil {
 		// The legacy Enter API cannot deliver a selected result directive to
 		// its caller, so accepting it would silently drop a control decision.
+		return ErrControlFault
+	}
+	if typ == TypeCall && kind == KindQuery && ack.QueryDirective != nil {
+		// The legacy Enter API cannot deliver a selected query scenario to its
+		// caller, so accepting it would silently drop a control decision.
 		return ErrControlFault
 	}
 	if typ == TypeReach && ack.Action == ActionReplyHidden {
@@ -396,7 +566,7 @@ func (c *Client) Seal(ctx context.Context) (Receipt, error) {
 	}
 
 	c.mu.Lock()
-	if c.closed || c.fault {
+	if c.closed || c.fault || len(c.queryPending) != 0 {
 		c.mu.Unlock()
 		c.failSeal()
 		return Receipt{}, ErrControlFault
@@ -404,7 +574,7 @@ func (c *Client) Seal(ctx context.Context) (Receipt, error) {
 	c.mu.Unlock()
 
 	seal := Frame{
-		Version:         Version,
+		Version:         c.version,
 		Type:            TypeSeal,
 		RunID:           c.session.RunID,
 		Epoch:           c.session.Epoch,
@@ -641,7 +811,8 @@ func exchangeFrame(
 }
 
 func validateClientAck(request, ack Frame) error {
-	if ack.Type != TypeAck ||
+	if ack.Version != request.Version ||
+		ack.Type != TypeAck ||
 		ack.RunID != request.RunID ||
 		ack.Epoch != request.Epoch ||
 		ack.Generation != request.Generation ||
@@ -651,6 +822,14 @@ func validateClientAck(request, ack Frame) error {
 	}
 	switch request.Type {
 	case TypeBegin:
+		if request.Version == Version2 {
+			if request.Capability != CapabilityQueryControl ||
+				ack.Capability != CapabilityQueryControl {
+				return errClientKnown
+			}
+		} else if ack.Capability != "" {
+			return errClientKnown
+		}
 	case TypeCall:
 		if ack.Seq != request.Seq {
 			return errClientKnown
@@ -660,11 +839,25 @@ func validateClientAck(request, ack Frame) error {
 				return errClientKnown
 			}
 		}
+		if ack.QueryDirective != nil {
+			if request.Version != Version2 || request.Kind != KindQuery ||
+				!validQueryScenario(*ack.QueryDirective) {
+				return errClientKnown
+			}
+		}
+		if ack.Directive != nil && ack.QueryDirective != nil {
+			return errClientKnown
+		}
 	case TypeReach:
 		if ack.Seq != request.Seq || !validAction(ack.Action) {
 			return errClientKnown
 		}
-		if ack.Action == ActionReplyHidden && !validPostcommitPoint(request.Point) {
+		if request.Point == PointQueryApplied {
+			if request.Version != Version2 || ack.Action != ActionContinue ||
+				request.QueryCallSeq == nil || request.QueryOutcome == nil {
+				return errClientKnown
+			}
+		} else if ack.Action == ActionReplyHidden && !validPostcommitPoint(request.Point) {
 			return errClientKnown
 		}
 	case TypeSeal:
