@@ -29,6 +29,9 @@ type ObserverConfig struct {
 	RunID          string
 	Epoch          string
 	BarrierTimeout time.Duration
+	// Version is the explicit protocol opt-in. Zero keeps the legacy v1
+	// boundary; v2 enables query-control.
+	Version int
 }
 
 type Counts struct {
@@ -52,20 +55,28 @@ const (
 	observerGenerationExpected observerGenerationStatus = iota
 	observerGenerationOpen
 	observerGenerationSealed
+	observerGenerationTruncated
 )
 
 type observerEvent struct {
-	typ            testcontrol.Type
-	seq            uint64
-	kind           testcontrol.Kind
-	point          testcontrol.Point
-	orderID        string
-	eventID        string
-	ack            testcontrol.Frame
-	barrier        *Barrier
-	paymentHold    *PaymentHold
-	paymentCallSeq *uint64
-	appliedResult  *testcontrol.Directive
+	typ                 testcontrol.Type
+	seq                 uint64
+	kind                testcontrol.Kind
+	point               testcontrol.Point
+	orderID             string
+	eventID             string
+	ack                 testcontrol.Frame
+	barrier             *Barrier
+	paymentHold         *PaymentHold
+	queryHold           *QueryHold
+	paymentCallSeq      *uint64
+	appliedResult       *testcontrol.Directive
+	queryCallSeq        *uint64
+	queryOutcome        *testcontrol.QueryOutcome
+	queryApplied        bool
+	queryAppliedSeq     uint64
+	queryAppliedEventID string
+	queryAppliedOutcome testcontrol.QueryOutcome
 }
 
 type observerGeneration struct {
@@ -73,6 +84,8 @@ type observerGeneration struct {
 	beginID         string
 	events          map[uint64]*observerEvent
 	expectedLastSeq uint64
+	counts          Counts
+	truncated       *ControlledTerminationBinding
 }
 
 type observerBarrierKey struct {
@@ -81,8 +94,14 @@ type observerBarrierKey struct {
 	orderID    string
 }
 
+type observerNextBarrierKey struct {
+	generation uint64
+	point      testcontrol.Point
+}
+
 type Observer struct {
 	cfg            ObserverConfig
+	version        int
 	barrierTimeout time.Duration
 	listener       *net.UnixListener
 	socketPath     string
@@ -91,18 +110,25 @@ type Observer struct {
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
 
-	mu           sync.Mutex
-	closing      bool
-	closeOnce    sync.Once
-	closeErr     error
-	conns        map[net.Conn]bool
-	generations  map[uint64]*observerGeneration
-	beginIDs     map[string]uint64
-	barriers     map[observerBarrierKey]*Barrier
-	paymentHolds map[uint64]*PaymentHold
-	records      int
-	counts       Counts
-	uncertain    bool
+	mu        sync.Mutex
+	closing   bool
+	closeOnce sync.Once
+	closeErr  error
+	conns     map[net.Conn]bool
+	connDone  map[net.Conn]chan struct{}
+	// testBarrierBind is a nil-default, package-private determinism seam. It is
+	// set under mu before traffic and invoked after the bind decision.
+	testBarrierBind func(*Barrier, net.Conn, bool)
+	generations     map[uint64]*observerGeneration
+	beginIDs        map[string]uint64
+	barriers        map[observerBarrierKey]*Barrier
+	nextBarriers    map[observerNextBarrierKey]*Barrier
+	paymentHolds    map[uint64]*PaymentHold
+	queryHolds      map[uint64]*QueryHold
+	expectedTerm    map[net.Conn]bool
+	records         int
+	counts          Counts
+	uncertain       bool
 
 	finalSnapshot ObserverFinalSnapshot
 	finalReady    bool
@@ -127,6 +153,8 @@ type Barrier struct {
 	receipt  testcontrol.Receipt
 	event    *observerEvent
 	reach    testcontrol.Frame
+	conn     net.Conn
+	frozen   bool
 }
 
 // PaymentBinding is the immutable payment call identity captured when an armed
@@ -138,6 +166,236 @@ type PaymentBinding struct {
 	CallSeq    uint64
 	EventID    string
 	OrderID    string
+}
+
+// QueryBinding is the immutable query call identity captured when an armed
+// QueryHold binds to the generation's next query entry call.
+type QueryBinding struct {
+	RunID      string
+	Epoch      string
+	Generation uint64
+	CallSeq    uint64
+	EventID    string
+	OrderID    string
+}
+
+// QueryHold is a one-per-generation fixture for selecting a query scenario for
+// the next query call and proving its later QUERY_APPLIED consumption.
+type QueryHold struct {
+	observer *Observer
+	gen      uint64
+	deadline time.Time
+
+	arrivedCh chan struct{}
+	releaseCh chan struct{}
+	cancelCh  chan struct{}
+
+	status   queryHoldStatus
+	binding  QueryBinding
+	scenario testcontrol.QueryScenario
+	event    *observerEvent
+	call     testcontrol.Frame
+	ack      testcontrol.Frame
+	canceled bool
+}
+
+type queryHoldStatus int
+
+const (
+	queryHoldArmed queryHoldStatus = iota
+	queryHoldBound
+	queryHoldReleased
+	queryHoldConsumed
+)
+
+// HoldQueryEntry arms the single query scenario fixture for one expected or
+// open generation whose next query entry has not occurred yet.
+func (o *Observer) HoldQueryEntry(generation uint64) (*QueryHold, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.version != testcontrol.Version2 {
+		return nil, testcontrol.ErrProtocol
+	}
+	if o.closing {
+		return nil, testcontrol.ErrControlFault
+	}
+	if o.uncertain {
+		return nil, testcontrol.ErrUncertain
+	}
+	state, ok := o.generations[generation]
+	if !ok || state.status == observerGenerationSealed || state.status == observerGenerationTruncated {
+		return nil, testcontrol.ErrProtocol
+	}
+	if _, exists := o.queryHolds[generation]; exists {
+		return nil, testcontrol.ErrProtocol
+	}
+	for _, event := range state.events {
+		if event.typ == testcontrol.TypeCall && event.kind == testcontrol.KindQuery {
+			return nil, testcontrol.ErrProtocol
+		}
+	}
+	hold := &QueryHold{
+		observer:  o,
+		gen:       generation,
+		deadline:  time.Now().Add(observerPaymentHoldTimeout),
+		arrivedCh: make(chan struct{}),
+		releaseCh: make(chan struct{}),
+		cancelCh:  make(chan struct{}),
+	}
+	o.queryHolds[generation] = hold
+	return hold, nil
+}
+
+// Wait waits for the generation's query entry call to bind this hold.
+func (h *QueryHold) Wait(ctx context.Context) (QueryBinding, error) {
+	if h == nil || h.observer == nil {
+		return QueryBinding{}, testcontrol.ErrControlFault
+	}
+	o := h.observer
+	if ctx == nil || ctx.Err() != nil {
+		o.mu.Lock()
+		o.latchFaultLocked()
+		o.mu.Unlock()
+		return QueryBinding{}, testcontrol.ErrControlFault
+	}
+
+	o.mu.Lock()
+	if h.canceled {
+		o.mu.Unlock()
+		return QueryBinding{}, testcontrol.ErrUncertain
+	}
+	if h.status != queryHoldArmed {
+		binding := h.binding
+		o.mu.Unlock()
+		return binding, nil
+	}
+	deadline := h.deadline
+	o.mu.Unlock()
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-h.arrivedCh:
+		o.mu.Lock()
+		if h.canceled {
+			o.mu.Unlock()
+			return QueryBinding{}, testcontrol.ErrUncertain
+		}
+		if ctx.Err() != nil {
+			o.latchFaultLocked()
+			o.mu.Unlock()
+			return QueryBinding{}, testcontrol.ErrControlFault
+		}
+		binding := h.binding
+		o.mu.Unlock()
+		return binding, nil
+	case <-h.cancelCh:
+		return QueryBinding{}, testcontrol.ErrUncertain
+	case <-ctx.Done():
+		o.mu.Lock()
+		canceled := h.canceled
+		if !canceled {
+			o.latchFaultLocked()
+		}
+		o.mu.Unlock()
+		if canceled {
+			return QueryBinding{}, testcontrol.ErrUncertain
+		}
+		return QueryBinding{}, testcontrol.ErrControlFault
+	case <-timer.C:
+		o.mu.Lock()
+		if h.canceled {
+			o.mu.Unlock()
+			return QueryBinding{}, testcontrol.ErrUncertain
+		}
+		if h.status != queryHoldArmed {
+			binding := h.binding
+			o.mu.Unlock()
+			return binding, nil
+		}
+		o.latchFaultLocked()
+		o.mu.Unlock()
+		return QueryBinding{}, testcontrol.ErrUncertain
+	case <-o.ctx.Done():
+		return QueryBinding{}, testcontrol.ErrUncertain
+	}
+}
+
+// Release selects the query scenario for the bound query entry.
+func (h *QueryHold) Release(scenario testcontrol.QueryScenario) error {
+	if h == nil || h.observer == nil {
+		return testcontrol.ErrControlFault
+	}
+	if !observerValidQueryScenario(scenario) {
+		return testcontrol.ErrProtocol
+	}
+	o := h.observer
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if h.canceled {
+		return testcontrol.ErrUncertain
+	}
+	if h.status != queryHoldBound || h.event == nil {
+		return testcontrol.ErrProtocol
+	}
+	if !time.Now().Before(h.deadline) {
+		o.latchFaultLocked()
+		return testcontrol.ErrUncertain
+	}
+	h.scenario = scenario
+	h.status = queryHoldReleased
+	ack := observerAckCall(h.call)
+	value := scenario
+	ack.QueryDirective = &value
+	h.event.ack = ack
+	h.ack = ack
+	close(h.releaseCh)
+	return nil
+}
+
+func (o *Observer) waitQueryHold(hold *QueryHold) testcontrol.Frame {
+	if hold == nil {
+		return observerFault(testcontrol.FaultProtocol)
+	}
+	timer := time.NewTimer(time.Until(hold.deadline))
+	defer timer.Stop()
+	select {
+	case <-hold.releaseCh:
+		o.mu.Lock()
+		if hold.canceled {
+			o.mu.Unlock()
+			return observerFault(testcontrol.FaultClosed)
+		}
+		ack := hold.ack
+		o.mu.Unlock()
+		return ack
+	case <-hold.cancelCh:
+		return observerFault(testcontrol.FaultClosed)
+	case <-timer.C:
+		o.mu.Lock()
+		if hold.canceled {
+			o.mu.Unlock()
+			return observerFault(testcontrol.FaultClosed)
+		}
+		if hold.status == queryHoldReleased || hold.status == queryHoldConsumed {
+			ack := hold.ack
+			o.mu.Unlock()
+			return ack
+		}
+		o.latchFaultLocked()
+		o.mu.Unlock()
+		return observerFault(testcontrol.FaultTimeout)
+	case <-o.ctx.Done():
+		return observerFault(testcontrol.FaultClosed)
+	}
+}
+
+func (h *QueryHold) cancelLocked() {
+	if h.canceled {
+		return
+	}
+	h.canceled = true
+	close(h.cancelCh)
 }
 
 // PaymentHold is a one-per-generation fixture for selecting a result directive
@@ -373,6 +631,14 @@ func StartObserver(ctx context.Context, cfg ObserverConfig) (*Observer, error) {
 	if barrierTimeout == 0 {
 		barrierTimeout = observerDefaultBarrierTimeout
 	}
+	version := cfg.Version
+	if version == 0 {
+		version = testcontrol.Version
+	}
+	if version != testcontrol.Version && version != testcontrol.Version2 {
+		return nil, testcontrol.ErrControlFault
+	}
+	cfg.Version = version
 	if err := observerValidateParent(filepath.Dir(cfg.Socket)); err != nil {
 		return nil, testcontrol.ErrControlFault
 	}
@@ -417,6 +683,7 @@ func StartObserver(ctx context.Context, cfg ObserverConfig) (*Observer, error) {
 	observerCtx, cancel := context.WithCancel(context.Background())
 	observer := &Observer{
 		cfg:            cfg,
+		version:        version,
 		barrierTimeout: barrierTimeout,
 		listener:       listener,
 		socketPath:     cfg.Socket,
@@ -424,10 +691,14 @@ func StartObserver(ctx context.Context, cfg ObserverConfig) (*Observer, error) {
 		ctx:            observerCtx,
 		cancel:         cancel,
 		conns:          make(map[net.Conn]bool),
+		connDone:       make(map[net.Conn]chan struct{}),
 		generations:    make(map[uint64]*observerGeneration),
 		beginIDs:       make(map[string]uint64),
 		barriers:       make(map[observerBarrierKey]*Barrier),
+		nextBarriers:   make(map[observerNextBarrierKey]*Barrier),
 		paymentHolds:   make(map[uint64]*PaymentHold),
+		queryHolds:     make(map[uint64]*QueryHold),
+		expectedTerm:   make(map[net.Conn]bool),
 	}
 	observer.wg.Add(1)
 	go observer.acceptLoop()
@@ -477,6 +748,7 @@ func (o *Observer) acceptLoop() {
 			return
 		}
 		o.conns[conn] = false
+		o.connDone[conn] = make(chan struct{})
 		o.wg.Add(1)
 		o.mu.Unlock()
 		go o.handleConnection(conn)
@@ -488,6 +760,10 @@ func (o *Observer) handleConnection(conn *net.UnixConn) {
 	defer func() {
 		o.mu.Lock()
 		delete(o.conns, conn)
+		if done, ok := o.connDone[conn]; ok {
+			delete(o.connDone, conn)
+			close(done)
+		}
 		o.mu.Unlock()
 		_ = conn.Close()
 	}()
@@ -513,12 +789,19 @@ func (o *Observer) handleConnection(conn *net.UnixConn) {
 		return
 	}
 
-	response, waitBarrier, waitHold := o.processFrame(frame)
+	response, waitBarrier, waitHold, waitQuery := o.processFrame(frame, conn)
 	if waitBarrier != nil {
-		response = o.waitBarrierRelease(waitBarrier)
+		if !o.bindBarrierConn(waitBarrier, conn) {
+			response = observerFault(testcontrol.FaultProtocol)
+		} else {
+			response = o.waitBarrierRelease(waitBarrier)
+		}
 	}
 	if waitHold != nil {
 		response = o.waitPaymentHold(waitHold)
+	}
+	if waitQuery != nil {
+		response = o.waitQueryHold(waitQuery)
 	}
 	o.writeResponse(conn, response)
 	o.markConnectionComplete(conn)
@@ -560,58 +843,72 @@ func (o *Observer) readRequest(conn net.Conn) ([]byte, error) {
 func (o *Observer) writeResponse(conn net.Conn, frame testcontrol.Frame) {
 	payload, err := testcontrol.EncodeFrame(frame)
 	if err != nil {
-		o.latchFault()
+		o.connectionFailure(conn)
 		return
 	}
 	if err := conn.SetWriteDeadline(time.Now().Add(observerIOTimeout)); err != nil {
-		if !o.isClosing() {
-			o.latchFault()
-		}
+		o.connectionFailure(conn)
 		return
 	}
 	n, err := conn.Write(payload)
 	if err != nil || n != len(payload) {
-		if !o.isClosing() {
-			o.latchFault()
-		}
+		o.connectionFailure(conn)
 	}
 }
 
-func (o *Observer) processFrame(frame testcontrol.Frame) (testcontrol.Frame, *Barrier, *PaymentHold) {
+func (o *Observer) connectionFailure(conn net.Conn) {
+	o.mu.Lock()
+	expected := o.expectedTerm[conn]
+	if expected {
+		delete(o.expectedTerm, conn)
+	}
+	closing := o.closing
+	o.mu.Unlock()
+	if expected || closing {
+		return
+	}
+	o.latchFault()
+}
+
+func (o *Observer) processFrame(frame testcontrol.Frame, conn net.Conn) (testcontrol.Frame, *Barrier, *PaymentHold, *QueryHold) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	if o.closing {
-		return observerFault(testcontrol.FaultClosed), nil, nil
+		return observerFault(testcontrol.FaultClosed), nil, nil, nil
 	}
 	if o.uncertain {
-		return observerFault(testcontrol.FaultProtocol), nil, nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil, nil
+	}
+	if frame.Version != o.version {
+		o.latchFaultLocked()
+		return observerFault(testcontrol.FaultProtocol), nil, nil, nil
 	}
 	switch frame.Type {
 	case testcontrol.TypeFault, testcontrol.TypeAck:
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol), nil, nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil, nil
 	}
 	if frame.RunID != o.cfg.RunID || frame.Epoch != o.cfg.Epoch {
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol), nil, nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil, nil
 	}
 
 	switch frame.Type {
 	case testcontrol.TypeBegin:
 		response, barrier := o.processBeginLocked(frame)
-		return response, barrier, nil
+		return response, barrier, nil, nil
 	case testcontrol.TypeCall:
-		response, hold := o.processCallLocked(frame)
-		return response, nil, hold
+		response, hold, queryHold := o.processCallLocked(frame, conn)
+		return response, nil, hold, queryHold
 	case testcontrol.TypeReach:
-		response, barrier := o.processReachLocked(frame)
-		return response, barrier, nil
+		response, barrier := o.processReachLocked(frame, conn)
+		return response, barrier, nil, nil
 	case testcontrol.TypeSeal:
-		return o.processSealLocked(frame), nil, nil
+		return o.processSealLocked(frame), nil, nil, nil
 	default:
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol), nil, nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil, nil
 	}
 }
 
@@ -643,35 +940,47 @@ func (o *Observer) processBeginLocked(frame testcontrol.Frame) (testcontrol.Fram
 	}
 }
 
-func (o *Observer) processCallLocked(frame testcontrol.Frame) (testcontrol.Frame, *PaymentHold) {
+func (o *Observer) processCallLocked(frame testcontrol.Frame, conn net.Conn) (testcontrol.Frame, *PaymentHold, *QueryHold) {
 	state, ok := o.generations[frame.Generation]
 	if !ok || state.status != observerGenerationOpen || !observerEventIDBelongsTo(frame.EventID, state.beginID) {
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol), nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil
 	}
 	if event, exists := state.events[frame.Seq]; exists {
 		if event.typ != testcontrol.TypeCall || event.kind != frame.Kind ||
 			event.orderID != frame.OrderID || event.eventID != frame.EventID {
 			o.latchFaultLocked()
-			return observerFault(testcontrol.FaultProtocol), nil
+			return observerFault(testcontrol.FaultProtocol), nil, nil
 		}
 		if event.paymentHold != nil {
 			hold := event.paymentHold
 			if hold.canceled {
-				return observerFault(testcontrol.FaultClosed), nil
+				return observerFault(testcontrol.FaultClosed), nil, nil
 			}
 			switch hold.status {
 			case paymentHoldBound:
-				return testcontrol.Frame{}, hold
+				return testcontrol.Frame{}, hold, nil
 			case paymentHoldReleased, paymentHoldConsumed:
-				return event.ack, nil
+				return event.ack, nil, nil
 			}
 		}
-		return event.ack, nil
+		if event.queryHold != nil {
+			hold := event.queryHold
+			if hold.canceled {
+				return observerFault(testcontrol.FaultClosed), nil, nil
+			}
+			switch hold.status {
+			case queryHoldBound:
+				return testcontrol.Frame{}, nil, hold
+			case queryHoldReleased, queryHoldConsumed:
+				return event.ack, nil, nil
+			}
+		}
+		return event.ack, nil, nil
 	}
 	if o.records >= testcontrol.MaxRecords {
 		o.latchFaultLocked()
-		return observerFault(testcontrol.FaultProtocol), nil
+		return observerFault(testcontrol.FaultProtocol), nil, nil
 	}
 	event := &observerEvent{
 		typ:     testcontrol.TypeCall,
@@ -685,8 +994,10 @@ func (o *Observer) processCallLocked(frame testcontrol.Frame) (testcontrol.Frame
 	o.records++
 	switch frame.Kind {
 	case testcontrol.KindPayment:
+		state.counts.Payment++
 		o.counts.Payment++
 	case testcontrol.KindQuery:
+		state.counts.Query++
 		o.counts.Query++
 	}
 	if frame.Kind == testcontrol.KindPayment {
@@ -696,11 +1007,11 @@ func (o *Observer) processCallLocked(frame testcontrol.Frame) (testcontrol.Frame
 				// fixture uncertain; a control rejection must not stand in for
 				// business duplicate prevention.
 				o.latchFaultLocked()
-				return observerFault(testcontrol.FaultProtocol), nil
+				return observerFault(testcontrol.FaultProtocol), nil, nil
 			}
 			if !time.Now().Before(hold.deadline) {
 				o.latchFaultLocked()
-				return observerFault(testcontrol.FaultTimeout), nil
+				return observerFault(testcontrol.FaultTimeout), nil, nil
 			}
 			hold.status = paymentHoldBound
 			hold.binding = PaymentBinding{
@@ -715,13 +1026,36 @@ func (o *Observer) processCallLocked(frame testcontrol.Frame) (testcontrol.Frame
 			hold.call = frame
 			event.paymentHold = hold
 			close(hold.arrivedCh)
-			return testcontrol.Frame{}, hold
+			return testcontrol.Frame{}, hold, nil
 		}
 	}
-	return event.ack, nil
+	if frame.Kind == testcontrol.KindQuery {
+		if hold, exists := o.queryHolds[frame.Generation]; exists && !hold.canceled &&
+			hold.status == queryHoldArmed {
+			if !time.Now().Before(hold.deadline) {
+				o.latchFaultLocked()
+				return observerFault(testcontrol.FaultTimeout), nil, nil
+			}
+			hold.status = queryHoldBound
+			hold.binding = QueryBinding{
+				RunID:      o.cfg.RunID,
+				Epoch:      o.cfg.Epoch,
+				Generation: frame.Generation,
+				CallSeq:    frame.Seq,
+				EventID:    frame.EventID,
+				OrderID:    frame.OrderID,
+			}
+			hold.event = event
+			hold.call = frame
+			event.queryHold = hold
+			close(hold.arrivedCh)
+			return testcontrol.Frame{}, nil, hold
+		}
+	}
+	return event.ack, nil, nil
 }
 
-func (o *Observer) processReachLocked(frame testcontrol.Frame) (testcontrol.Frame, *Barrier) {
+func (o *Observer) processReachLocked(frame testcontrol.Frame, conn net.Conn) (testcontrol.Frame, *Barrier) {
 	state, ok := o.generations[frame.Generation]
 	if !ok || state.status != observerGenerationOpen || !observerEventIDBelongsTo(frame.EventID, state.beginID) {
 		o.latchFaultLocked()
@@ -731,7 +1065,9 @@ func (o *Observer) processReachLocked(frame testcontrol.Frame) (testcontrol.Fram
 		if event.typ != testcontrol.TypeReach || event.point != frame.Point ||
 			event.orderID != frame.OrderID || event.eventID != frame.EventID ||
 			!observerUintPtrEqual(event.paymentCallSeq, frame.PaymentCallSeq) ||
-			!observerDirectivePtrEqual(event.appliedResult, frame.AppliedResult) {
+			!observerDirectivePtrEqual(event.appliedResult, frame.AppliedResult) ||
+			!observerUintPtrEqual(event.queryCallSeq, frame.QueryCallSeq) ||
+			!observerOutcomePtrEqual(event.queryOutcome, frame.QueryOutcome) {
 			o.latchFaultLocked()
 			return observerFault(testcontrol.FaultProtocol), nil
 		}
@@ -766,6 +1102,19 @@ func (o *Observer) processReachLocked(frame testcontrol.Frame) (testcontrol.Fram
 		proofResult = &result
 	}
 
+	var queryCallSeq *uint64
+	var queryOutcome *testcontrol.QueryOutcome
+	if frame.QueryCallSeq != nil {
+		if err := o.consumeQueryAppliedLocked(frame); err != nil {
+			o.latchFaultLocked()
+			return observerFault(testcontrol.FaultProtocol), nil
+		}
+		callSeq := *frame.QueryCallSeq
+		outcome := *frame.QueryOutcome
+		queryCallSeq = &callSeq
+		queryOutcome = &outcome
+	}
+
 	event := &observerEvent{
 		typ:            testcontrol.TypeReach,
 		seq:            frame.Seq,
@@ -774,31 +1123,91 @@ func (o *Observer) processReachLocked(frame testcontrol.Frame) (testcontrol.Fram
 		eventID:        frame.EventID,
 		paymentCallSeq: proofCallSeq,
 		appliedResult:  proofResult,
+		queryCallSeq:   queryCallSeq,
+		queryOutcome:   queryOutcome,
 	}
 	state.events[frame.Seq] = event
 	o.records++
 
-	if frame.PaymentCallSeq == nil {
+	if frame.PaymentCallSeq == nil && frame.QueryCallSeq == nil {
 		key := observerBarrierKey{generation: frame.Generation, point: frame.Point, orderID: frame.OrderID}
-		if barrier, exists := o.barriers[key]; exists && !barrier.arrived && !barrier.canceled && !barrier.released {
-			barrier.arrived = true
-			barrier.seq = frame.Seq
-			barrier.receipt = testcontrol.Receipt{
+		nextKey := observerNextBarrierKey{generation: frame.Generation, point: frame.Point}
+		exact, hasExact := o.barriers[key]
+		next, hasNext := o.nextBarriers[nextKey]
+		if hasExact && hasNext {
+			o.latchFaultLocked()
+			return observerFault(testcontrol.FaultProtocol), nil
+		}
+		if hasExact && !exact.arrived && !exact.canceled && !exact.released {
+			exact.arrived = true
+			exact.seq = frame.Seq
+			exact.conn = conn
+			exact.receipt = testcontrol.Receipt{
 				RunID:      o.cfg.RunID,
 				Epoch:      o.cfg.Epoch,
 				Generation: frame.Generation,
 				LastSeq:    frame.Seq,
 			}
-			barrier.event = event
-			barrier.reach = frame
-			event.barrier = barrier
-			close(barrier.arrivedCh)
-			return testcontrol.Frame{}, barrier
+			exact.event = event
+			exact.reach = frame
+			event.barrier = exact
+			close(exact.arrivedCh)
+			return testcontrol.Frame{}, exact
+		}
+		if hasNext && !next.arrived && !next.canceled && !next.released {
+			next.arrived = true
+			next.orderID = frame.OrderID
+			next.seq = frame.Seq
+			next.conn = conn
+			next.receipt = testcontrol.Receipt{
+				RunID:      o.cfg.RunID,
+				Epoch:      o.cfg.Epoch,
+				Generation: frame.Generation,
+				LastSeq:    frame.Seq,
+			}
+			next.event = event
+			next.reach = frame
+			event.barrier = next
+			close(next.arrivedCh)
+			return testcontrol.Frame{}, next
 		}
 	}
 
 	event.ack = observerAckReach(frame, testcontrol.ActionContinue)
 	return event.ack, nil
+}
+
+func (o *Observer) consumeQueryAppliedLocked(frame testcontrol.Frame) error {
+	if frame.Point != testcontrol.PointQueryApplied ||
+		frame.QueryCallSeq == nil || frame.QueryOutcome == nil ||
+		*frame.QueryCallSeq < 1 || *frame.QueryCallSeq >= frame.Seq {
+		return testcontrol.ErrControlFault
+	}
+	state, ok := o.generations[frame.Generation]
+	if !ok {
+		return testcontrol.ErrControlFault
+	}
+	call, ok := state.events[*frame.QueryCallSeq]
+	if !ok || call.typ != testcontrol.TypeCall || call.kind != testcontrol.KindQuery ||
+		call.orderID != frame.OrderID || call.queryApplied {
+		return testcontrol.ErrControlFault
+	}
+	if call.queryHold != nil {
+		if call.queryHold.canceled {
+			return testcontrol.ErrControlFault
+		}
+		if call.queryHold.status != queryHoldReleased && call.queryHold.status != queryHoldConsumed {
+			return testcontrol.ErrControlFault
+		}
+	}
+	call.queryApplied = true
+	call.queryAppliedSeq = frame.Seq
+	call.queryAppliedEventID = frame.EventID
+	call.queryAppliedOutcome = *frame.QueryOutcome
+	if call.queryHold != nil {
+		call.queryHold.status = queryHoldConsumed
+	}
+	return nil
 }
 
 func (o *Observer) consumePaymentProofLocked(frame testcontrol.Frame) error {
@@ -839,6 +1248,25 @@ func observerUintPtrEqual(a, b *uint64) bool {
 		return a == nil && b == nil
 	}
 	return *a == *b
+}
+
+func observerOutcomePtrEqual(a, b *testcontrol.QueryOutcome) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func observerValidQueryScenario(value testcontrol.QueryScenario) bool {
+	switch value {
+	case testcontrol.QueryScenarioNormal, testcontrol.QueryScenarioFailure,
+		testcontrol.QueryScenarioSubtimeout, testcontrol.QueryScenarioNotVisible,
+		testcontrol.QueryScenarioMismatchReference, testcontrol.QueryScenarioMismatchAmount,
+		testcontrol.QueryScenarioMismatchCurrency, testcontrol.QueryScenarioMismatchTransaction:
+		return true
+	default:
+		return false
+	}
 }
 
 func observerDirectivePtrEqual(a, b *testcontrol.Directive) bool {
@@ -887,12 +1315,32 @@ func (o *Observer) sealLocked(generation, expected uint64) (testcontrol.Receipt,
 			return testcontrol.Receipt{}, testcontrol.ErrControlFault
 		}
 	}
+	for key, barrier := range o.nextBarriers {
+		if key.generation == generation && !barrier.released && !barrier.canceled {
+			return testcontrol.Receipt{}, testcontrol.ErrControlFault
+		}
+	}
 	for holdGen, hold := range o.paymentHolds {
 		if holdGen != generation {
 			continue
 		}
 		if hold.canceled || hold.status != paymentHoldConsumed {
 			return testcontrol.Receipt{}, testcontrol.ErrControlFault
+		}
+	}
+	for holdGen, hold := range o.queryHolds {
+		if holdGen != generation {
+			continue
+		}
+		if hold.canceled || hold.status != queryHoldConsumed {
+			return testcontrol.Receipt{}, testcontrol.ErrControlFault
+		}
+	}
+	if o.version == testcontrol.Version2 {
+		for _, event := range state.events {
+			if event.typ == testcontrol.TypeCall && event.kind == testcontrol.KindQuery && !event.queryApplied {
+				return testcontrol.Receipt{}, testcontrol.ErrControlFault
+			}
 		}
 	}
 	if uint64(len(state.events)) != expected {
@@ -906,6 +1354,43 @@ func (o *Observer) sealLocked(generation, expected uint64) (testcontrol.Receipt,
 	state.status = observerGenerationSealed
 	state.expectedLastSeq = expected
 	return observerReceipt(o.cfg, generation, expected), nil
+}
+
+func (o *Observer) bindBarrierConn(barrier *Barrier, conn net.Conn) bool {
+	o.mu.Lock()
+	result := false
+	duplicate := false
+	if barrier != nil && barrier.arrived && !barrier.canceled {
+		duplicate = barrier.conn != nil && barrier.conn != conn
+		switch {
+		case barrier.conn == nil:
+			barrier.conn = conn
+			result = true
+		case barrier.conn == conn:
+			result = true
+		case barrier.frozen:
+			// After Prepare has frozen the held connection, a duplicate reach on
+			// a different connection must fail closed rather than replace the target.
+			o.latchFaultLocked()
+			result = false
+		default:
+			// Before Prepare, a transport retransmission may share the barrier
+			// result but never replaces the first connection.
+			result = true
+		}
+	}
+	hook := o.testBarrierBind
+	o.mu.Unlock()
+	if hook != nil {
+		hook(barrier, conn, duplicate)
+	}
+	return result
+}
+
+func (o *Observer) setTestBarrierBindHook(hook func(*Barrier, net.Conn, bool)) {
+	o.mu.Lock()
+	o.testBarrierBind = hook
+	o.mu.Unlock()
 }
 
 func (o *Observer) waitBarrierRelease(barrier *Barrier) testcontrol.Frame {
@@ -969,6 +1454,72 @@ func (o *Observer) Expect(generation uint64) error {
 	return nil
 }
 
+// ArmNextCommittedPoint arms exactly the next real Reach for one generation
+// and one allowed committed point. It does not accept an order ID, event ID, or
+// any caller-supplied identity; the first validated server frame binds them.
+func (o *Observer) ArmNextCommittedPoint(generation uint64, point testcontrol.Point) (*Barrier, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closing {
+		return nil, testcontrol.ErrControlFault
+	}
+	if o.uncertain {
+		return nil, testcontrol.ErrUncertain
+	}
+	if point != testcontrol.PointRegistered && point != testcontrol.PointMockCommitted {
+		return nil, testcontrol.ErrProtocol
+	}
+	state, ok := o.generations[generation]
+	if !ok || state.status == observerGenerationSealed || state.status == observerGenerationTruncated {
+		return nil, testcontrol.ErrProtocol
+	}
+	nextKey := observerNextBarrierKey{generation: generation, point: point}
+	if _, exists := o.nextBarriers[nextKey]; exists {
+		return nil, testcontrol.ErrProtocol
+	}
+	for key := range o.barriers {
+		if key.generation == generation && key.point == point {
+			return nil, testcontrol.ErrProtocol
+		}
+	}
+	barrier := &Barrier{
+		observer:  o,
+		gen:       generation,
+		point:     point,
+		arrivedCh: make(chan struct{}),
+		releaseCh: make(chan struct{}),
+		cancelCh:  make(chan struct{}),
+	}
+	o.nextBarriers[nextKey] = barrier
+	return barrier, nil
+}
+
+// Binding returns the immutable actual binding captured for this barrier. It
+// is false until a real server-validated reach has arrived and the barrier has
+// not been canceled or timed out.
+func (b *Barrier) Binding() (ControlledTerminationBinding, bool) {
+	if b == nil || b.observer == nil {
+		return ControlledTerminationBinding{}, false
+	}
+	o := b.observer
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !b.arrived || b.canceled || b.event == nil || b.orderID == "" ||
+		b.seq == 0 || b.event.eventID == "" {
+		return ControlledTerminationBinding{}, false
+	}
+	return ControlledTerminationBinding{
+		RunID:       o.cfg.RunID,
+		Epoch:       o.cfg.Epoch,
+		Generation:  b.gen,
+		Point:       b.point,
+		OrderID:     b.orderID,
+		Seq:         b.seq,
+		EventID:     b.event.eventID,
+		PrefixCount: int(b.seq),
+	}, true
+}
+
 func (o *Observer) Arm(generation uint64, point testcontrol.Point, orderID string) (*Barrier, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -987,6 +1538,9 @@ func (o *Observer) Arm(generation uint64, point testcontrol.Point, orderID strin
 	}
 	key := observerBarrierKey{generation: generation, point: point, orderID: orderID}
 	if _, exists := o.barriers[key]; exists {
+		return nil, testcontrol.ErrProtocol
+	}
+	if _, exists := o.nextBarriers[observerNextBarrierKey{generation: generation, point: point}]; exists {
 		return nil, testcontrol.ErrProtocol
 	}
 	barrier := &Barrier{
@@ -1099,6 +1653,109 @@ func (o *Observer) Identity() (string, string) {
 	return o.cfg.RunID, o.cfg.Epoch
 }
 
+// QueryApplication is one server-accepted v2 query call and its exactly-once
+// QUERY_APPLIED proof. Directive is nil when the call had no scenario
+// directive. Values are deep copies of validated frames, never caller input.
+type QueryApplication struct {
+	RunID          string
+	Epoch          string
+	Generation     uint64
+	CallSeq        uint64
+	CallEventID    string
+	OrderID        string
+	Directive      *testcontrol.QueryScenario
+	Outcome        testcontrol.QueryOutcome
+	AppliedSeq     uint64
+	AppliedEventID string
+}
+
+// QueryApplicationSnapshot is the immutable measurement surface for one
+// generation. Trusted is true only when that generation independently sealed
+// and the observer is not uncertain.
+type QueryApplicationSnapshot struct {
+	Generation   uint64
+	Applications []QueryApplication
+	ApplyCount   int
+	Trusted      bool
+}
+
+// QueryApplications returns the actual accepted query applications for one v2
+// generation. It never accepts an expected value from the caller and never
+// fabricates a proof for v1 or an unsealed/uncertain generation.
+func (o *Observer) QueryApplications(generation uint64) (QueryApplicationSnapshot, bool) {
+	if o == nil {
+		return QueryApplicationSnapshot{}, false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.version != testcontrol.Version2 {
+		return QueryApplicationSnapshot{}, false
+	}
+	state, ok := o.generations[generation]
+	if !ok {
+		return QueryApplicationSnapshot{}, false
+	}
+	snapshot := QueryApplicationSnapshot{
+		Generation: generation,
+		Trusted:    state.status == observerGenerationSealed && !o.uncertain,
+	}
+	sequences := make([]uint64, 0, len(state.events))
+	for seq := range state.events {
+		sequences = append(sequences, seq)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	for _, seq := range sequences {
+		event := state.events[seq]
+		if event.typ != testcontrol.TypeCall || event.kind != testcontrol.KindQuery {
+			continue
+		}
+		application := QueryApplication{
+			RunID:       o.cfg.RunID,
+			Epoch:       o.cfg.Epoch,
+			Generation:  generation,
+			CallSeq:     event.seq,
+			CallEventID: event.eventID,
+			OrderID:     event.orderID,
+		}
+		if event.ack.QueryDirective != nil {
+			directive := *event.ack.QueryDirective
+			application.Directive = &directive
+		}
+		if event.queryApplied {
+			application.Outcome = event.queryAppliedOutcome
+			application.AppliedSeq = event.queryAppliedSeq
+			application.AppliedEventID = event.queryAppliedEventID
+			snapshot.ApplyCount++
+		}
+		snapshot.Applications = append(snapshot.Applications, application)
+	}
+	return snapshot, true
+}
+
+// SealedGeneration returns the immutable receipt and exact per-generation
+// counts for one independently sealed generation. It never derives a
+// generation from cumulative snapshot arithmetic.
+func (o *Observer) SealedGeneration(generation uint64) (testcontrol.Receipt, Counts, bool) {
+	if o == nil {
+		return testcontrol.Receipt{}, Counts{}, false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	state, ok := o.generations[generation]
+	if !ok || state.status != observerGenerationSealed {
+		return testcontrol.Receipt{}, Counts{}, false
+	}
+	if uint64(len(state.events)) != state.expectedLastSeq {
+		return testcontrol.Receipt{}, Counts{}, false
+	}
+	for seq := uint64(1); seq <= state.expectedLastSeq; seq++ {
+		if _, exists := state.events[seq]; !exists {
+			return testcontrol.Receipt{}, Counts{}, false
+		}
+	}
+	return observerReceipt(o.cfg, generation, state.expectedLastSeq), state.counts, true
+}
+
 func (o *Observer) FinalSnapshot() (ObserverFinalSnapshot, bool) {
 	if o == nil {
 		return ObserverFinalSnapshot{}, false
@@ -1156,8 +1813,22 @@ func (o *Observer) close(ctx context.Context) error {
 			close(barrier.cancelCh)
 		}
 	}
+	for _, barrier := range o.nextBarriers {
+		if !barrier.released && !barrier.canceled {
+			incomplete = true
+			barrier.canceled = true
+			close(barrier.cancelCh)
+		}
+	}
 	for _, hold := range o.paymentHolds {
 		if hold.status != paymentHoldConsumed {
+			incomplete = true
+		}
+		hold.cancelLocked()
+	}
+	for generation, hold := range o.queryHolds {
+		state := o.generations[generation]
+		if hold.status != queryHoldConsumed && (state == nil || state.status != observerGenerationTruncated) {
 			incomplete = true
 		}
 		hold.cancelLocked()
@@ -1205,6 +1876,7 @@ func (o *Observer) buildFinalSnapshotLocked() ObserverFinalSnapshot {
 	for generation, state := range o.generations {
 		if state.status != observerGenerationSealed {
 			trusted = false
+			continue
 		}
 		receipts = append(receipts, testcontrol.Receipt{
 			RunID:      o.cfg.RunID,
@@ -1262,7 +1934,16 @@ func (o *Observer) latchFaultLocked() {
 			close(barrier.cancelCh)
 		}
 	}
+	for _, barrier := range o.nextBarriers {
+		if !barrier.released && !barrier.canceled {
+			barrier.canceled = true
+			close(barrier.cancelCh)
+		}
+	}
 	for _, hold := range o.paymentHolds {
+		hold.cancelLocked()
+	}
+	for _, hold := range o.queryHolds {
 		hold.cancelLocked()
 	}
 }
@@ -1277,8 +1958,8 @@ func observerReceipt(cfg ObserverConfig, generation, lastSeq uint64) testcontrol
 }
 
 func observerAckBegin(req testcontrol.Frame) testcontrol.Frame {
-	return testcontrol.Frame{
-		Version:    testcontrol.Version,
+	frame := testcontrol.Frame{
+		Version:    req.Version,
 		Type:       testcontrol.TypeAck,
 		RunID:      req.RunID,
 		Epoch:      req.Epoch,
@@ -1286,11 +1967,15 @@ func observerAckBegin(req testcontrol.Frame) testcontrol.Frame {
 		EventID:    req.EventID,
 		For:        testcontrol.TypeBegin,
 	}
+	if req.Version == testcontrol.Version2 {
+		frame.Capability = testcontrol.CapabilityQueryControl
+	}
+	return frame
 }
 
 func observerAckCall(req testcontrol.Frame) testcontrol.Frame {
 	return testcontrol.Frame{
-		Version:    testcontrol.Version,
+		Version:    req.Version,
 		Type:       testcontrol.TypeAck,
 		RunID:      req.RunID,
 		Epoch:      req.Epoch,
@@ -1303,7 +1988,7 @@ func observerAckCall(req testcontrol.Frame) testcontrol.Frame {
 
 func observerAckReach(req testcontrol.Frame, action testcontrol.Action) testcontrol.Frame {
 	return testcontrol.Frame{
-		Version:    testcontrol.Version,
+		Version:    req.Version,
 		Type:       testcontrol.TypeAck,
 		RunID:      req.RunID,
 		Epoch:      req.Epoch,
@@ -1317,7 +2002,7 @@ func observerAckReach(req testcontrol.Frame, action testcontrol.Action) testcont
 
 func observerAckSeal(req testcontrol.Frame) testcontrol.Frame {
 	frame := testcontrol.Frame{
-		Version:    testcontrol.Version,
+		Version:    req.Version,
 		Type:       testcontrol.TypeAck,
 		RunID:      req.RunID,
 		Epoch:      req.Epoch,
