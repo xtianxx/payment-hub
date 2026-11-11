@@ -296,7 +296,7 @@ class WorkflowContractTests(unittest.TestCase):
             "database-foundation",
             "Export safe database reports",
         )
-        self.assertIn("--expect db,cancellation,us1,us2", export)
+        self.assertIn("--expect db,cancellation,us1,us2,us3", export)
         upload = _step(
             self.workflow,
             "database-foundation",
@@ -318,6 +318,7 @@ class WorkflowContractTests(unittest.TestCase):
                 "${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json",
                 "${{ runner.temp }}/payment-hub-db/reports/upload/us1.safe.json",
                 "${{ runner.temp }}/payment-hub-db/reports/upload/us2.safe.json",
+                "${{ runner.temp }}/payment-hub-db/reports/upload/us3.safe.json",
                 "${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json",
             ],
         )
@@ -474,10 +475,10 @@ class WorkflowContractTests(unittest.TestCase):
         issues = self._issues_for_mutation(text)
         self.assertTrue(issues)
 
-    def test_validation_detects_missing_us2_export(self):
+    def test_validation_detects_missing_us3_export(self):
         text = self.text.replace(
+            "--expect db,cancellation,us1,us2,us3",
             "--expect db,cancellation,us1,us2",
-            "--expect db,cancellation,us1",
             1,
         )
         self.assertNotEqual(text, self.text)
@@ -486,9 +487,9 @@ class WorkflowContractTests(unittest.TestCase):
             "workflow-export", {issue.kind for issue in issues}
         )
 
-    def test_validation_detects_missing_us2_upload_path(self):
+    def test_validation_detects_missing_us3_upload_path(self):
         text = self.text.replace(
-            "            ${{ runner.temp }}/payment-hub-db/reports/upload/us2.safe.json\n",
+            "            ${{ runner.temp }}/payment-hub-db/reports/upload/us3.safe.json\n",
             "",
             1,
         )
@@ -498,18 +499,18 @@ class WorkflowContractTests(unittest.TestCase):
             "workflow-upload-paths", {issue.kind for issue in issues}
         )
 
-    def test_validation_detects_us2_upload_after_provenance(self):
-        us2_line = (
+    def test_validation_detects_us3_upload_after_provenance(self):
+        us3_line = (
             "            ${{ runner.temp }}/payment-hub-db/reports/upload/"
-            "us2.safe.json\n"
+            "us3.safe.json\n"
         )
         provenance_line = (
             "            ${{ runner.temp }}/payment-hub-db/reports/upload/"
             "provenance.json\n"
         )
         text = self.text.replace(
-            us2_line + provenance_line,
-            provenance_line + us2_line,
+            us3_line + provenance_line,
+            provenance_line + us3_line,
             1,
         )
         self.assertNotEqual(text, self.text)
@@ -739,11 +740,12 @@ class ManifestContractTests(unittest.TestCase):
 class BindingContractTests(unittest.TestCase):
     def test_real_binding_inventory_passes(self):
         self.assertEqual(MOD.check_binding_inventory(), [])
-        self.assertEqual(len(CI_MOD.DB_REQUIRED_TEST_KEYS), 18)
+        self.assertEqual(len(CI_MOD.DB_REQUIRED_TEST_KEYS), 24)
         self.assertEqual(
             tuple(CI_MOD.DB_REQUIRED_TEST_KEYS),
             tuple(DB_MOD.REQUIRED_TEST_PACKAGES),
         )
+        self.assertEqual(len(CI_MOD.DEFAULT_REQUIRED_TESTS), 55)
 
     def test_missing_package_is_rejected(self):
         packages = tuple(
@@ -761,7 +763,7 @@ class BindingContractTests(unittest.TestCase):
         issues = MOD.check_binding_inventory(required_keys=keys)
         self.assertTrue(issues)
 
-    def test_missing_us2_explicit_key_is_rejected(self):
+    def test_missing_us2_us3_explicit_key_is_rejected(self):
         for target in (
             "TestOrderRegistrationConcurrencyIntegration",
             "TestMockIdempotencyIntegration",
@@ -770,6 +772,12 @@ class BindingContractTests(unittest.TestCase):
             "TestUS2Concurrency",
             "TestUS2Restart",
             "TestUS2ReportSafety",
+            "TestObservationFaultIntegration",
+            "TestUS3Query",
+            "TestUS3Protection",
+            "TestUS3Restart",
+            "TestUS3Lifecycle",
+            "TestUS3ReportSafety",
         ):
             with self.subTest(target=target):
                 keys = tuple(
@@ -1001,7 +1009,7 @@ class SummaryContractTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, output)
                 self.assertIn(bindings[name], output)
-        self.assertEqual(len(keys), 18)
+        self.assertEqual(len(keys), 24)
         ordered = [
             line[len("- ") :]
             for line in output.splitlines()
@@ -1022,6 +1030,12 @@ class SummaryContractTests(unittest.TestCase):
             "TestUS2Concurrency",
             "TestUS2Restart",
             "TestUS2ReportSafety",
+            "TestObservationFaultIntegration",
+            "TestUS3Query",
+            "TestUS3Protection",
+            "TestUS3Restart",
+            "TestUS3Lifecycle",
+            "TestUS3ReportSafety",
         ):
             with self.subTest(us2=name):
                 self.assertIn(name, output)

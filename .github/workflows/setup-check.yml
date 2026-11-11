@@ -304,7 +304,7 @@ jobs:
             else
               echo "cancellation-report: missing (normal PG failed, step skipped, or report not written)"
             fi
-            echo "安全归档由 scripts/ci_checks.py export-reports 仅从白名单字段重建 db-foundation.safe.json、cancellation.safe.json、us1.safe.json、us2.safe.json 与 provenance.json，并上传这些固定安全文件；不递归复制 artifacts 目录，不包含原始 launcher 日志、环境、原始 us1/us2 报告或任意报告内容。"
+            echo "安全归档由 scripts/ci_checks.py export-reports 仅从白名单字段重建 db-foundation.safe.json、cancellation.safe.json、us1.safe.json、us2.safe.json、us3.safe.json 与 provenance.json，并上传这些固定安全文件；不递归复制 artifacts 目录，不包含原始 launcher 日志、环境、原始 us1/us2/us3 报告或任意报告内容。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Export safe database reports
@@ -315,7 +315,7 @@ jobs:
           python3 -B scripts/ci_checks.py export-reports \
             --report-dir "$RUNNER_TEMP/payment-hub-db/reports" \
             --db-artifact-root "$RUNNER_TEMP/payment-hub-db/artifacts" \
-            --expect db,cancellation,us1,us2
+            --expect db,cancellation,us1,us2,us3
 
       - name: Upload safe database reports
         if: always()
@@ -327,6 +327,7 @@ jobs:
             ${{ runner.temp }}/payment-hub-db/reports/upload/cancellation.safe.json
             ${{ runner.temp }}/payment-hub-db/reports/upload/us1.safe.json
             ${{ runner.temp }}/payment-hub-db/reports/upload/us2.safe.json
+            ${{ runner.temp }}/payment-hub-db/reports/upload/us3.safe.json
             ${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json
           if-no-files-found: error
           retention-days: 14

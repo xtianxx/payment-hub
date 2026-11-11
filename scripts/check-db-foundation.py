@@ -157,6 +157,24 @@ REQUIRED_TEST_PACKAGES[
 REQUIRED_TEST_PACKAGES[
     "TestUS2ReportSafety"
 ] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestObservationFaultIntegration"
+] = f"{EXPECTED_MODULE}/internal/postgres"
+REQUIRED_TEST_PACKAGES[
+    "TestUS3Query"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS3Protection"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS3Restart"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS3Lifecycle"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestUS3ReportSafety"
+] = f"{EXPECTED_MODULE}/tests"
 EXPECTED_PACKAGE_PATHS = tuple(
     f"{EXPECTED_MODULE}/{name}" for name in PACKAGES
 )
