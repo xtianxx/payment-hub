@@ -1,10 +1,12 @@
 # Implementation Plan: 模拟商城一次性 Mock 支付闭环
 
+**四项审查修复已收口（2026-11-11）**：Submit/HTTP生产接缝、重启核实必需证明及v1原始ACK严格性已取得反例回归、独立复核与fresh PG接受；权威记录为`artifacts/us3/review-fixes/parent-acceptance.json`。先前接受及本轮夹具残留失败均保留，不用旧绿灯替代本轮验证；资格、依赖、期限和T070+边界未扩大。
+
 **Branch**: `001-mock-payment` | **Date**: 2026-11-06 | **Spec**: [spec.md](spec.md)
 
 **Input**: 已批准的 `specs/001-mock-payment/spec.md` 与本次对话已确认的技术决策。
 
-**Status**: Approved design; US1 merged; US2 locally accepted — 当前范围技术设计于2026-11-06获用户确认；US1及CI防漂移已通过PR #6四项远端检查并合并到main `11369b9`。US2 T042–T053已按既定HTTP合同的严格语法/payment业务值与限定只读分层完成本机验收；fresh PG run `813b3f4bed304b66a4e765d7dc6e7a7c`的18项必需检查、US2八场景及US1六场景和安全导出已独立接受，详见tasks与quickstart。沿用既有规范增量实施，未重建Spec Kit产物。T023原始测试先行缺证继续披露且未勾选；US2已本地提交、尚未推送，也未进行远端CI验收，US3、镜像、CD及完整MVP不在本批交付范围；不自动提交、推送或发布。
+**Status**: Approved design; US1/US2 merged; US3 review fixes locally accepted — 当前fresh PG run `932b50b41ea1450385051fad4b2f0a94`及严格安全导出已本机独立接受，详见tasks和quickstart 0.5；原0.4为历史快照。v1保持原义并严格拒绝v2入站字段，US3显式启用v2查询控制。真实SQL故障只在隔离库，可靠原确认与追踪失败分开表达；Submit与Query共用同一窄标记语义，HTTP仅对白名单受控说明区分展示。未新增生产迁移、公开故障入口或付款资格。历史证据限制、T070+、镜像、CD及远端CI边界不变，不自动提交、推送或发布。
 
 ## Summary
 

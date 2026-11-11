@@ -1,12 +1,14 @@
 # 运行与验证指南：模拟商城一次性 Mock 支付闭环
 
-**Status**: US1 merged; US2 locally accepted — US1及CI防漂移已通过PR #6四项远端检查并合并到main `11369b9`；US2 T042–T053本机独立验收完成，见0.3。US2已本地提交、尚未推送，也未进行远端CI验收；T023最早测试先行证据缺失仍披露。US3、应用镜像和发布/CD不在本批范围，不代表完整MVP完成。本批不自动提交、推送或合并。
+**四项审查修复已本机接受（2026-11-11）**：当前结果见0.5及`artifacts/us3/review-fixes/parent-acceptance.json`。下文0.4与原接受记录保留为先前快照，不用旧run代替新增接缝验证；原审查及失败证据不删除。
 
-**Date**: 2026-11-10
+**Status**: US1/US2 merged; US3 review fixes locally accepted — US3 T054–T069及最终四项审查修复的本机验证通过；可执行入口沿用0.4，当前计数及证据以0.5为准。历史证据限制、T070+、应用镜像、发布/CD及远端CI边界不变；未提交、推送或合并。
+
+**Date**: 2026-11-11
 
 **依据**: [plan.md](plan.md)、[spec.md](spec.md)、[data-model.md](data-model.md)、[HTTP 合同](contracts/http-api.md)。
 
-本文不新增业务能力。0.1记录基础入口与历史证据，0.2记录当前US1入口及实际验收；第1–7节还包含完整MVP/镜像发布的后续目标，不表示所有步骤已获验收。实际版本、命令和结果见[开发记录](../../docs/development.md)。
+本文不新增业务能力。0.1–0.3记录基础与US1/US2历史验收，0.4给出当前三故事合流入口；第1–7节还包含完整MVP/镜像发布的后续目标，不表示所有步骤已获验收。
 
 所有业务与故障演示均使用模拟数据，不处理真实资金、真实支付凭据或个人信息。后续完整流程中的“应当”均为目标行为，不是本次执行结果。
 
@@ -98,6 +100,58 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
 
 外部审查随后确认原T050混合请求没有独立服务端重叠证明，本批补独立屏障及必需报告字段后，fresh run `7757e1e6fd034e75a5b7c0f09b778d8e`已通过18/18、四包、US1六/US2八场景和安全导出；父核对初始等待者2与混合等待者2的独立来源、混合200/409、付款和效果不增加及资源缺席，接受记录见`artifacts/us2/review-mixed-concurrency/validation/parent-acceptance.json`。同期467项Python及真实metadata通过，untagged vet/default42复用有效结果，未重跑漏洞扫描/取消实验；117项当前输入稳定。前述813b等旧run不包含新混合证明，不冒称覆盖当前字段。US2历史报告、首次失败及夹具命名空间修复证据均保留。T023历史缺证继续披露；本批已本地提交、尚未推送、尚未运行远端CI，此指南不授权US3、镜像、发布/CD或Git推送。
 
+### 0.4 US3首次本机验收与可执行入口（历史快照；当前结果见0.5）
+
+正常业务仍只使用既有POST及两种GET：未知时查询核实，可靠匹配才能确认；无Mock匹配不证明从未付款，不提供补付、重置或后台自动恢复。普通已确认GET不访问Mock或新增追踪。先读UNKNOWN的在途核实若遇到另一请求先确认，后来的故障/错配不能降级原确认；追踪保存失败须明确返回`TRACE_SAVE_ERROR`，不能冒称该次记录已保存。
+
+以下是当前完整本机入口，使用已准备的固定工具链、离线缓存和子shell环境；不自动安装、下载或升级。每次使用新的`root`，遇到任何失败立即停止并检查安全报告，不盲重试。
+
+```sh
+(
+set -eu
+cache="$HOME/.cache/payment-hub"
+go="$cache/toolchains/go1.27.3/bin/go"
+export PATH="$(dirname "$go"):$PATH"
+export GOENV=off GOTOOLCHAIN=local GOWORK=off GOFLAGS= GOTELEMETRY=off
+export XDG_CONFIG_HOME="$cache/config" GOPATH="$cache/gopath"
+export GOMODCACHE="$cache/gomod" GOCACHE="$cache/gobuild"
+export CGO_ENABLED=1 GOMAXPROCS=2 GOPROXY=off GOSUMDB=off TMPDIR=/tmp/opencode
+mkdir -p "$PWD/artifacts"
+root="$(mktemp -d "$PWD/artifacts/us3-local.XXXXXX")"
+python3 -B -m unittest discover -s scripts -p 'test_*.py' &&
+python3 -B scripts/check-ci-contract.py --go "$go" &&
+"$go" vet -mod=readonly -p=1 ./... &&
+python3 -B scripts/ci_checks.py run-default --go "$go" --report-dir "$root/reports" &&
+python3 -B scripts/check-db-foundation.py --go "$go" --cache-dir "$cache" \
+  --cleanup-owned-resources --artifact-root "$root/db" &&
+python3 -B scripts/check-ci-cancellation.py --go "$go" --cache-dir "$cache" \
+  --artifact-root "$root/cancellation-db" --report-dir "$root/reports" &&
+python3 -B scripts/ci_checks.py export-reports --report-dir "$root/reports" \
+  --db-artifact-root "$root/db" --expect default,db,cancellation,us1,us2,us3
+)
+```
+
+- 首次US3快照默认必需绑定53项（51根＋2个焦点），当前审查修复后为55项，见0.5；DB24项，仍为固定四包，launcher无故事选择参数。整批570秒、integration包120秒、业务10秒/Mock3秒/DB2秒/一次收尾2秒不变。镜像缺失须先取得明确准备许可，不能静默加`--prepare-images`。
+- 可信固定场景只走私有UDS，US3显式`PAYMENT_HUB_TEST_CONTROL_VERSION=2`，v1默认且严格不变；版本值本身不能开启testmode。场景不接受商城字段、任意SQL或自由JSON，也不修改Mock已保存结果或`processed_at`。250ms是受控查询子期限；报告区分配置期限与含应用证明开销的实测耗时，不替代默认3秒期限测试。
+- 24场景分别覆盖未知确认、故障、真实无匹配、暂不可见、四类错配、提交不明、确认保护、追踪失败、四种重启及三种生命周期；缺一失败。付款未形成交易使用隔离库真实表锁与目标事务身份；追踪失败使用精确临时trigger/function并验证清理缺席，不修改生产迁移。
+- 查询报告按真实调用身份关联`queries[].request_id`、HTTP及处理记录，不按响应完成顺序拼接。追踪插入失败且确无本次记录时只报`NOT_RECORDED`，不补造决定。受控`reply_hidden`仅证明提交成功后隐藏答复路径，不等于真实网络断链；应用仅订单读回与外部订单＋同记录核对分别表达。
+- T058登记后未付款、Mock提交后答复未送达两窗口使用真实应用进程中断。gen1为`controlled_truncated`、无receipt、`exact_counts=false`；真实held绑定、进程终态、独立PG事实和gen2完整Seal联合通过才接受保护，不补造跨代精确计数或全局Trusted。
+- 客户端取消不等于回滚；只有目标事务终结后的PG事实才用于最终断言。应用20秒退出、宿主harness25秒宽限及清理已测；池/工作者关闭顺序部分来自既有app单测组合证据，不宣称实测goroutine数量或容器镜像行为。
+- 本机接受run：`6729612a4323459984eaee49341b834c`。四包、24项DB必需检查、US1六/US2八/US3二十四场景、取消门禁与独立资源缺席均通过。修订后metadata、vet、整包编译、default53通过；最终安全消费者完整532项Python通过，六类safe JSON及provenance无错误。导出层最后只改变消费者及其测试，Go和DB/取消启动器未变，复用边界见`artifacts/us3/final-validation/parent-acceptance.json`。
+- 主报告为`$root/db/<run_id>/us3.json`，内部命名空间`scenarios/us3/<scenario>`；US3报告独立上限256KiB。仅上传`$root/reports/upload/`中的六类safe JSON和provenance，不上传原始日志、报文、Authorization、DSN或动态SQL。
+- 首轮失败run `9c51442cf6b4445db5f9a03a0dcfa52c`及首次导出失败保留；旧16场景PASS不追认为关联证明。Q首次完整安全动作明细缺失继续披露，后续overlay回归是新复验，不是补回首次历史；T023仍不勾选。漏洞扫描、本次应用镜像、远端CI及T070+未执行，不承诺无缺口审计、自动补付、自动补齐或生产SLA。
+
+### 0.5 审查修复后：当前本机接受结果
+
+- Submit与Query均识别存储返回的两个trace-save标记；仅经独立校验的原已提交确认＋空Record可直接返回。Submit新建登记的`Created=true`、HTTP 201及Location保持，复用/登记不明路径不升级201，不再次付款或新增收尾窗口；普通error附带结果仍不可信。
+- `TRACE_SAVE_ERROR`的两种受控说明分别映射为固定`trace save failed`与`trace save state unconfirmed`；其他任意Issue.Message仍按code安全回退。调用方继续按code判断，不把文案变体当新增支付状态。
+- 两个受控中断重启场景的gen2必须付款0次、查询1次；GET request_id必须关联实际QUERY记录。无Mock为KEEP_UNKNOWN＋MOCK_RESULT_NOT_FOUND，有匹配Mock为ACCEPT_CONFIRMATION＋完整依据。删除query/record并把计数改零的反例现已被Go及安全消费者拒绝；gen1受控截断限制不变。
+- v1原始ACK含`query_directive`键一律拒绝，包括null或数字；v2合法指令、v1既有帧保持兼容。验证直接使用DecodeFrame原始字节，不以EncodeFrame的拒绝替代入站证明。
+- 默认必需检查55项（53根＋2个焦点），新增`TestSubmitTraceFailureProtection`及`TestTraceSaveIssueVariants`，旧53项完整保留；DB仍24项/四包。533项完整Python、真实metadata、vet、default55及integration编译通过。
+- fresh PG run `932b50b41ea1450385051fad4b2f0a94`四包/24项必需检查、US1六/US2八/US3二十四场景通过；新增Submit真实PG服务组合子例在既有ObservationFaultIntegration根内执行。该子例不等于正常应用二进制HTTP端到端；201/Location/双issue及消息安全另由实际路由JSON测试证明。
+- 先前补验run `7abfb873d1a84104a1a288ac992d6e5b`因新增夹具漏清真实Mock行而最终失败，`[0,1,0]`证据保留。只补本次order ID精确清理及零行核验后重新执行，当前最终`[0,0,0]`；不放宽残留门禁。该修订仅影响integration夹具，未受影响的Python/default/metadata证据按记录复用，没有冒称全部重跑。
+- 当前取消门禁、六类严格安全导出及provenance通过，正式与取消窗口串行且资源独立确认缺席。新接受记录为`artifacts/us3/review-fixes/parent-acceptance.json`，原`artifacts/us3/final-validation/parent-acceptance.json`保持历史原样。未运行远端CI、漏洞重扫、镜像或T070+；不承诺无缺口审计、自动补付、生产SLA。
+
 ## 1. 启动数据库
 
 **目标操作**：确认项目与数据卷后启动隔离的 PostgreSQL，等待数据库就绪。
@@ -179,10 +233,10 @@ TMPDIR=/tmp/opencode python3 -B scripts/check-db-foundation.py \
 
 | 状态 | 判定依据 | 当前情况 |
 |------|----------|----------|
-| 设计写清楚 | 操作顺序、检查条件与失败边界已记录并评审 | 已批准设计；0.1/0.2区分历史基础与当前US1 |
-| 命令实际执行成功 | 对应实现存在，有实际命令、退出码及证据 | 基础与US1宿主正常二进制/真实PG/HTTP/重启已通过；镜像未验收 |
-| 业务验收通过 | 关键业务断言成立且证据完整，未执行项已披露 | US1本地运行范围通过；T023历史缺证保留，US2/US3及完整MVP未通过 |
+| 设计写清楚 | 操作顺序、检查条件与失败边界已记录并评审 | 已批准设计；0.4给入口、0.5给当前审查修复结论，历史记录保留 |
+| 命令实际执行成功 | 对应实现存在，有实际命令、退出码及证据 | 三故事宿主正常二进制/真实PG/HTTP/重启及取消、安全导出通过；镜像未验收 |
+| 业务验收通过 | 关键业务断言成立且证据完整，未执行项已披露 | US1/US2/US3本机故事范围接受；历史证据限制保留，完整MVP未验收 |
 
-后续US2/US3、配对应用镜像及发布流程须另获授权、分别实施验收。不得把US1本机绿灯当作完整MVP、当前分支远端CI或部署产物已通过。
+后续T070+、配对应用镜像及发布流程须另获授权、分别实施验收。不得把三故事本机绿灯当作完整MVP、当前分支远端CI或部署产物已通过。
 
 本文件不授权安装、启动、迁移、构建、测试、发布、清理数据、创建外部资源、Git 提交或推送，也不授权进入 tasks 或 implement；实际执行仍需相应授权。

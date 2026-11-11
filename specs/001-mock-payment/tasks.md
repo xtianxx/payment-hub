@@ -4,7 +4,9 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 # Tasks: 模拟商城一次性 Mock 支付闭环
 
-**Status**: US1 merged; US2 locally accepted — US1及CI防漂移已通过PR #6四项远端检查并合并到main `11369b9`；T024–T041完成。US2在`003-us2-payment-idempotency`完成T042–T053，本机fresh PG run `813b3f4bed304b66a4e765d7dc6e7a7c`的18项必需检查、US1六场景和US2八场景及安全导出已独立接受，见`artifacts/us2/final-validation-after-namespace/parent-acceptance.json`。T023最早测试先行证据缺失仍披露且不勾选；US2当前已本地提交、尚未推送，也未进行远端CI验收。不进入US3，完整MVP、应用镜像和CD未验收。本文件本身不授予执行或Git权限；本批不自动提交、推送、合并或部署。
+**四项审查修复已本机接受（2026-11-11）**：Submit的trace-save标记消费、HTTP受控说明、重启后必需查询证明及v1入站ACK严格性均已修复并取得反例回归。独立复核、533项Python、default55、fresh PG四包/24项DB检查、US3二十四场景、取消门禁及六类安全导出通过；本轮run为`932b50b41ea1450385051fad4b2f0a94`，权威记录为`artifacts/us3/review-fixes/parent-acceptance.json`。原接受及失败证据保留，不提交、推送或进入T070+。
+
+**Status**: US1/US2 merged; US3 review fixes locally accepted — 当前本机结论包含四项审查修复，见quickstart 0.5及`artifacts/us3/review-fixes/parent-acceptance.json`；0.4及原接受记录保留为先前快照，不用旧绿灯证明新增接缝。未运行US3远端CI，未提交或推送；不进入T070+、镜像或CD。T023最早测试先行缺证及US3首次部分动作证据缺失继续披露，不宣称完整历史证据或完整MVP。本文件不授予执行或Git权限。
 
 **Input**: `specs/001-mock-payment/` 中已批准的设计，基线提交 `a999f01`。
 
@@ -151,27 +153,31 @@ description: "模拟商城一次性 Mock 支付闭环的分故事实施任务"
 
 ### Tests for User Story 3（必需，先于对应扩展）
 
-- [ ] T054 [P] [US3] 在 `internal/payment/reconcile_test.go` 编写超时/故障保留UNKNOWN、匹配才确认、仍未知/无匹配不重付、业务关联/金额/币种/交易号错配与冲突拒绝，以及依据白名单/类型/长度和处理前后状态的测试。（依赖：T053；验收：FR-004/006/007/012及SC-006/010覆盖，超时不是FAILED，未取得信息不补造。）
-- [ ] T055 [P] [US3] 在 `internal/postgres/result_fault_test.go` 编写真实SQL失败、结果/依据无半套保存、受控提交答复丢失读回、同记录号保存重试、异义同号拒绝和并发保存主键冲突回滚后核对测试。（依赖：T053；验收：实际执行SQL并查PG事实，不吞失败事务继续写，不用历史UNKNOWN覆盖后来确认，受控丢答复不冒充真实网络断链。）
-- [ ] T056 [P] [US3] 在 `tests/us3_query_test.go` 编写US3-A1/A2/A3/A5/A6及HTTP问题表达：无平台单404、Mock无匹配200+原单与问题、查询故障/错配保持原结果，error与payment+issues互斥，提交不明不得假201、假回滚或泄露候选号。（依赖：T053；验收：五类问题码与error映射可区分，2xx仍不代表追踪完整，查询不发起付款。）
-- [ ] T057 [P] [US3] 在 `tests/us3_protection_test.go` 编写US3-A4与并发保护：普通读确认结果不查Mock；对先读到UNKNOWN的在途核实，用屏障让另一请求先确认，再让前者返回故障/错配，检查锁下仍保留确认并保存本次原因；另测额外追踪失败不阻断可靠确认返回。（依赖：T053；验收：既覆盖原规格后续核实故障，又不为普通已确认查询强行新增渠道调用；追踪失败显式报告且不算追踪通过。）
-- [ ] T058 [P] [US3] 在 `tests/us3_restart_test.go` 编写US3-A7及两个真实中断窗口：登记已提交但尚未付款、Mock已提交但答复未送达；保持父观察器和DB，重启后未知仍未知、原意图重放不再付款，后续核实可确认或继续未知。（依赖：T053；验收：无匹配不证明没付，重启不恢复资格，Mock已提交事实保留，证据缺口不按零调用通过。）
-- [ ] T059 [P] [US3] 在 `internal/payment/cancellation_test.go`、`tests/lifecycle_test.go` 编写默认主处理10秒、Mock3秒、完整DB操作2秒、每请求额外最多一次2秒收尾及退出总预算的测试，覆盖客户端断开、到期前后进入Mock边界、池关闭与迟到答复。（依赖：T053；验收：已观察取消不再新增付款/核实，收尾不再查Mock或补付，取消/强退不证明回滚，屏障预算和普通默认期限证据分开。）
+- [x] T054 [P] [US3] 在 `internal/payment/reconcile_test.go` 编写超时/故障保留UNKNOWN、匹配才确认、仍未知/无匹配不重付、业务关联/金额/币种/交易号错配与冲突拒绝，以及依据白名单/类型/长度和处理前后状态的测试。（依赖：T053；验收：FR-004/006/007/012及SC-006/010覆盖，超时不是FAILED，未取得信息不补造。）
+- [x] T055 [P] [US3] 在 `internal/postgres/result_fault_test.go` 编写真实SQL失败、结果/依据无半套保存、受控提交答复丢失读回、同记录号保存重试、异义同号拒绝和并发保存主键冲突回滚后核对测试。（依赖：T053；验收：实际执行SQL并查PG事实，不吞失败事务继续写，不用历史UNKNOWN覆盖后来确认，受控丢答复不冒充真实网络断链。）
+- [x] T056 [P] [US3] 在 `tests/us3_query_test.go` 编写US3-A1/A2/A3/A5/A6及HTTP问题表达：无平台单404、Mock无匹配200+原单与问题、查询故障/错配保持原结果，error与payment+issues互斥，提交不明不得假201、假回滚或泄露候选号。（依赖：T053；验收：五类问题码与error映射可区分，2xx仍不代表追踪完整，查询不发起付款。）
+- [x] T057 [P] [US3] 在 `tests/us3_protection_test.go` 编写US3-A4与并发保护：普通读确认结果不查Mock；对先读到UNKNOWN的在途核实，用屏障让另一请求先确认，再让前者返回故障/错配，检查锁下仍保留确认并保存本次原因；另测额外追踪失败不阻断可靠确认返回。（依赖：T053；验收：既覆盖原规格后续核实故障，又不为普通已确认查询强行新增渠道调用；追踪失败显式报告且不算追踪通过。）
+- [x] T058 [P] [US3] 在 `tests/us3_restart_test.go` 编写US3-A7及两个真实中断窗口：登记已提交但尚未付款、Mock已提交但答复未送达；保持父观察器和DB，重启后未知仍未知、原意图重放不再付款，后续核实可确认或继续未知。（依赖：T053；验收：无匹配不证明没付，重启不恢复资格，Mock已提交事实保留，证据缺口不按零调用通过。）
+- [x] T059 [P] [US3] 在 `internal/payment/cancellation_test.go`、`tests/lifecycle_test.go` 编写默认主处理10秒、Mock3秒、完整DB操作2秒、每请求额外最多一次2秒收尾及退出总预算的测试，覆盖客户端断开、到期前后进入Mock边界、池关闭与迟到答复。（依赖：T053；验收：已观察取消不再新增付款/核实，收尾不再查Mock或补付，取消/强退不证明回滚，屏障预算和普通默认期限证据分开。）
 
 ### Implementation for User Story 3
 
-- [ ] T060 [US3] 实现 `internal/mock/scenarios.go` 的可信故障与可见性控制，区分付款未形成交易、提交后丢答复、查询失败、暂不可见及错配答复；接入T019而不接受商城控制字段，场景切换不改已保存SUCCEEDED/FAILED或processed_at。（依赖：T054,T056,T058；验收：延迟后可查不是查询触发付款，不新增后台处理或未知Mock交易状态。）
-- [ ] T061 [US3] 完善 `internal/payment/reconcile.go` 的核实判断与依据过滤，兑现原文：“接受新确认时必须保存足以核对原订单的关联、金额、币种和确认结果，不能用空对象代替最小依据；取得的交易号也必须按业务关联规则核对。”；保持T031白名单及T011原因长度，故障/未知/冲突不直接覆盖确认结果。（依赖：T054,T057,T060；验收：四类决定与实际前后状态一致，不用时间戳新旧或任意JSON决定状态。）
-- [ ] T062 [US3] 完善 `internal/payment/query.go` 的未知核实与结果保护，查询仍无结论/无匹配/失败/错配均正常保存处理记录；已能可靠读取的确认不以额外追踪或新读取成功为返回前提。（依赖：T056,T057,T061；验收：两GET共享规则，普通确认读取无Mock调用，任何分支不触发新的支付尝试。）
-- [ ] T063 [US3] 完善 `internal/postgres/results.go`、`internal/postgres/readback.go` 的同次保存重试、提交不明核对和故障处理：记录号复用、语义核对，失败事务先回滚；按稳定订单号/接入方锁行，接受新确认及最小依据仍原子保存，读回当前可靠事实而非历史快照。（依赖：T055,T057,T061；验收：T055通过，锁不跨Mock调用，读不到原记录不宣称保存完成，其他唯一错误不冒充重复成功。）
-- [ ] T064 [US3] 在 `internal/payment/finish.go` 管理每请求一次的有限收尾窗口，保存/重试/读回/事务清理共享最多2秒且受退出截止限制，仅处理固定答复或故障及已发生提交的核对；不等待更好结果、不查Mock、不重开窗口或留下无人管理goroutine。（依赖：T059,T062,T063；验收：T059业务层断言成立，未鉴权/无效请求不能借收尾进入订单流程，客户端断开不宣称响应已送达。）
-- [ ] T065 [US3] 完善 `internal/app/lifecycle.go` 的主处理、DB/Mock子期限及收尾生命周期，退出先不就绪/停止新请求，数据库使用者结束后关池，预留资源清理时间，20秒总截止到期取消剩余工作，25秒容器宽限不再发放新预算。（依赖：T059,T064；验收：普通默认期限与放宽屏障实验分别记录，单SQL/重试不重置外层预算，未完成事务不被猜测回滚。）
-- [ ] T066 [US3] 完善 `internal/httpapi/response.go`、`internal/httpapi/payments.go` 的不确定保存与追踪故障响应，分别表达 `MOCK_RESULT_UNCONFIRMED`、`MOCK_RESULT_NOT_FOUND`、`MOCK_EVIDENCE_REJECTED`、`RESULT_SAVE_ERROR`、`TRACE_SAVE_ERROR`；只返回可靠订单事实，问题说明不旁路宣布未保存的新成功/失败。（依赖：T056,T057,T062,T063,T064,T065；验收：T056/T057通过，无可靠订单时走error，已有可靠订单时按合同201/200和issues处理，FAILED不等于500。）
-- [ ] T067 [US3] 扩展 `tests/harness/observer_test.go`、`tests/harness/artifacts_test.go` 的负面实验，验证独立调用身份、仅传输重试去重、观察器离线/重启/ACK不明、采集不完整/写入失败的判定；夹具阻塞不能冒充目标故障，日志及产物不包含敏感原文。（依赖：T058,T059,T060,T064,T065；验收：只有证据闭合才报告精确次数，不以“每单只放行一次”掩盖重复调用，失败明确暴露。）
-- [ ] T068 [US3] 执行 `tests/us3_query_test.go`、`tests/us3_protection_test.go`、`tests/us3_restart_test.go`、`tests/lifecycle_test.go` 及T055真实PG故障检查，将主证据写入 `artifacts/<run_id>/us3.json`。（依赖：T054,T055,T056,T057,T058,T059,T060,T061,T062,T063,T064,T065,T066,T067；验收：US3-A1–A7、错配、追踪失败、提交不明及取消/退出均有实际结果；无记录/不可读/无匹配不能混同。）
-- [ ] T069 [US3] 按T068实际证据更新 `specs/001-mock-payment/quickstart.md` 的未知核实、故障和重启步骤，区分受控提交答复丢失与真实断链、追踪故障处理符合预期与追踪完整性通过。（依赖：T068；验收：未执行项和证据限制可见，不承诺无缺口审计、自动补付、自动补齐或生产SLA。）
+- [x] T060 [US3] 实现 `internal/mock/scenarios.go` 的可信故障与可见性控制，区分付款未形成交易、提交后丢答复、查询失败、暂不可见及错配答复；接入T019而不接受商城控制字段，场景切换不改已保存SUCCEEDED/FAILED或processed_at。（依赖：T054,T056,T058；验收：延迟后可查不是查询触发付款，不新增后台处理或未知Mock交易状态。）
+- [x] T061 [US3] 完善 `internal/payment/reconcile.go` 的核实判断与依据过滤，兑现原文：“接受新确认时必须保存足以核对原订单的关联、金额、币种和确认结果，不能用空对象代替最小依据；取得的交易号也必须按业务关联规则核对。”；保持T031白名单及T011原因长度，故障/未知/冲突不直接覆盖确认结果。（依赖：T054,T057,T060；验收：四类决定与实际前后状态一致，不用时间戳新旧或任意JSON决定状态。）
+- [x] T062 [US3] 完善 `internal/payment/query.go` 的未知核实与结果保护，查询仍无结论/无匹配/失败/错配均正常保存处理记录；已能可靠读取的确认不以额外追踪或新读取成功为返回前提。（依赖：T056,T057,T061；验收：两GET共享规则，普通确认读取无Mock调用，任何分支不触发新的支付尝试。）
+- [x] T063 [US3] 完善 `internal/postgres/results.go`、`internal/postgres/readback.go` 的同次保存重试、提交不明核对和故障处理：记录号复用、语义核对，失败事务先回滚；按稳定订单号/接入方锁行，接受新确认及最小依据仍原子保存，读回当前可靠事实而非历史快照。（依赖：T055,T057,T061；验收：T055通过，锁不跨Mock调用，读不到原记录不宣称保存完成，其他唯一错误不冒充重复成功。）
+- [x] T064 [US3] 在 `internal/payment/finish.go` 管理每请求一次的有限收尾窗口，保存/重试/读回/事务清理共享最多2秒且受退出截止限制，仅处理固定答复或故障及已发生提交的核对；不等待更好结果、不查Mock、不重开窗口或留下无人管理goroutine。（依赖：T059,T062,T063；验收：T059业务层断言成立，未鉴权/无效请求不能借收尾进入订单流程，客户端断开不宣称响应已送达。）
+- [x] T065 [US3] 完善 `internal/app/lifecycle.go` 的主处理、DB/Mock子期限及收尾生命周期，退出先不就绪/停止新请求，数据库使用者结束后关池，预留资源清理时间，20秒总截止到期取消剩余工作，25秒容器宽限不再发放新预算。（依赖：T059,T064；验收：普通默认期限与放宽屏障实验分别记录，单SQL/重试不重置外层预算，未完成事务不被猜测回滚。）
+- [x] T066 [US3] 完善 `internal/httpapi/response.go`、`internal/httpapi/payments.go` 的不确定保存与追踪故障响应，分别表达 `MOCK_RESULT_UNCONFIRMED`、`MOCK_RESULT_NOT_FOUND`、`MOCK_EVIDENCE_REJECTED`、`RESULT_SAVE_ERROR`、`TRACE_SAVE_ERROR`；只返回可靠订单事实，问题说明不旁路宣布未保存的新成功/失败。（依赖：T056,T057,T062,T063,T064,T065；验收：T056/T057通过，无可靠订单时走error，已有可靠订单时按合同201/200和issues处理，FAILED不等于500。）
+- [x] T067 [US3] 扩展 `tests/harness/observer_test.go`、`tests/harness/artifacts_test.go` 的负面实验，验证独立调用身份、仅传输重试去重、观察器离线/重启/ACK不明、采集不完整/写入失败的判定；夹具阻塞不能冒充目标故障，日志及产物不包含敏感原文。（依赖：T058,T059,T060,T064,T065；验收：只有证据闭合才报告精确次数，不以“每单只放行一次”掩盖重复调用，失败明确暴露。）
+- [x] T068 [US3] 执行 `tests/us3_query_test.go`、`tests/us3_protection_test.go`、`tests/us3_restart_test.go`、`tests/lifecycle_test.go` 及T055真实PG故障检查，将主证据写入 `artifacts/<run_id>/us3.json`。（依赖：T054,T055,T056,T057,T058,T059,T060,T061,T062,T063,T064,T065,T066,T067；验收：US3-A1–A7、错配、追踪失败、提交不明及取消/退出均有实际结果；无记录/不可读/无匹配不能混同。）
+- [x] T069 [US3] 按T068实际证据更新 `specs/001-mock-payment/quickstart.md` 的未知核实、故障和重启步骤，区分受控提交答复丢失与真实断链、追踪故障处理符合预期与追踪完整性通过。（依赖：T068；验收：未执行项和证据限制可见，不承诺无缺口审计、自动补付、自动补齐或生产SLA。）
 
-**Checkpoint**: 三个P1故事均可用各自夹具独立验收。只有三故事及跨故事门禁齐全才可称完整首期MVP，不把故障用例的预期处理等同正常追踪全部成功。
+**US3首次本机接受（历史快照，2026-11-11）**：fresh run `6729612a4323459984eaee49341b834c`的四包及24项必需检查、US3全部24场景通过；T055真实故障、T058两中断窗口、取消/退出及本次资源缺席均已核对。最终532项Python通过；metadata、vet、整包编译及default53在修订后同批通过，后续仅安全导出消费者及其自测两文件改变，未改变Go、数据库/取消启动器或测试根，复用边界见接受记录。六类安全导出与provenance通过。首个PG失败run `9c51442cf6b4445db5f9a03a0dcfa52c`、首次导出失败及历史缺证说明全部保留；旧16场景PASS不追认为请求关联已验收。实际职责沿现有query/result/submit及Mock hooks实现，未为任务建议文件名另造reconcile.go、finish.go、scenarios.go或readback.go。20秒应用退出与25秒宿主宽限已测，不冒称镜像/容器验收；故障处理符合预期不等于追踪全部保存成功。
+
+**审查后补验（2026-11-11）**：原run未覆盖Submit/HTTP接缝及重启无查询反例，不能作为这四项的完整证明。本轮新增两个默认根，旧53项完整保留；T055既有真实PG根增加Submit与Query在途重叠的服务组合子例，真实Mock提交、QUERY确认、PAYMENT trace SQL拒绝及无额外读回均断言通过。HTTP的201/Location及两受控说明由独立路由JSON测试证明，不冒称该PG组合子例本身是正常二进制HTTP端到端。首次补验run `7abfb873d1a84104a1a288ac992d6e5b`虽然四包/24项均通过，最终因夹具Mock残留`[0,1,0]`判失败并清理；修复精确夹具清理后，fresh run `932b50b41ea1450385051fad4b2f0a94`取得`[0,0,0]`及全部通过。未重复未受影响的默认门禁：仅integration夹具清理文件改变的复用边界已记录；最终新PG、取消及严格导出均使用修订输入。附属但未纳入最终四项的意见不在本轮修复承诺内。
+
+**Checkpoint**: 三个P1故事本机运行范围已接受。T070+跨故事交付、镜像、发布及远端CI仍未验收，不称完整首期MVP。
 
 ## Phase 6: Polish & Cross-Cutting Concerns（本地验收、镜像与CI交付）
 
