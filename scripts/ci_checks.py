@@ -57,6 +57,7 @@ REPORT_FILENAMES = {
     "db": "db-foundation.json",
     "us1": "us1.json",
     "us2": "us2.json",
+    "us3": "us3.json",
     "vulnerability": "vulnerability-report.json",
     "cancellation": "cancellation-report.json",
 }
@@ -65,6 +66,7 @@ SAFE_FILENAMES = {
     "db": "db-foundation.safe.json",
     "us1": "us1.safe.json",
     "us2": "us2.safe.json",
+    "us3": "us3.safe.json",
     "vulnerability": "vulnerability.safe.json",
     "cancellation": "cancellation.safe.json",
 }
@@ -73,6 +75,7 @@ EXPECT_NAMES = (
     "db",
     "us1",
     "us2",
+    "us3",
     "vulnerability",
     "cancellation",
 )
@@ -113,6 +116,212 @@ US2_SCENARIO_NAMES = (
     "restart_failed",
     "key_rotation",
 )
+US3_SCHEMA = "payment-hub.us3.v1"
+US3_SCENARIO_NAMES = (
+    "submit_unknown_no_transaction",
+    "submit_commit_unknown",
+    "query_unknown_confirmed",
+    "query_unknown_failure",
+    "query_unknown_subtimeout",
+    "query_unknown_not_visible",
+    "query_unknown_no_mock_match",
+    "query_mismatch_reference",
+    "query_mismatch_amount",
+    "query_mismatch_currency",
+    "query_mismatch_transaction",
+    "query_not_found",
+    "query_confirmed_plain",
+    "query_confirmed_trace_failure",
+    "query_result_commit_unknown",
+    "protection_inflight_failure",
+    "protection_inflight_mismatch",
+    "restart_registered_unpaid",
+    "restart_mock_committed_reply_lost",
+    "restart_unknown_no_confirm",
+    "restart_unknown_then_confirmed",
+    "lifecycle_cancel_before_mock",
+    "lifecycle_cancel_after_mock",
+    "lifecycle_exit_budget",
+)
+US3_RESULTS = US1_RESULTS
+US3_HTTP_RESULTS = US1_HTTP_RESULTS
+US3_ISSUES = frozenset(
+    {
+        "MOCK_RESULT_UNCONFIRMED",
+        "MOCK_RESULT_NOT_FOUND",
+        "MOCK_EVIDENCE_REJECTED",
+        "RESULT_SAVE_ERROR",
+        "TRACE_SAVE_ERROR",
+    }
+)
+US3_DECISIONS = frozenset(
+    {
+        "ACCEPT_CONFIRMATION",
+        "KEEP_UNKNOWN",
+        "KEEP_CONFIRMED",
+        "REJECT_EVIDENCE",
+    }
+)
+US3_QUERY_DECISIONS = US3_DECISIONS | {"NOT_RECORDED"}
+US3_REASONS = frozenset(
+    {
+        "MOCK_EVIDENCE_INVALID",
+        "MOCK_EVIDENCE_MISMATCH",
+        "MOCK_CONFIRMATION_CONFLICT",
+        "MOCK_RESULT_UNCONFIRMED",
+        "MOCK_RESULT_NOT_FOUND",
+        "CONFIRMED_RESULT_PRESERVED",
+    }
+)
+US3_SOURCES = frozenset({"PAYMENT", "QUERY"})
+US3_TRANSPORTS = frozenset(
+    {"RESPONSE", "CLIENT_CANCELED", "NO_RESPONSE"}
+)
+US3_QUERY_DIRECTIVES = frozenset(
+    {
+        "normal",
+        "failure",
+        "subtimeout",
+        "notvisible",
+        "mismatch_reference",
+        "mismatch_amount",
+        "mismatch_currency",
+        "mismatch_transaction",
+    }
+)
+US3_QUERY_OUTCOMES = frozenset(
+    {"found", "not_found", "unavailable", "subtimeout", "mismatch_applied"}
+)
+US3_TRACE_PROOF_SOURCE_LITERAL = (
+    "actual first-request HTTP TRACE_SAVE_ERROR + absent first record + "
+    "actual second ACCEPT record"
+)
+US3_TRACE_PROOF_SOURCE_CANONICAL = "HTTP_TRACE_FAILURE_AND_PG_REQUEST_RECORDS"
+US3_TRACE_OUTCOMES = frozenset(
+    {"SAVED", "FAILED", "INDETERMINATE", "NOT_ATTEMPTED"}
+)
+US3_BUDGET_CLASSES = frozenset({"NORMAL", "CONTROLLED"})
+US3_BUDGET_KINDS = frozenset(
+    {
+        "MAIN",
+        "MOCK",
+        "DB",
+        "FINISH",
+        "QUERY_SUBTIMEOUT",
+        "BARRIER",
+        "EXIT",
+        "PROCESS_GRACE",
+        "MOCK_DB_SUBTIMEOUT",
+    }
+)
+US3_BUDGET_SOURCES = frozenset({"APP", "HARNESS", "UNIT", "MOCK"})
+US3_FAULT_KINDS = frozenset(
+    {
+        "MOCK_INSERT_WAITER_HOLD",
+        "REGISTRATION_INSERT_HOLD",
+        "RESULT_HANDLING_INSERT_HOLD",
+        "REGISTRATION_COMMIT_REPLY_LOST",
+        "RESULT_SAVE_COMMIT_REPLY_LOST",
+        "RESULT_COMMIT_REPLY_HIDDEN",
+        "MOCK_QUERY_FAILURE",
+        "MOCK_QUERY_SUBTIMEOUT_250MS",
+        "MOCK_QUERY_NOT_VISIBLE",
+        "MISMATCH_REFERENCE",
+        "MISMATCH_AMOUNT",
+        "MISMATCH_CURRENCY",
+        "MISMATCH_TRANSACTION",
+        "TRACE_INSERT_SQL",
+        "PROCESS_TERMINATED",
+        "CLIENT_CANCEL",
+        "SHUTDOWN_ACTIVE_REQUEST",
+    }
+)
+US3_CLEANUP_KINDS = frozenset(
+    {
+        "NONE",
+        "UDS_SCENARIO",
+        "TRIGGER_FUNCTION",
+        "ROW_LOCK",
+        "PROCESS_TERMINAL",
+        "TEMP_DB",
+        "TABLE_SHARE_LOCK",
+    }
+)
+US3_SQLSTATES = frozenset(
+    {"", "00000", "23505", "40001", "57014", "P0001", "08006", "57P01"}
+)
+US3_SQLSTATE_SOURCES = frozenset(
+    {"fixture_probe", "application_observed", "none"}
+)
+US3_PROOF_MODES = frozenset({"complete", "controlled_truncated"})
+US3_TRANSITIONS = frozenset(
+    {"NONE", "CREATED_UNKNOWN", "UNKNOWN_TO_CONFIRMED", "UNCHANGED"}
+)
+US3_PROTECTION_KINDS = frozenset(
+    {"INFLIGHT_FAILURE", "INFLIGHT_MISMATCH"}
+)
+US3_SAVE_COMMIT_STATES = frozenset(
+    {"CONFIRMED", "FAILED", "INDETERMINATE", "NOT_ATTEMPTED"}
+)
+US3_READBACK_SCOPES = frozenset(
+    {"NONE", "APPLICATION_ORDER_ONLY", "INDEPENDENT_ORDER_AND_RECORD"}
+)
+US3_READBACK_SOURCES = frozenset(
+    {"NONE", "APP", "EXTERNAL_PG", "APP_AND_EXTERNAL"}
+)
+US3_DIFFERENCES = frozenset(
+    {"platform_reference_id", "mock_transaction_id", "amount", "currency", "result"}
+)
+US3_HTTP_KINDS = frozenset({"PRIMARY", "SHUTDOWN_PROBE"})
+US3_COUNT_KEYS = (
+    "payment_calls",
+    "query_calls",
+    "order_rows",
+    "mock_rows",
+    "trace_rows",
+)
+US3_REPORT_MAX_BYTES = 256 * 1024
+US3_SCENARIO_MAX = 32
+US3_HTTP_MAX = 16
+US3_PG_MAX = 8
+US3_CALLS_MAX = 8
+US3_RECORDS_MAX = 16
+US3_QUERIES_MAX = 8
+US3_FAULTS_MAX = 8
+US3_PROOFS_MAX = 8
+US3_BUDGETS_MAX = 8
+US3_COMMANDS_MAX = 8
+US3_DIFFERENCES_MAX = 5
+US3_CONTROLLED_TRUNCATED_SCENARIOS = frozenset(
+    {"restart_registered_unpaid", "restart_mock_committed_reply_lost"}
+)
+US3_QUERY_REQUIRED_SCENARIOS = frozenset(
+    {
+        "query_unknown_confirmed",
+        "query_unknown_failure",
+        "query_unknown_subtimeout",
+        "query_unknown_not_visible",
+        "query_unknown_no_mock_match",
+        "query_mismatch_reference",
+        "query_mismatch_amount",
+        "query_mismatch_currency",
+        "query_mismatch_transaction",
+        "query_confirmed_trace_failure",
+        "query_result_commit_unknown",
+        "protection_inflight_failure",
+        "protection_inflight_mismatch",
+        "restart_unknown_no_confirm",
+        "restart_unknown_then_confirmed",
+        "restart_registered_unpaid",
+        "restart_mock_committed_reply_lost",
+    }
+)
+US3_MISMATCH_DIFFERENCES = {
+    "query_mismatch_reference": "platform_reference_id",
+    "query_mismatch_amount": "amount",
+    "query_mismatch_currency": "currency",
+    "query_mismatch_transaction": "mock_transaction_id",
+}
 # US2 keeps the US1 scenario-result enum. UNKNOWN is a payment/HTTP result,
 # never a scenario execution conclusion.
 US2_RESULTS = US1_RESULTS
@@ -250,6 +459,12 @@ DB_REQUIRED_TEST_KEYS = (
     "TestUS2Concurrency",
     "TestUS2Restart",
     "TestUS2ReportSafety",
+    "TestObservationFaultIntegration",
+    "TestUS3Query",
+    "TestUS3Protection",
+    "TestUS3Restart",
+    "TestUS3Lifecycle",
+    "TestUS3ReportSafety",
 )
 DB_PACKAGE_KEYS = (
     "internal/postgres",
@@ -258,11 +473,13 @@ DB_PACKAGE_KEYS = (
     "tests",
 )
 
-# Frozen default inventory: 38 required roots plus one focused subtest entry
-# (TestPaymentRequestBoundary/POST_rejection_priority), i.e. 39 required
+# Frozen default inventory: 53 required roots plus two focused subtest entries
+# (TestPaymentRequestBoundary/POST_rejection_priority and
+# TestPaymentRequestBoundary/POST_business_value_delegation), i.e. 55 required
 # mapping entries total. Roots cover the original 26 PR3 roots, first-batch
 # US1 core roots, query/HTTP contract roots, payment-directive
-# protocol/client/consumer roots, and runtime/router wiring. The eleven DB
+# protocol/client/consumer roots, runtime/router wiring, and the US3
+# query-scenario/reconciliation/cancellation additions. The twenty-four DB
 # integration checks (including the explicit lifecycle subtest) are build-tagged
 # integration and remain required in the DB launcher (REQUIRED_TEST_PACKAGES),
 # not in the untagged default ./... gate.
@@ -311,6 +528,19 @@ DEFAULT_REQUIRED_TESTS = {
     "TestPaymentRequestBoundary/POST_business_value_delegation": (
         "payment-hub/internal/httpapi"
     ),
+    "TestPaymentReconciliation": "payment-hub/internal/payment",
+    "TestQueryTraceFailureProtection": "payment-hub/internal/payment",
+    "TestPaymentCancellationBounds": "payment-hub/internal/payment",
+    "TestObservationRecordRetrySemantics": "payment-hub/internal/postgres",
+    "TestQueryScenarioProtocol": "payment-hub/internal/testcontrol",
+    "TestQueryScenarioClient": "payment-hub/internal/testcontrol",
+    "TestMockQueryScenarios": "payment-hub/internal/mock",
+    "TestQueryScenarioAdapter": "payment-hub/internal/app",
+    "TestObserverQueryDirectiveSafety": "payment-hub/tests/harness",
+    "TestControlledTerminationProof": "payment-hub/tests/harness",
+    "TestNextCommittedPointBarrier": "payment-hub/tests/harness",
+    "TestSubmitTraceFailureProtection": "payment-hub/internal/payment",
+    "TestTraceSaveIssueVariants": "payment-hub/internal/httpapi",
 }
 
 
@@ -1372,7 +1602,10 @@ def run_default(go: str, report_dir: str) -> int:
 
 
 def _read_source_json(
-    path: Path, *, expected_parent: Path | None = None
+    path: Path,
+    *,
+    expected_parent: Path | None = None,
+    max_bytes: int = MAX_REPORT_BYTES,
 ) -> tuple[dict[str, Any], str]:
     if path.is_symlink() or not path.is_file():
         raise CiError("unsafe-source-path")
@@ -1384,7 +1617,7 @@ def _read_source_json(
         if resolved.parent != expected_parent.resolve():
             raise CiError("unsafe-source-path")
     try:
-        if path.stat().st_size > MAX_REPORT_BYTES:
+        if path.stat().st_size > max_bytes:
             raise CiError("source-too-large")
         raw = path.read_bytes()
     except OSError as exc:
@@ -3140,6 +3373,2365 @@ def _safe_us2_report(
     }
 
 
+def _us3_exact_keys(
+    value: Any, keys: Sequence[str], name: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_optional_exact_keys(
+    value: Any, required: Sequence[str], optional: Sequence[str], name: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CiError("unsafe-field-us3." + name)
+    allowed = set(required) | set(optional)
+    if not set(required) <= set(value) or not set(value) <= allowed:
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_int(
+    value: Any, name: str, minimum: int = 0, maximum: int | None = None
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CiError("unsafe-field-us3." + name)
+    if value < minimum or (maximum is not None and value > maximum):
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_enum(value: Any, allowed: frozenset[str], name: str) -> str:
+    if not isinstance(value, str) or value not in allowed:
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_str(value: Any, name: str, max_length: int = 160) -> str:
+    if not isinstance(value, str) or len(value) > max_length:
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_token(value: Any, name: str, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise CiError("unsafe-field-us3." + name)
+    if allow_empty and value == "":
+        return value
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,80}", value):
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_uuid(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not UUID_RE.fullmatch(value):
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_hex32(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_hex64(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not HEX64_RE.fullmatch(value):
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_timestamp(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not TIMESTAMP_RE.fullmatch(value):
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_event_id(value: Any, name: str, call_seq: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not US1_EVENT_ID_RE.fullmatch(value)
+        or call_seq < 1
+        or call_seq > US1_MAX_RECORDS
+    ):
+        raise CiError("unsafe-field-us3." + name)
+    if int(value.rsplit(":", 1)[1]) != call_seq:
+        raise CiError("unsafe-field-us3." + name)
+    return value
+
+
+def _us3_counts(value: Any, name: str) -> dict[str, int]:
+    item = _us3_exact_keys(value, US3_COUNT_KEYS, name)
+    return {
+        key: _us3_int(item[key], name + "." + key)
+        for key in US3_COUNT_KEYS
+    }
+
+
+def _us3_fact(value: Any, name: str) -> dict[str, Any]:
+    fact = _us3_optional_exact_keys(
+        value,
+        (
+            "payment_id",
+            "client_ref_sha256",
+            "business_ref_sha256",
+            "amount",
+            "currency",
+            "result",
+            "registered_at",
+        ),
+        ("confirmed_at", "mock_transaction_id"),
+        name,
+    )
+    result: dict[str, Any] = {
+        "payment_id": _us3_uuid(fact["payment_id"], name + ".payment_id"),
+        "client_ref_sha256": _us3_hex64(
+            fact["client_ref_sha256"], name + ".client_ref_sha256"
+        ),
+        "business_ref_sha256": _us3_hex64(
+            fact["business_ref_sha256"], name + ".business_ref_sha256"
+        ),
+        "amount": _us3_int(fact["amount"], name + ".amount"),
+        "currency": _us3_str(fact["currency"], name + ".currency", 8),
+        "result": _us3_enum(
+            fact["result"], US1_HTTP_RESULTS | {""}, name + ".result"
+        ),
+        "registered_at": _us3_timestamp(
+            fact["registered_at"], name + ".registered_at"
+        ),
+    }
+    if result["currency"] != "CNY":
+        raise CiError("unsafe-field-us3." + name + ".currency")
+    if "confirmed_at" in fact:
+        result["confirmed_at"] = _us3_timestamp(
+            fact["confirmed_at"], name + ".confirmed_at"
+        )
+    if "mock_transaction_id" in fact:
+        result["mock_transaction_id"] = _us3_uuid(
+            fact["mock_transaction_id"], name + ".mock_transaction_id"
+        )
+    return result
+
+
+def _us3_facts(value: Any) -> dict[str, Any]:
+    facts = _us3_optional_exact_keys(
+        value,
+        ("transition", "stable_facts"),
+        ("before", "after"),
+        "facts",
+    )
+    result: dict[str, Any] = {
+        "transition": _us3_enum(
+            facts["transition"], US3_TRANSITIONS, "facts.transition"
+        ),
+        "stable_facts": _us3_bool(
+            facts["stable_facts"], "facts.stable_facts"
+        ),
+    }
+    for key in ("before", "after"):
+        if key in facts:
+            result[key] = _us3_fact(facts[key], "facts." + key)
+    return result
+
+
+def _us3_checks(value: Any) -> dict[str, Any]:
+    checks = _us3_exact_keys(
+        value,
+        ("counts_before", "counts_after", "counts_exact", "stable_facts"),
+        "checks",
+    )
+    return {
+        "counts_before": _us3_counts(
+            checks["counts_before"], "checks.counts_before"
+        ),
+        "counts_after": _us3_counts(
+            checks["counts_after"], "checks.counts_after"
+        ),
+        "counts_exact": _us3_bool(
+            checks["counts_exact"], "checks.counts_exact"
+        ),
+        "stable_facts": _us3_bool(
+            checks["stable_facts"], "checks.stable_facts"
+        ),
+    }
+
+
+def _us3_http(value: Any) -> dict[str, Any]:
+    entry = _us3_exact_keys(
+        value,
+        (
+            "kind",
+            "generation",
+            "status",
+            "request_id",
+            "payment_id",
+            "result",
+            "issues",
+        ),
+        "http",
+    )
+    issues_value = _require_list(entry["issues"], "us3.http.issues")
+    if len(issues_value) > len(US3_ISSUES):
+        raise CiError("unsafe-field-us3.http.issues")
+    issues: list[str] = []
+    for issue in issues_value:
+        if not isinstance(issue, str) or issue not in US3_ISSUES:
+            raise CiError("unsafe-field-us3.http.issues")
+        if issue in issues:
+            raise CiError("unsafe-field-us3.http.issues")
+        issues.append(issue)
+    request_id = entry["request_id"]
+    payment_id = entry["payment_id"]
+    return {
+        "kind": _us3_enum(entry["kind"], US3_HTTP_KINDS, "http.kind"),
+        "generation": _us3_int(
+            entry["generation"], "http.generation", 1, US1_MAX_GENERATIONS
+        ),
+        "status": _us3_int(entry["status"], "http.status", 100, 599),
+        "request_id": (
+            ""
+            if request_id == ""
+            else _us3_uuid(request_id, "http.request_id")
+        ),
+        "payment_id": (
+            ""
+            if payment_id == ""
+            else _us3_uuid(payment_id, "http.payment_id")
+        ),
+        "result": _us3_enum(
+            entry["result"], US3_HTTP_RESULTS | {""}, "http.result"
+        ),
+        "issues": issues,
+    }
+
+
+def _us3_pg(value: Any) -> dict[str, Any]:
+    entry = _us3_exact_keys(value, ("state", "rows"), "pg")
+    return {
+        "state": _us3_enum(entry["state"], frozenset(US1_PG_STATES), "pg.state"),
+        "rows": _us3_int(entry["rows"], "pg.rows"),
+    }
+
+
+def _us3_call(value: Any) -> dict[str, Any]:
+    entry = _us3_exact_keys(
+        value, ("generation", "exact", "payment_calls", "query_calls"), "calls"
+    )
+    return {
+        "generation": _us3_int(
+            entry["generation"], "calls.generation", 1, US1_MAX_GENERATIONS
+        ),
+        "exact": _us3_bool(entry["exact"], "calls.exact"),
+        "payment_calls": _us3_int(
+            entry["payment_calls"], "calls.payment_calls"
+        ),
+        "query_calls": _us3_int(entry["query_calls"], "calls.query_calls"),
+    }
+
+
+def _us3_evidence(value: Any) -> dict[str, Any]:
+    evidence = _us3_optional_exact_keys(
+        value,
+        ("differences",),
+        (
+            "platform_reference_id",
+            "mock_transaction_id",
+            "amount",
+            "currency",
+            "result",
+        ),
+        "record.evidence",
+    )
+    differences_value = _require_list(
+        evidence["differences"], "us3.record.evidence.differences"
+    )
+    if len(differences_value) > US3_DIFFERENCES_MAX:
+        raise CiError("unsafe-field-us3.record.evidence.differences")
+    differences: list[str] = []
+    for difference in differences_value:
+        if (
+            not isinstance(difference, str)
+            or difference not in US3_DIFFERENCES
+        ):
+            raise CiError("unsafe-field-us3.record.evidence.differences")
+        if difference in differences:
+            raise CiError("unsafe-field-us3.record.evidence.differences")
+        differences.append(difference)
+    result: dict[str, Any] = {"differences": differences}
+    if "platform_reference_id" in evidence:
+        result["platform_reference_id"] = _us3_uuid(
+            evidence["platform_reference_id"],
+            "record.evidence.platform_reference_id",
+        )
+    if "mock_transaction_id" in evidence:
+        result["mock_transaction_id"] = _us3_uuid(
+            evidence["mock_transaction_id"],
+            "record.evidence.mock_transaction_id",
+        )
+    if "amount" in evidence:
+        result["amount"] = _us3_int(
+            evidence["amount"], "record.evidence.amount"
+        )
+    if "currency" in evidence:
+        currency = _us3_str(
+            evidence["currency"], "record.evidence.currency", 8
+        )
+        if currency != "CNY":
+            raise CiError("unsafe-field-us3.record.evidence.currency")
+        result["currency"] = currency
+    if "result" in evidence:
+        result["result"] = _us3_enum(
+            evidence["result"],
+            US3_HTTP_RESULTS | {""},
+            "record.evidence.result",
+        )
+    return result
+
+
+def _us3_record(value: Any) -> dict[str, Any]:
+    record = _us3_exact_keys(
+        value,
+        (
+            "record_id",
+            "request_id",
+            "source",
+            "decision",
+            "result_before",
+            "result_after",
+            "reason_code",
+            "evidence",
+        ),
+        "record",
+    )
+    return {
+        "record_id": _us3_uuid(record["record_id"], "record.record_id"),
+        "request_id": _us3_uuid(record["request_id"], "record.request_id"),
+        "source": _us3_enum(record["source"], US3_SOURCES, "record.source"),
+        "decision": _us3_enum(
+            record["decision"], US3_DECISIONS, "record.decision"
+        ),
+        "result_before": _us3_enum(
+            record["result_before"],
+            US3_HTTP_RESULTS | {""},
+            "record.result_before",
+        ),
+        "result_after": _us3_enum(
+            record["result_after"],
+            US3_HTTP_RESULTS | {""},
+            "record.result_after",
+        ),
+        "reason_code": (
+            ""
+            if record["reason_code"] == ""
+            else _us3_enum(
+                record["reason_code"], US3_REASONS, "record.reason_code"
+            )
+        ),
+        "evidence": _us3_evidence(record["evidence"]),
+    }
+
+
+def _us3_query_binding(value: Any) -> dict[str, Any]:
+    binding = _us3_exact_keys(
+        value,
+        ("run_id", "epoch", "generation", "call_seq", "event_id", "order_id"),
+        "query.binding",
+    )
+    call_seq = _us3_int(
+        binding["call_seq"], "query.binding.call_seq", 1, US1_MAX_RECORDS
+    )
+    return {
+        "run_id": _us3_hex32(binding["run_id"], "query.binding.run_id"),
+        "epoch": _us3_hex32(binding["epoch"], "query.binding.epoch"),
+        "generation": _us3_int(
+            binding["generation"],
+            "query.binding.generation",
+            1,
+            US1_MAX_GENERATIONS,
+        ),
+        "call_seq": call_seq,
+        "event_id": _us3_event_id(
+            binding["event_id"], "query.binding.event_id", call_seq
+        ),
+        "order_id": _us3_uuid(binding["order_id"], "query.binding.order_id"),
+    }
+
+
+def _us3_query(value: Any) -> dict[str, Any]:
+    query = _us3_optional_exact_keys(
+        value,
+        (
+            "generation",
+            "path",
+            "query_call_seq",
+            "request_id",
+            "directive",
+            "outcome",
+            "applied",
+            "apply_count",
+            "decision",
+            "result_before",
+            "result_after",
+            "trace_outcome",
+            "confirmed_returned",
+            "new_mock_calls",
+            "trusted",
+        ),
+        ("binding", "expected_mock_transaction_id"),
+        "query",
+    )
+    result: dict[str, Any] = {
+        "generation": _us3_int(
+            query["generation"], "query.generation", 1, US1_MAX_GENERATIONS
+        ),
+        "path": _us3_enum(
+            query["path"], frozenset({"BY_ID", "BY_BUSINESS_ORDER_NO"}), "query.path"
+        ),
+        "query_call_seq": _us3_int(
+            query["query_call_seq"], "query.query_call_seq", 1, US1_MAX_RECORDS
+        ),
+        "request_id": _us3_uuid(query["request_id"], "query.request_id"),
+        "directive": _us3_enum(
+            query["directive"], US3_QUERY_DIRECTIVES, "query.directive"
+        ),
+        "outcome": _us3_enum(
+            query["outcome"], US3_QUERY_OUTCOMES, "query.outcome"
+        ),
+        "applied": _us3_bool(query["applied"], "query.applied"),
+        "apply_count": _us3_int(
+            query["apply_count"], "query.apply_count", 0, 1
+        ),
+        "decision": _us3_enum(
+            query["decision"], US3_QUERY_DECISIONS, "query.decision"
+        ),
+        "result_before": _us3_enum(
+            query["result_before"],
+            US3_HTTP_RESULTS | {""},
+            "query.result_before",
+        ),
+        "result_after": _us3_enum(
+            query["result_after"],
+            US3_HTTP_RESULTS | {""},
+            "query.result_after",
+        ),
+        "trace_outcome": _us3_enum(
+            query["trace_outcome"], US3_TRACE_OUTCOMES, "query.trace_outcome"
+        ),
+        "confirmed_returned": _us3_bool(
+            query["confirmed_returned"], "query.confirmed_returned"
+        ),
+        "new_mock_calls": _us3_int(
+            query["new_mock_calls"], "query.new_mock_calls"
+        ),
+        "trusted": _us3_bool(query["trusted"], "query.trusted"),
+    }
+    if result["applied"] != (result["apply_count"] == 1):
+        raise CiError("unsafe-field-us3.query.apply_count")
+    if "binding" in query:
+        result["binding"] = _us3_query_binding(query["binding"])
+    if "expected_mock_transaction_id" in query:
+        result["expected_mock_transaction_id"] = _us3_uuid(
+            query["expected_mock_transaction_id"],
+            "query.expected_mock_transaction_id",
+        )
+    return result
+
+
+def _us3_cleanup(value: Any) -> dict[str, Any]:
+    cleanup = _us3_optional_exact_keys(
+        value, ("kind", "removed", "verified"), ("target_id",), "cleanup"
+    )
+    result: dict[str, Any] = {
+        "kind": _us3_enum(
+            cleanup["kind"], US3_CLEANUP_KINDS, "cleanup.kind"
+        ),
+        "removed": _us3_bool(cleanup["removed"], "cleanup.removed"),
+        "verified": _us3_bool(cleanup["verified"], "cleanup.verified"),
+    }
+    if "target_id" in cleanup:
+        result["target_id"] = _us3_token(
+            cleanup["target_id"], "cleanup.target_id"
+        )
+    if not result["removed"] or not result["verified"]:
+        raise CiError("unsafe-field-us3.cleanup")
+    return result
+
+
+def _us3_fault(value: Any) -> dict[str, Any]:
+    fault = _us3_optional_exact_keys(
+        value,
+        (
+            "kind",
+            "sqlstate",
+            "sqlstate_source",
+            "fixture_copy",
+            "platform_table_read",
+            "cleanup",
+        ),
+        ("target_id",),
+        "fault",
+    )
+    result: dict[str, Any] = {
+        "kind": _us3_enum(fault["kind"], US3_FAULT_KINDS, "fault.kind"),
+        "sqlstate": _us3_enum(
+            fault["sqlstate"], US3_SQLSTATES, "fault.sqlstate"
+        ),
+        "sqlstate_source": _us3_enum(
+            fault["sqlstate_source"],
+            US3_SQLSTATE_SOURCES | {""},
+            "fault.sqlstate_source",
+        ),
+        "fixture_copy": _us3_bool(
+            fault["fixture_copy"], "fault.fixture_copy"
+        ),
+        "platform_table_read": _us3_bool(
+            fault["platform_table_read"], "fault.platform_table_read"
+        ),
+        "cleanup": _us3_cleanup(fault["cleanup"]),
+    }
+    if "target_id" in fault:
+        result["target_id"] = _us3_token(
+            fault["target_id"], "fault.target_id"
+        )
+    sqlstate = result["sqlstate"]
+    source = result["sqlstate_source"]
+    cleanup_kind = result["cleanup"]["kind"]
+    if source == "":
+        if (
+            sqlstate == ""
+            and result["kind"]
+            in {"REGISTRATION_INSERT_HOLD", "RESULT_HANDLING_INSERT_HOLD"}
+            and cleanup_kind == "TABLE_SHARE_LOCK"
+        ):
+            result["sqlstate_source"] = "none"
+        else:
+            raise CiError("unsafe-field-us3.fault.sqlstate_source")
+    elif source == "none":
+        if sqlstate != "":
+            raise CiError("unsafe-field-us3.fault.sqlstate_source")
+    elif sqlstate == "":
+        raise CiError("unsafe-field-us3.fault.sqlstate_source")
+    return result
+
+
+def _us3_receipt(value: Any, generation: int, run_id: str) -> dict[str, Any]:
+    receipt = _us3_exact_keys(
+        value, ("run_id", "epoch", "generation", "last_seq"), "receipt"
+    )
+    if _us3_hex32(receipt["run_id"], "receipt.run_id") != run_id:
+        raise CiError("unsafe-field-us3.receipt.run_id")
+    receipt_generation = _us3_int(
+        receipt["generation"], "receipt.generation", 1, US1_MAX_GENERATIONS
+    )
+    if receipt_generation != generation:
+        raise CiError("unsafe-field-us3.receipt.generation")
+    return {
+        "run_id": run_id,
+        "epoch": _us3_hex32(receipt["epoch"], "receipt.epoch"),
+        "generation": receipt_generation,
+        "last_seq": _us3_int(
+            receipt["last_seq"], "receipt.last_seq", 0, US1_MAX_RECORDS
+        ),
+    }
+
+
+def _us3_controlled_binding(value: Any) -> dict[str, Any]:
+    binding = _us3_exact_keys(
+        value,
+        (
+            "run_id",
+            "epoch",
+            "generation",
+            "point",
+            "order_id",
+            "call_seq",
+            "event_id",
+            "prefix_count",
+        ),
+        "controlled_termination.binding",
+    )
+    call_seq = _us3_int(
+        binding["call_seq"],
+        "controlled_termination.binding.call_seq",
+        1,
+        US1_MAX_RECORDS,
+    )
+    return {
+        "run_id": _us3_hex32(
+            binding["run_id"], "controlled_termination.binding.run_id"
+        ),
+        "epoch": _us3_hex32(
+            binding["epoch"], "controlled_termination.binding.epoch"
+        ),
+        "generation": _us3_int(
+            binding["generation"],
+            "controlled_termination.binding.generation",
+            1,
+            US1_MAX_GENERATIONS,
+        ),
+        "point": _us3_enum(
+            binding["point"],
+            frozenset({"REGISTERED", "MOCK_COMMITTED"}),
+            "controlled_termination.binding.point",
+        ),
+        "order_id": _us3_uuid(
+            binding["order_id"], "controlled_termination.binding.order_id"
+        ),
+        "call_seq": call_seq,
+        "event_id": _us3_event_id(
+            binding["event_id"],
+            "controlled_termination.binding.event_id",
+            call_seq,
+        ),
+        "prefix_count": _us3_int(
+            binding["prefix_count"],
+            "controlled_termination.binding.prefix_count",
+        ),
+    }
+
+
+def _us3_process_exit(value: Any) -> dict[str, Any]:
+    exit_value = _us3_exact_keys(
+        value,
+        ("code", "canceled", "reaped", "group_gone", "output_complete"),
+        "controlled_termination.exit",
+    )
+    return {
+        "code": _us3_int(
+            exit_value["code"],
+            "controlled_termination.exit.code",
+            -255,
+            255,
+        ),
+        "canceled": _us3_bool(
+            exit_value["canceled"], "controlled_termination.exit.canceled"
+        ),
+        "reaped": _us3_bool(
+            exit_value["reaped"], "controlled_termination.exit.reaped"
+        ),
+        "group_gone": _us3_bool(
+            exit_value["group_gone"],
+            "controlled_termination.exit.group_gone",
+        ),
+        "output_complete": _us3_bool(
+            exit_value["output_complete"],
+            "controlled_termination.exit.output_complete",
+        ),
+    }
+
+
+def _us3_controlled_termination(value: Any) -> dict[str, Any]:
+    controlled = _us3_exact_keys(
+        value,
+        (
+            "binding",
+            "exit",
+            "controlled_truncated",
+            "no_receipt",
+            "exact_counts",
+            "observed_prefix",
+        ),
+        "controlled_termination",
+    )
+    return {
+        "binding": _us3_controlled_binding(controlled["binding"]),
+        "exit": _us3_process_exit(controlled["exit"]),
+        "controlled_truncated": _us3_bool(
+            controlled["controlled_truncated"],
+            "controlled_termination.controlled_truncated",
+        ),
+        "no_receipt": _us3_bool(
+            controlled["no_receipt"], "controlled_termination.no_receipt"
+        ),
+        "exact_counts": _us3_bool(
+            controlled["exact_counts"], "controlled_termination.exact_counts"
+        ),
+        "observed_prefix": _us3_counts(
+            controlled["observed_prefix"],
+            "controlled_termination.observed_prefix",
+        ),
+    }
+
+
+def _us3_generation_proof(value: Any, run_id: str) -> dict[str, Any]:
+    proof = _us3_optional_exact_keys(
+        value,
+        ("generation", "mode", "sealed", "trusted", "exact_counts"),
+        ("receipt", "counts", "controlled_termination"),
+        "generation_proof",
+    )
+    generation = _us3_int(
+        proof["generation"], "generation_proof.generation", 1, US1_MAX_GENERATIONS
+    )
+    result: dict[str, Any] = {
+        "generation": generation,
+        "mode": _us3_enum(
+            proof["mode"], US3_PROOF_MODES, "generation_proof.mode"
+        ),
+        "sealed": _us3_bool(proof["sealed"], "generation_proof.sealed"),
+        "trusted": _us3_bool(proof["trusted"], "generation_proof.trusted"),
+        "exact_counts": _us3_bool(
+            proof["exact_counts"], "generation_proof.exact_counts"
+        ),
+    }
+    if "receipt" in proof:
+        result["receipt"] = _us3_receipt(
+            proof["receipt"], generation, run_id
+        )
+    if "counts" in proof:
+        result["counts"] = _us3_counts(
+            proof["counts"], "generation_proof.counts"
+        )
+    if "controlled_termination" in proof:
+        result["controlled_termination"] = _us3_controlled_termination(
+            proof["controlled_termination"]
+        )
+    return result
+
+
+def _us3_joint(value: Any, run_id: str) -> dict[str, Any]:
+    joint = _us3_exact_keys(
+        value,
+        (
+            "kind",
+            "first_generation",
+            "second_generation",
+            "first_mode",
+            "second_mode",
+            "first_exact_counts",
+            "second_exact_counts",
+            "second_receipt",
+            "held_point",
+            "held_binding",
+            "process_exit",
+            "observed_prefix",
+            "no_extra_payment_effect",
+            "no_new_payment_call_after_restart",
+            "original_intent_same",
+            "limitation",
+        ),
+        "joint",
+    )
+    return {
+        "kind": _us3_enum(
+            joint["kind"],
+            frozenset({"CONTROLLED_TRUNCATED_RESTART"}),
+            "joint.kind",
+        ),
+        "first_generation": _us3_int(
+            joint["first_generation"], "joint.first_generation", 1, US1_MAX_GENERATIONS
+        ),
+        "second_generation": _us3_int(
+            joint["second_generation"], "joint.second_generation", 1, US1_MAX_GENERATIONS
+        ),
+        "first_mode": _us3_enum(
+            joint["first_mode"], US3_PROOF_MODES, "joint.first_mode"
+        ),
+        "second_mode": _us3_enum(
+            joint["second_mode"], US3_PROOF_MODES, "joint.second_mode"
+        ),
+        "first_exact_counts": _us3_bool(
+            joint["first_exact_counts"], "joint.first_exact_counts"
+        ),
+        "second_exact_counts": _us3_bool(
+            joint["second_exact_counts"], "joint.second_exact_counts"
+        ),
+        "second_receipt": _us3_receipt(
+            joint["second_receipt"],
+            _us3_int(
+                joint["second_generation"],
+                "joint.second_generation",
+                1,
+                US1_MAX_GENERATIONS,
+            ),
+            run_id,
+        ),
+        "held_point": _us3_enum(
+            joint["held_point"],
+            frozenset({"REGISTERED", "MOCK_COMMITTED"}),
+            "joint.held_point",
+        ),
+        "held_binding": _us3_controlled_binding(joint["held_binding"]),
+        "process_exit": _us3_process_exit(joint["process_exit"]),
+        "observed_prefix": _us3_counts(
+            joint["observed_prefix"], "joint.observed_prefix"
+        ),
+        "no_extra_payment_effect": _us3_bool(
+            joint["no_extra_payment_effect"],
+            "joint.no_extra_payment_effect",
+        ),
+        "no_new_payment_call_after_restart": _us3_bool(
+            joint["no_new_payment_call_after_restart"],
+            "joint.no_new_payment_call_after_restart",
+        ),
+        "original_intent_same": _us3_bool(
+            joint["original_intent_same"], "joint.original_intent_same"
+        ),
+        "limitation": _us3_enum(
+            joint["limitation"],
+            frozenset({"CROSS_GENERATION_EXACT_COUNTS_NOT_PROVABLE"}),
+            "joint.limitation",
+        ),
+    }
+
+
+def _us3_protection(value: Any) -> dict[str, Any]:
+    protection = _us3_exact_keys(
+        value,
+        (
+            "kind",
+            "initial_result",
+            "confirmed_result",
+            "protected_result",
+            "first_applied",
+            "second_applied",
+            "post_confirmation_mock_calls",
+            "original_fact_preserved",
+        ),
+        "protection",
+    )
+    return {
+        "kind": _us3_enum(
+            protection["kind"], US3_PROTECTION_KINDS, "protection.kind"
+        ),
+        "initial_result": _us3_enum(
+            protection["initial_result"],
+            US3_HTTP_RESULTS | {""},
+            "protection.initial_result",
+        ),
+        "confirmed_result": _us3_enum(
+            protection["confirmed_result"],
+            US3_HTTP_RESULTS | {""},
+            "protection.confirmed_result",
+        ),
+        "protected_result": _us3_enum(
+            protection["protected_result"],
+            US3_HTTP_RESULTS | {""},
+            "protection.protected_result",
+        ),
+        "first_applied": _us3_enum(
+            protection["first_applied"], US3_DECISIONS, "protection.first_applied"
+        ),
+        "second_applied": _us3_enum(
+            protection["second_applied"], US3_DECISIONS, "protection.second_applied"
+        ),
+        "post_confirmation_mock_calls": _us3_int(
+            protection["post_confirmation_mock_calls"],
+            "protection.post_confirmation_mock_calls",
+        ),
+        "original_fact_preserved": _us3_bool(
+            protection["original_fact_preserved"],
+            "protection.original_fact_preserved",
+        ),
+    }
+
+
+def _us3_save(value: Any, allow_empty_record_id: bool = False) -> dict[str, Any]:
+    save = _us3_exact_keys(
+        value,
+        (
+            "attempts",
+            "record_id",
+            "commit_state",
+            "application_readback",
+            "external_pg_readback",
+            "readback_verified",
+            "readback_scope",
+            "readback_source",
+            "created_claimed",
+            "rollback_claimed",
+            "candidate_id_leaked",
+        ),
+        "save",
+    )
+    record_id = save["record_id"]
+    if record_id == "":
+        if not allow_empty_record_id:
+            raise CiError("unsafe-field-us3.save.record_id")
+        record_id = ""
+    else:
+        record_id = _us3_uuid(record_id, "save.record_id")
+    return {
+        "attempts": _us3_int(save["attempts"], "save.attempts", 1, 8),
+        "record_id": record_id,
+        "commit_state": _us3_enum(
+            save["commit_state"], US3_SAVE_COMMIT_STATES, "save.commit_state"
+        ),
+        "application_readback": _us3_token(
+            save["application_readback"], "save.application_readback", True
+        ),
+        "external_pg_readback": _us3_token(
+            save["external_pg_readback"], "save.external_pg_readback", True
+        ),
+        "readback_verified": _us3_bool(
+            save["readback_verified"], "save.readback_verified"
+        ),
+        "readback_scope": _us3_enum(
+            save["readback_scope"], US3_READBACK_SCOPES, "save.readback_scope"
+        ),
+        "readback_source": _us3_enum(
+            save["readback_source"], US3_READBACK_SOURCES, "save.readback_source"
+        ),
+        "created_claimed": _us3_bool(
+            save["created_claimed"], "save.created_claimed"
+        ),
+        "rollback_claimed": _us3_bool(
+            save["rollback_claimed"], "save.rollback_claimed"
+        ),
+        "candidate_id_leaked": _us3_bool(
+            save["candidate_id_leaked"], "save.candidate_id_leaked"
+        ),
+    }
+
+
+def _us3_trace(value: Any) -> dict[str, Any]:
+    trace = _us3_exact_keys(
+        value,
+        (
+            "outcome",
+            "issue",
+            "sqlstate",
+            "sqlstate_source",
+            "confirmed_fact_returned",
+            "new_lookup",
+            "proof_source",
+        ),
+        "trace",
+    )
+    issue = trace["issue"]
+    if issue != "" and issue not in US3_ISSUES:
+        raise CiError("unsafe-field-us3.trace.issue")
+    proof_source = trace["proof_source"]
+    if proof_source == US3_TRACE_PROOF_SOURCE_LITERAL:
+        proof_source = US3_TRACE_PROOF_SOURCE_CANONICAL
+    else:
+        proof_source = _us3_token(
+            proof_source, "trace.proof_source", True
+        )
+    return {
+        "outcome": _us3_enum(
+            trace["outcome"], US3_TRACE_OUTCOMES, "trace.outcome"
+        ),
+        "issue": issue,
+        "sqlstate": _us3_enum(
+            trace["sqlstate"], US3_SQLSTATES, "trace.sqlstate"
+        ),
+        "sqlstate_source": _us3_enum(
+            trace["sqlstate_source"],
+            US3_SQLSTATE_SOURCES,
+            "trace.sqlstate_source",
+        ),
+        "confirmed_fact_returned": _us3_bool(
+            trace["confirmed_fact_returned"], "trace.confirmed_fact_returned"
+        ),
+        "new_lookup": _us3_bool(trace["new_lookup"], "trace.new_lookup"),
+        "proof_source": proof_source,
+    }
+
+
+def _us3_budget(value: Any) -> dict[str, Any]:
+    budget = _us3_exact_keys(
+        value,
+        ("class", "kind", "source", "pass_budget", "limit_ms", "elapsed_ms"),
+        "budget",
+    )
+    result = {
+        "class": _us3_enum(
+            budget["class"], US3_BUDGET_CLASSES, "budget.class"
+        ),
+        "kind": _us3_enum(budget["kind"], US3_BUDGET_KINDS, "budget.kind"),
+        "source": _us3_enum(
+            budget["source"], US3_BUDGET_SOURCES, "budget.source"
+        ),
+        "pass_budget": _us3_bool(
+            budget["pass_budget"], "budget.pass_budget"
+        ),
+        "limit_ms": _us3_int(budget["limit_ms"], "budget.limit_ms", 1),
+        "elapsed_ms": _us3_int(budget["elapsed_ms"], "budget.elapsed_ms"),
+    }
+    if result["pass_budget"] and result["elapsed_ms"] > result["limit_ms"]:
+        raise CiError("unsafe-field-us3.budget.elapsed_ms")
+    if result["kind"] == "QUERY_SUBTIMEOUT":
+        if (
+            result["class"] != "CONTROLLED"
+            or result["source"] not in {"APP", "MOCK"}
+            or result["pass_budget"]
+            or result["limit_ms"] != 250
+        ):
+            raise CiError("unsafe-field-us3.budget")
+    elif result["kind"] == "MOCK_DB_SUBTIMEOUT":
+        if (
+            result["class"] != "CONTROLLED"
+            or result["source"] not in {"APP", "MOCK"}
+            or result["pass_budget"]
+            or result["limit_ms"] != 2000
+        ):
+            raise CiError("unsafe-field-us3.budget")
+    elif result["kind"] == "EXIT":
+        if (
+            result["class"] != "NORMAL"
+            or result["source"] != "APP"
+            or not result["pass_budget"]
+            or result["limit_ms"] != 20000
+        ):
+            raise CiError("unsafe-field-us3.budget")
+    elif result["kind"] == "PROCESS_GRACE":
+        if (
+            result["class"] != "NORMAL"
+            or result["source"] != "HARNESS"
+            or result["pass_budget"]
+            or result["limit_ms"] != 25000
+        ):
+            raise CiError("unsafe-field-us3.budget")
+    return result
+
+
+def _us3_budget_companion_problems(
+    scenario: Mapping[str, Any],
+) -> list[str]:
+    problems: list[str] = []
+    budgets = scenario["budgets"]
+    for budget in budgets:
+        if budget["kind"] == "QUERY_SUBTIMEOUT":
+            if budget["elapsed_ms"] < budget["limit_ms"]:
+                problems.append("us3-query-subtimeout-elapsed")
+            companions = [
+                item
+                for item in budgets
+                if item is not budget
+                and item["class"] == "NORMAL"
+                and item["kind"] == "MOCK"
+                and item["source"] == "MOCK"
+                and item["pass_budget"]
+                and item["limit_ms"] == 3000
+            ]
+            if not companions or not any(
+                item["elapsed_ms"] == budget["elapsed_ms"]
+                for item in companions
+            ):
+                problems.append("us3-query-subtimeout-companion")
+        elif budget["kind"] == "MOCK_DB_SUBTIMEOUT":
+            companions = [
+                item
+                for item in budgets
+                if item is not budget
+                and item["class"] == "NORMAL"
+                and item["pass_budget"]
+                and (
+                    (item["kind"] == "MOCK" and item["source"] == "MOCK" and item["limit_ms"] == 3000)
+                    or (item["kind"] == "MAIN" and item["limit_ms"] == 10000)
+                )
+            ]
+            if not companions or not any(
+                item["elapsed_ms"] >= budget["elapsed_ms"]
+                for item in companions
+            ):
+                problems.append("us3-mock-db-subtimeout-companion")
+    return problems
+
+
+def _us3_cancel(value: Any) -> dict[str, Any]:
+    cancel = _us3_exact_keys(
+        value,
+        (
+            "phase",
+            "post_cancel_payment_calls",
+            "post_cancel_query_calls",
+            "finish_checked_mock",
+            "rollback_claimed",
+        ),
+        "cancel",
+    )
+    return {
+        "phase": _us3_enum(
+            cancel["phase"],
+            frozenset({"BEFORE_MOCK", "AFTER_MOCK"}),
+            "cancel.phase",
+        ),
+        "post_cancel_payment_calls": _us3_int(
+            cancel["post_cancel_payment_calls"],
+            "cancel.post_cancel_payment_calls",
+        ),
+        "post_cancel_query_calls": _us3_int(
+            cancel["post_cancel_query_calls"],
+            "cancel.post_cancel_query_calls",
+        ),
+        "finish_checked_mock": _us3_bool(
+            cancel["finish_checked_mock"], "cancel.finish_checked_mock"
+        ),
+        "rollback_claimed": _us3_bool(
+            cancel["rollback_claimed"], "cancel.rollback_claimed"
+        ),
+    }
+
+
+def _us3_shutdown(value: Any) -> dict[str, Any]:
+    shutdown = _us3_exact_keys(
+        value,
+        (
+            "post_shutdown_payment_calls",
+            "post_shutdown_query_calls",
+            "rollback_claimed",
+            "no_unmanaged_goroutine",
+            "no_unmanaged_goroutine_source",
+            "pool_closed_after_users",
+            "pool_closed_after_users_source",
+            "exit_elapsed_ms",
+            "exit_upper_bound_ms",
+            "observation_tolerance_ms",
+            "host_grace_ms",
+            "host_grace_pass_budget",
+        ),
+        "shutdown",
+    )
+    source = shutdown["pool_closed_after_users_source"]
+    if source not in {"APP_UNIT_EVIDENCE", "OBSERVED", ""}:
+        raise CiError("unsafe-field-us3.shutdown.pool_closed_after_users_source")
+    unmanaged = _us3_bool(
+        shutdown["no_unmanaged_goroutine"],
+        "shutdown.no_unmanaged_goroutine",
+    )
+    unmanaged_source = shutdown["no_unmanaged_goroutine_source"]
+    if unmanaged_source not in {"", "APP_UNIT_PLUS_GROUP_GONE"}:
+        raise CiError(
+            "unsafe-field-us3.shutdown.no_unmanaged_goroutine_source"
+        )
+    if unmanaged and unmanaged_source != "APP_UNIT_PLUS_GROUP_GONE":
+        raise CiError(
+            "unsafe-field-us3.shutdown.no_unmanaged_goroutine_source"
+        )
+    return {
+        "post_shutdown_payment_calls": _us3_int(
+            shutdown["post_shutdown_payment_calls"],
+            "shutdown.post_shutdown_payment_calls",
+        ),
+        "post_shutdown_query_calls": _us3_int(
+            shutdown["post_shutdown_query_calls"],
+            "shutdown.post_shutdown_query_calls",
+        ),
+        "rollback_claimed": _us3_bool(
+            shutdown["rollback_claimed"], "shutdown.rollback_claimed"
+        ),
+        "no_unmanaged_goroutine": unmanaged,
+        "no_unmanaged_goroutine_source": unmanaged_source,
+        "pool_closed_after_users": _us3_bool(
+            shutdown["pool_closed_after_users"],
+            "shutdown.pool_closed_after_users",
+        ),
+        "pool_closed_after_users_source": source,
+        "exit_elapsed_ms": _us3_int(
+            shutdown["exit_elapsed_ms"], "shutdown.exit_elapsed_ms"
+        ),
+        "exit_upper_bound_ms": _us3_int(
+            shutdown["exit_upper_bound_ms"], "shutdown.exit_upper_bound_ms"
+        ),
+        "observation_tolerance_ms": _us3_int(
+            shutdown["observation_tolerance_ms"],
+            "shutdown.observation_tolerance_ms",
+        ),
+        "host_grace_ms": _us3_int(
+            shutdown["host_grace_ms"], "shutdown.host_grace_ms"
+        ),
+        "host_grace_pass_budget": _us3_bool(
+            shutdown["host_grace_pass_budget"],
+            "shutdown.host_grace_pass_budget",
+        ),
+    }
+
+
+def _us3_command(value: Any) -> dict[str, Any]:
+    command = _us3_exact_keys(value, ("kind", "exit", "not_run"), "command")
+    return {
+        "kind": _us3_enum(
+            command["kind"], US1_COMMAND_KINDS, "command.kind"
+        ),
+        "exit": _us3_int(command["exit"], "command.exit", -255, 255),
+        "not_run": _us3_bool(command["not_run"], "command.not_run"),
+    }
+
+
+def _us3_scenario(value: Any, run_id: str) -> dict[str, Any]:
+    base_keys = (
+        "name",
+        "result",
+        "generations",
+        "transport",
+        "http",
+        "pg",
+        "calls",
+        "records",
+        "queries",
+        "faults",
+        "facts",
+        "checks",
+        "generation_proofs",
+        "budgets",
+        "commands",
+    )
+    optional_keys = ("joint", "protection", "save", "trace", "cancel", "shutdown")
+    scenario = _us3_optional_exact_keys(
+        value, base_keys, optional_keys, "scenario"
+    )
+    name = scenario["name"]
+    if not isinstance(name, str) or name not in US3_SCENARIO_NAMES:
+        raise CiError("unsafe-field-us3.scenario.name")
+    result: dict[str, Any] = {
+        "name": name,
+        "result": _us3_enum(
+            scenario["result"], US3_RESULTS, "scenario.result"
+        ),
+        "generations": [],
+        "transport": _us3_enum(
+            scenario["transport"], US3_TRANSPORTS, "scenario.transport"
+        ),
+        "http": [],
+        "pg": [],
+        "calls": [],
+        "records": [],
+        "queries": [],
+        "faults": [],
+        "facts": _us3_facts(scenario["facts"]),
+        "checks": _us3_checks(scenario["checks"]),
+        "generation_proofs": [],
+        "budgets": [],
+        "commands": [],
+    }
+    generations_value = _require_list(
+        scenario["generations"], "us3.scenario.generations"
+    )
+    if not generations_value or len(generations_value) > 2:
+        raise CiError("unsafe-field-us3.scenario.generations")
+    for generation in generations_value:
+        result["generations"].append(
+            _us3_int(
+                generation, "scenario.generations", 1, US1_MAX_GENERATIONS
+            )
+        )
+    if result["generations"] != sorted(set(result["generations"])):
+        raise CiError("unsafe-field-us3.scenario.generations")
+
+    for key, limit, parser in (
+        ("http", US3_HTTP_MAX, _us3_http),
+        ("pg", US3_PG_MAX, _us3_pg),
+        ("calls", US3_CALLS_MAX, _us3_call),
+        ("records", US3_RECORDS_MAX, _us3_record),
+        ("queries", US3_QUERIES_MAX, _us3_query),
+        ("faults", US3_FAULTS_MAX, _us3_fault),
+        ("budgets", US3_BUDGETS_MAX, _us3_budget),
+        ("commands", US3_COMMANDS_MAX, _us3_command),
+    ):
+        items = _require_list(scenario[key], "us3.scenario." + key)
+        if len(items) > limit:
+            raise CiError("unsafe-field-us3.scenario." + key)
+        result[key] = [parser(item) for item in items]
+
+    proofs_value = _require_list(
+        scenario["generation_proofs"], "us3.scenario.generation_proofs"
+    )
+    if len(proofs_value) > US3_PROOFS_MAX:
+        raise CiError("unsafe-field-us3.scenario.generation_proofs")
+    result["generation_proofs"] = [
+        _us3_generation_proof(item, run_id) for item in proofs_value
+    ]
+
+    if "joint" in scenario:
+        result["joint"] = _us3_joint(scenario["joint"], run_id)
+    if "protection" in scenario:
+        result["protection"] = _us3_protection(scenario["protection"])
+    if "save" in scenario:
+        result["save"] = _us3_save(
+            scenario["save"],
+            allow_empty_record_id=name == "submit_commit_unknown",
+        )
+    if "trace" in scenario:
+        result["trace"] = _us3_trace(scenario["trace"])
+    if "cancel" in scenario:
+        result["cancel"] = _us3_cancel(scenario["cancel"])
+    if "shutdown" in scenario:
+        result["shutdown"] = _us3_shutdown(scenario["shutdown"])
+    return result
+
+
+def _us3_pg_map(scenario: Mapping[str, Any]) -> dict[str, int]:
+    return {entry["state"]: entry["rows"] for entry in scenario["pg"]}
+
+
+def _us3_has_issue(scenario: Mapping[str, Any], issue: str) -> bool:
+    return any(issue in entry["issues"] for entry in scenario["http"])
+
+
+def _us3_fault_kinds(scenario: Mapping[str, Any]) -> set[str]:
+    return {entry["kind"] for entry in scenario["faults"]}
+
+
+def _us3_has_decision(scenario: Mapping[str, Any], decision: str) -> bool:
+    return any(record["decision"] == decision for record in scenario["records"])
+
+
+def _us3_lifecycle_counts(counts: Mapping[str, int]) -> tuple[int, ...]:
+    return tuple(counts[key] for key in US3_COUNT_KEYS)
+
+
+def _us3_scenario_problems(
+    scenario: Mapping[str, Any], run_id: str
+) -> list[str]:
+    name = scenario["name"]
+    problems: list[str] = []
+    http = scenario["http"]
+    primary = [entry for entry in http if entry["kind"] == "PRIMARY"]
+    probes = [entry for entry in http if entry["kind"] == "SHUTDOWN_PROBE"]
+    transport = scenario["transport"]
+    generations = scenario["generations"]
+    is_exit = name == "lifecycle_exit_budget"
+    is_cancel = name in {
+        "lifecycle_cancel_before_mock",
+        "lifecycle_cancel_after_mock",
+    }
+
+    if transport == "RESPONSE":
+        if not primary:
+            problems.append("us3-primary-response-missing")
+    elif primary:
+        problems.append("us3-primary-response-forbidden")
+    if is_exit:
+        if len(probes) > 1:
+            problems.append("us3-shutdown-probe-count")
+        for entry in probes:
+            if entry["status"] != 503:
+                problems.append("us3-shutdown-probe-status")
+            if entry["generation"] not in generations:
+                problems.append("us3-shutdown-probe-generation")
+    else:
+        if probes:
+            problems.append("us3-shutdown-probe-forbidden")
+        if any(entry["kind"] != "PRIMARY" for entry in http):
+            problems.append("us3-http-kind-forbidden")
+    if is_cancel and http:
+        problems.append("us3-lifecycle-cancel-http")
+
+    calls_by_generation = {
+        entry["generation"]: entry for entry in scenario["calls"]
+    }
+    if set(calls_by_generation) != set(generations):
+        problems.append("us3-call-generation-mismatch")
+    proofs_by_generation = {
+        entry["generation"]: entry for entry in scenario["generation_proofs"]
+    }
+    if set(proofs_by_generation) != set(generations):
+        problems.append("us3-generation-proof-mismatch")
+    for generation in generations:
+        proof = proofs_by_generation.get(generation)
+        call = calls_by_generation.get(generation)
+        if proof is None or call is None:
+            continue
+        if proof["mode"] == "complete" and not call["exact"]:
+            problems.append("us3-complete-call-not-exact")
+        if proof["mode"] == "controlled_truncated" and call["exact"]:
+            problems.append("us3-controlled-call-exact")
+        receipt = proof.get("receipt")
+        if receipt is not None and receipt["last_seq"] == 0:
+            if call["payment_calls"] != 0 or call["query_calls"] != 0:
+                problems.append("us3-zero-receipt-calls")
+            if any(
+                query["generation"] == generation
+                for query in scenario["queries"]
+            ):
+                problems.append("us3-zero-receipt-queries")
+
+    checks = scenario["checks"]
+    facts = scenario["facts"]
+    if checks["stable_facts"] != facts["stable_facts"]:
+        problems.append("us3-stable-facts-mismatch")
+    if checks["counts_exact"] != all(
+        proof["exact_counts"] for proof in scenario["generation_proofs"]
+    ):
+        problems.append("us3-counts-exact-mismatch")
+    transition = facts["transition"]
+    before = facts.get("before")
+    after = facts.get("after")
+    if transition == "UNCHANGED":
+        if before is None or after is None or before != after:
+            problems.append("us3-unchanged-facts-mismatch")
+    elif transition == "NONE":
+        if (before is not None or after is not None) and not (
+            name == "lifecycle_cancel_after_mock"
+            and before is not None
+            and after is not None
+        ):
+            problems.append("us3-none-facts-mismatch")
+    elif transition == "CREATED_UNKNOWN":
+        if (
+            before is not None
+            or after is None
+            or after["result"] != "UNKNOWN"
+        ):
+            problems.append("us3-created-unknown-facts-mismatch")
+    elif transition == "UNKNOWN_TO_CONFIRMED":
+        if (
+            before is None
+            or after is None
+            or before["result"] != "UNKNOWN"
+            or after["result"] != "SUCCEEDED"
+        ):
+            problems.append("us3-confirmed-facts-mismatch")
+
+    query_required = name in US3_QUERY_REQUIRED_SCENARIOS
+    if query_required:
+        if not scenario["queries"]:
+            problems.append("us3-missing-query-applied")
+        elif not any(
+            query["applied"]
+            and query["apply_count"] == 1
+            and query.get("binding") is not None
+            and query["trusted"]
+            for query in scenario["queries"]
+        ):
+            problems.append("us3-missing-query-applied")
+    for query in scenario["queries"]:
+        binding = query.get("binding")
+        if binding is None:
+            continue
+        if binding["run_id"] != run_id:
+            problems.append("us3-query-binding-run-mismatch")
+        if binding["generation"] != query["generation"]:
+            problems.append("us3-query-binding-generation-mismatch")
+        if binding["call_seq"] != query["query_call_seq"]:
+            problems.append("us3-query-binding-call-seq-mismatch")
+    http_primary = {
+        (entry["generation"], entry["request_id"]): entry
+        for entry in scenario["http"]
+        if entry["kind"] == "PRIMARY" and entry["request_id"]
+    }
+    query_request_ids: set[str] = set()
+    for query in scenario["queries"]:
+        request_id = query["request_id"]
+        if request_id in query_request_ids:
+            problems.append("us3-query-request-id-duplicate")
+        query_request_ids.add(request_id)
+        observation = http_primary.get(
+            (query["generation"], request_id)
+        )
+        if observation is None:
+            problems.append("us3-query-request-http")
+        if query["trace_outcome"] == "SAVED":
+            records = [
+                record
+                for record in scenario["records"]
+                if record["source"] == "QUERY"
+                and record["request_id"] == request_id
+            ]
+            if not any(
+                record["decision"] == query["decision"]
+                and record["result_before"] == query["result_before"]
+                and record["result_after"] == query["result_after"]
+                for record in records
+            ):
+                problems.append("us3-query-record")
+        if query["decision"] == "NOT_RECORDED":
+            if (
+                observation is None
+                or observation["result"] not in {"SUCCEEDED", "FAILED"}
+                or not {
+                    "MOCK_RESULT_UNCONFIRMED",
+                    "TRACE_SAVE_ERROR",
+                }
+                <= set(observation["issues"])
+            ):
+                problems.append("us3-not-recorded-http-proof")
+            if any(
+                record["request_id"] == request_id
+                for record in scenario["records"]
+            ):
+                problems.append("us3-not-recorded-record-present")
+    not_recorded = [
+        query
+        for query in scenario["queries"]
+        if query["decision"] == "NOT_RECORDED"
+    ]
+    trace = scenario.get("trace")
+    if not_recorded:
+        if name != "query_confirmed_trace_failure":
+            problems.append("us3-not-recorded-outside-trace-failure")
+        elif (
+            len(not_recorded) != 1
+            or scenario["queries"][0]["decision"] != "NOT_RECORDED"
+        ):
+            problems.append("us3-not-recorded-shape")
+        else:
+            query = not_recorded[0]
+            if (
+                query["path"] != "BY_ID"
+                or query["directive"] != "failure"
+                or query["outcome"] != "unavailable"
+                or query["result_before"] != ""
+                or query["result_after"] != ""
+                or query["trace_outcome"] != "FAILED"
+                or not query["confirmed_returned"]
+            ):
+                problems.append("us3-not-recorded-shape")
+            if (
+                trace is None
+                or trace["outcome"] != "FAILED"
+                or trace["issue"] != "TRACE_SAVE_ERROR"
+                or trace["sqlstate"] == ""
+                or trace["sqlstate_source"] != "fixture_probe"
+            ):
+                problems.append("us3-not-recorded-trace-proof")
+            if not any(
+                fault["kind"] == "TRACE_INSERT_SQL"
+                and fault.get("target_id")
+                and fault["cleanup"]["verified"]
+                for fault in scenario["faults"]
+            ):
+                problems.append("us3-not-recorded-fault-proof")
+            if not (
+                _us3_has_issue(scenario, "TRACE_SAVE_ERROR")
+                and any(
+                    entry["result"] == "SUCCEEDED"
+                    for entry in scenario["http"]
+                )
+            ):
+                problems.append("us3-not-recorded-http-proof")
+            if (
+                len(scenario["records"]) != 1
+                or scenario["records"][0]["decision"]
+                != "ACCEPT_CONFIRMATION"
+            ):
+                problems.append("us3-not-recorded-record-proof")
+            if transition != "UNKNOWN_TO_CONFIRMED":
+                problems.append("us3-not-recorded-facts-proof")
+
+    pg_rows = _us3_pg_map(scenario)
+    if name == "query_not_found":
+        if scenario["queries"]:
+            problems.append("us3-query-not-found-queries")
+        if scenario["records"]:
+            problems.append("us3-query-not-found-records")
+        if scenario.get("trace") is not None or scenario.get("save") is not None:
+            problems.append("us3-query-not-found-trace-save")
+        if any(
+            call["payment_calls"] != 0 or call["query_calls"] != 0
+            for call in scenario["calls"]
+        ):
+            problems.append("us3-query-not-found-calls")
+        if any(pg_rows.get(state, 0) != 0 for state in US1_PG_STATES):
+            problems.append("us3-query-not-found-pg")
+        if transition != "NONE":
+            problems.append("us3-query-not-found-facts")
+        if any(
+            _us3_lifecycle_counts(counts) != (0, 0, 0, 0, 0)
+            for counts in (
+                scenario["checks"]["counts_before"],
+                scenario["checks"]["counts_after"],
+            )
+        ):
+            problems.append("us3-query-not-found-checks")
+        if not any(
+            entry["status"] == 404 and entry["result"] == ""
+            for entry in scenario["http"]
+        ):
+            problems.append("us3-query-not-found-http")
+    if name == "query_confirmed_plain":
+        if scenario["queries"]:
+            problems.append("us3-confirmed-plain-query")
+        if scenario.get("save") is not None:
+            problems.append("us3-confirmed-plain-save")
+        trace = scenario.get("trace")
+        if trace is not None and (
+            trace["outcome"] != "NOT_ATTEMPTED" or trace["issue"] != ""
+        ):
+            problems.append("us3-confirmed-plain-trace")
+        if any(
+            call["payment_calls"] != 0 or call["query_calls"] != 0
+            for call in scenario["calls"]
+        ):
+            problems.append("us3-confirmed-plain-calls")
+        if pg_rows.get("MOCK", 0) != 1 or pg_rows.get("TRACE", 0) != 0:
+            problems.append("us3-confirmed-plain-pg")
+
+    expected_difference = US3_MISMATCH_DIFFERENCES.get(name)
+    if expected_difference is not None:
+        expected_directive = {
+            "platform_reference_id": "mismatch_reference",
+            "amount": "mismatch_amount",
+            "currency": "mismatch_currency",
+            "mock_transaction_id": "mismatch_transaction",
+        }[expected_difference]
+        matching = [
+            query
+            for query in scenario["queries"]
+            if query["directive"] == expected_directive
+            and query["outcome"] == "mismatch_applied"
+            and query["decision"] == "REJECT_EVIDENCE"
+        ]
+        if not matching:
+            problems.append("us3-mismatch-query-proof")
+        if len(scenario["queries"]) != 1:
+            problems.append("us3-mismatch-single-request")
+        rejected = [
+            record
+            for record in scenario["records"]
+            if record["decision"] == "REJECT_EVIDENCE"
+            and expected_difference in record["evidence"]["differences"]
+        ]
+        if not rejected:
+            problems.append("us3-mismatch-record-proof")
+        elif matching and not any(
+            record["source"] == "QUERY"
+            and record["request_id"] == matching[0]["request_id"]
+            for record in rejected
+        ):
+            problems.append("us3-mismatch-record-request")
+        if any(
+            record["result_before"] != record["result_after"]
+            for record in rejected
+        ):
+            problems.append("us3-mismatch-result-changed")
+        if any(
+            record["reason_code"]
+            not in {"MOCK_EVIDENCE_MISMATCH", "MOCK_EVIDENCE_INVALID"}
+            for record in rejected
+        ):
+            problems.append("us3-mismatch-reason")
+        if not _us3_has_issue(scenario, "MOCK_EVIDENCE_REJECTED"):
+            problems.append("us3-mismatch-issue")
+        mismatch_fault = {
+            "query_mismatch_reference": "MISMATCH_REFERENCE",
+            "query_mismatch_amount": "MISMATCH_AMOUNT",
+            "query_mismatch_currency": "MISMATCH_CURRENCY",
+            "query_mismatch_transaction": "MISMATCH_TRANSACTION",
+        }[name]
+        if mismatch_fault not in _us3_fault_kinds(scenario):
+            problems.append("us3-mismatch-fault")
+
+    if name == "query_unknown_no_mock_match":
+        if pg_rows.get("MOCK", 0) != 0:
+            problems.append("us3-no-mock-match-has-mock")
+        if "MOCK_QUERY_NOT_VISIBLE" in _us3_fault_kinds(scenario):
+            problems.append("us3-no-mock-match-not-visible-fault")
+        if any(
+            query["directive"] != "normal"
+            or query["outcome"] != "not_found"
+            for query in scenario["queries"]
+        ):
+            problems.append("us3-no-mock-match-query")
+    if name == "query_unknown_not_visible":
+        if pg_rows.get("MOCK", 0) < 1:
+            problems.append("us3-not-visible-missing-mock")
+        if "MOCK_QUERY_NOT_VISIBLE" not in _us3_fault_kinds(scenario):
+            problems.append("us3-not-visible-missing-fault")
+        if not any(
+            query["directive"] == "notvisible"
+            for query in scenario["queries"]
+        ):
+            problems.append("us3-not-visible-directive")
+        if (
+            len(scenario["queries"]) != 2
+            or scenario["queries"][0]["decision"] != "KEEP_UNKNOWN"
+            or scenario["queries"][1]["decision"] != "ACCEPT_CONFIRMATION"
+            or scenario["queries"][1]["directive"] != "normal"
+        ):
+            problems.append("us3-not-visible-query-pair")
+        for query in scenario["queries"]:
+            if not any(
+                record["source"] == "QUERY"
+                and record["request_id"] == query["request_id"]
+                and record["decision"] == query["decision"]
+                for record in scenario["records"]
+            ):
+                problems.append("us3-not-visible-record-pair")
+    if name == "query_unknown_failure":
+        if "MOCK_QUERY_FAILURE" not in _us3_fault_kinds(scenario):
+            problems.append("us3-query-failure-missing-fault")
+    if name == "query_unknown_subtimeout":
+        if "MOCK_QUERY_SUBTIMEOUT_250MS" not in _us3_fault_kinds(scenario):
+            problems.append("us3-query-subtimeout-missing-fault")
+        if not any(
+            budget["kind"] == "QUERY_SUBTIMEOUT"
+            and budget["class"] == "CONTROLLED"
+            and budget["source"] in {"APP", "MOCK"}
+            and not budget["pass_budget"]
+            and budget["limit_ms"] == 250
+            for budget in scenario["budgets"]
+        ):
+            problems.append("us3-query-subtimeout-budget")
+
+    trace = scenario.get("trace")
+    trace_expected = {
+        "query_confirmed_trace_failure": "FAILED",
+    }.get(name)
+    if trace_expected is not None and (
+        trace is None or trace["outcome"] != trace_expected
+    ):
+        problems.append("us3-trace-outcome")
+    if name == "query_result_commit_unknown" and trace is not None:
+        if trace["outcome"] != "NOT_ATTEMPTED" or trace["issue"] != "":
+            problems.append("us3-trace-claim")
+    if trace is not None:
+        if trace["outcome"] == "SAVED":
+            if not scenario["queries"]:
+                problems.append("us3-trace-saved-without-query")
+            if "TRACE_INSERT_SQL" in _us3_fault_kinds(scenario):
+                problems.append("us3-trace-saved-with-fault")
+        if trace["outcome"] == "FAILED":
+            if "TRACE_INSERT_SQL" not in _us3_fault_kinds(scenario):
+                problems.append("us3-trace-failure-missing-fault")
+            if trace["issue"] != "TRACE_SAVE_ERROR":
+                problems.append("us3-trace-failure-issue")
+            if (
+                trace["sqlstate"] != "P0001"
+                or trace["sqlstate_source"] != "fixture_probe"
+            ):
+                problems.append("us3-trace-failure-sqlstate")
+        if (
+            trace["outcome"] in {"SAVED", "FAILED", "INDETERMINATE"}
+            and name
+            in {"submit_unknown_no_transaction", "submit_commit_unknown"}
+        ):
+            problems.append("us3-trace-without-query")
+    if name == "query_confirmed_trace_failure":
+        accept_records = [
+            record
+            for record in scenario["records"]
+            if record["decision"] == "ACCEPT_CONFIRMATION"
+        ]
+        if len(scenario["records"]) != 1 or len(accept_records) != 1:
+            problems.append("us3-trace-failure-missing-accept")
+        else:
+            record = accept_records[0]
+            if not any(
+                query["decision"] == "ACCEPT_CONFIRMATION"
+                and query["directive"] == "normal"
+                and query["trace_outcome"] == "SAVED"
+                and query["request_id"] == record["request_id"]
+                for query in scenario["queries"]
+            ):
+                problems.append("us3-trace-failure-accept-binding")
+        if trace is not None and not trace["confirmed_fact_returned"]:
+            problems.append("us3-trace-failure-missing-confirmed-return")
+
+    save = scenario.get("save")
+    if name in {"submit_commit_unknown", "query_result_commit_unknown"}:
+        if save is None:
+            problems.append("us3-save-proof-missing")
+        else:
+            if save["commit_state"] != "INDETERMINATE":
+                problems.append("us3-save-commit-state")
+            if save["attempts"] != 1:
+                problems.append("us3-save-attempts")
+            if (
+                save["created_claimed"]
+                or save["rollback_claimed"]
+                or save["candidate_id_leaked"]
+            ):
+                problems.append("us3-save-overclaim")
+            if not save["readback_verified"]:
+                problems.append("us3-save-readback")
+            if name == "query_result_commit_unknown":
+                if save["readback_scope"] not in {
+                    "APPLICATION_ORDER_ONLY",
+                    "INDEPENDENT_ORDER_AND_RECORD",
+                }:
+                    problems.append("us3-save-readback-scope")
+                expected_source = {
+                    "APPLICATION_ORDER_ONLY": "APP",
+                    "INDEPENDENT_ORDER_AND_RECORD": "APP_AND_EXTERNAL",
+                }.get(save["readback_scope"])
+                if save["readback_source"] != expected_source:
+                    problems.append("us3-save-readback-source")
+                if not _us3_has_decision(scenario, "ACCEPT_CONFIRMATION"):
+                    problems.append("us3-save-missing-accept")
+                if save["record_id"] not in {
+                    record["record_id"] for record in scenario["records"]
+                }:
+                    problems.append("us3-save-record-binding")
+                if "RESULT_COMMIT_REPLY_HIDDEN" not in _us3_fault_kinds(
+                    scenario
+                ):
+                    problems.append("us3-save-missing-hidden-fault")
+                if not _us3_has_issue(scenario, "RESULT_SAVE_ERROR"):
+                    problems.append("us3-save-missing-issue")
+            else:
+                if save["record_id"] != "":
+                    problems.append("us3-submit-save-record-id")
+                if scenario["records"]:
+                    problems.append("us3-submit-save-records")
+                if scenario.get("trace") is not None:
+                    problems.append("us3-submit-save-trace")
+                if (
+                    save["readback_scope"] != "APPLICATION_ORDER_ONLY"
+                    or save["readback_source"] != "APP"
+                ):
+                    problems.append("us3-submit-save-readback")
+                if pg_rows.get("MOCK", 0) != 0 or pg_rows.get("TRACE", 0) != 0:
+                    problems.append("us3-submit-save-pg")
+                if "REGISTRATION_COMMIT_REPLY_LOST" not in _us3_fault_kinds(
+                    scenario
+                ):
+                    problems.append("us3-save-missing-lost-fault")
+                if not any(
+                    fault["kind"] == "REGISTRATION_COMMIT_REPLY_LOST"
+                    and fault["cleanup"]["kind"] == "UDS_SCENARIO"
+                    and fault["sqlstate_source"] == "none"
+                    for fault in scenario["faults"]
+                ):
+                    problems.append("us3-submit-save-fault")
+                if not _us3_has_issue(scenario, "RESULT_SAVE_ERROR"):
+                    problems.append("us3-submit-save-issue")
+
+    if name in {
+        "protection_inflight_failure",
+        "protection_inflight_mismatch",
+    }:
+        protection = scenario.get("protection")
+        if protection is None:
+            problems.append("us3-protection-missing")
+        else:
+            expected_kind = (
+                "INFLIGHT_FAILURE"
+                if name == "protection_inflight_failure"
+                else "INFLIGHT_MISMATCH"
+            )
+            if protection["kind"] != expected_kind:
+                problems.append("us3-protection-kind")
+            if protection["protected_result"] != "SUCCEEDED":
+                problems.append("us3-protection-result")
+            if not protection["original_fact_preserved"]:
+                problems.append("us3-protection-original")
+            if protection["post_confirmation_mock_calls"] != 0:
+                problems.append("us3-protection-post-mock-calls")
+            expected_first = (
+                "KEEP_CONFIRMED"
+                if name == "protection_inflight_failure"
+                else "REJECT_EVIDENCE"
+            )
+            if protection["first_applied"] != expected_first:
+                problems.append("us3-protection-first-applied")
+            if protection["second_applied"] != "ACCEPT_CONFIRMATION":
+                problems.append("us3-protection-second-applied")
+            if not _us3_has_decision(scenario, expected_first):
+                problems.append("us3-protection-record")
+            if not _us3_has_decision(scenario, "ACCEPT_CONFIRMATION"):
+                problems.append("us3-protection-record")
+            if (
+                name == "protection_inflight_mismatch"
+                and "MISMATCH_TRANSACTION"
+                not in _us3_fault_kinds(scenario)
+                and not (
+                    {
+                        "MISMATCH_REFERENCE",
+                        "MISMATCH_AMOUNT",
+                        "MISMATCH_CURRENCY",
+                    }
+                    & _us3_fault_kinds(scenario)
+                )
+            ):
+                problems.append("us3-protection-mismatch-fault")
+
+    if name not in US3_CONTROLLED_TRUNCATED_SCENARIOS and any(
+        proof["mode"] == "controlled_truncated"
+        for proof in scenario["generation_proofs"]
+    ):
+        problems.append("us3-controlled-proof-outside-window")
+    if name in US3_CONTROLLED_TRUNCATED_SCENARIOS:
+        controlled_proofs = [
+            proof
+            for proof in scenario["generation_proofs"]
+            if proof["mode"] == "controlled_truncated"
+        ]
+        if len(controlled_proofs) != 1:
+            problems.append("us3-controlled-proof")
+        else:
+            proof = controlled_proofs[0]
+            controlled = proof.get("controlled_termination")
+            if (
+                proof["generation"] != 1
+                or proof["sealed"]
+                or proof["trusted"]
+                or proof.get("receipt") is not None
+                or proof["exact_counts"]
+                or controlled is None
+            ):
+                problems.append("us3-controlled-proof")
+            else:
+                expected_point = (
+                    "REGISTERED"
+                    if name == "restart_registered_unpaid"
+                    else "MOCK_COMMITTED"
+                )
+                if (
+                    controlled["binding"]["run_id"] != run_id
+                    or controlled["binding"]["generation"] != 1
+                    or controlled["binding"]["point"] != expected_point
+                ):
+                    problems.append("us3-controlled-binding")
+                if not (
+                    controlled["controlled_truncated"]
+                    and controlled["no_receipt"]
+                    and not controlled["exact_counts"]
+                ):
+                    problems.append("us3-controlled-flags")
+                if not (
+                    controlled["exit"]["reaped"]
+                    and controlled["exit"]["group_gone"]
+                    and controlled["exit"]["output_complete"]
+                ):
+                    problems.append("us3-controlled-exit")
+        if "PROCESS_TERMINATED" not in _us3_fault_kinds(scenario):
+            problems.append("us3-controlled-missing-termination-fault")
+        if name == "restart_registered_unpaid" and pg_rows.get("MOCK", 0) != 0:
+            problems.append("us3-registered-unpaid-mock")
+        if (
+            name == "restart_mock_committed_reply_lost"
+            and pg_rows.get("MOCK", 0) < 1
+        ):
+            problems.append("us3-mock-committed-missing-mock")
+        joint = scenario.get("joint")
+        if joint is None:
+            problems.append("us3-joint-missing")
+        elif controlled_proofs:
+            controlled = controlled_proofs[0]["controlled_termination"]
+            second = next(
+                (
+                    proof
+                    for proof in scenario["generation_proofs"]
+                    if proof["generation"] == 2
+                ),
+                None,
+            )
+            if second is None or second["mode"] != "complete":
+                problems.append("us3-joint-second-proof")
+            if (
+                joint["first_generation"] != 1
+                or joint["second_generation"] != 2
+                or joint["first_mode"] != "controlled_truncated"
+                or joint["second_mode"] != "complete"
+                or joint["first_exact_counts"]
+                or not joint["second_exact_counts"]
+                or joint["held_point"] != controlled["binding"]["point"]
+                or joint["held_binding"] != controlled["binding"]
+                or joint["process_exit"] != controlled["exit"]
+                or joint["observed_prefix"] != controlled["observed_prefix"]
+                or second is None
+                or joint["second_receipt"] != second.get("receipt")
+                or not joint["no_extra_payment_effect"]
+                or not joint["no_new_payment_call_after_restart"]
+                or not joint["original_intent_same"]
+                or joint["limitation"]
+                != "CROSS_GENERATION_EXACT_COUNTS_NOT_PROVABLE"
+            ):
+                problems.append("us3-joint-proof")
+        if name in {
+            "restart_registered_unpaid",
+            "restart_mock_committed_reply_lost",
+        }:
+            call2 = calls_by_generation.get(2)
+            if (
+                call2 is None
+                or not call2["exact"]
+                or call2["payment_calls"] != 0
+                or call2["query_calls"] != 1
+            ):
+                problems.append("us3-restart-gen2-calls")
+            if len(scenario["queries"]) != 1 or scenario["queries"][0]["generation"] != 2:
+                problems.append("us3-restart-query-proof")
+            else:
+                query = scenario["queries"][0]
+                gen2_primary = [
+                    entry
+                    for entry in http
+                    if entry["kind"] == "PRIMARY"
+                    and entry["generation"] == 2
+                    and entry["request_id"]
+                ]
+                if len(gen2_primary) != 2 or len(
+                    {entry["request_id"] for entry in gen2_primary}
+                ) != 2:
+                    problems.append("us3-restart-http-pair")
+                get_observation = next(
+                    (
+                        entry
+                        for entry in gen2_primary
+                        if entry["request_id"] == query["request_id"]
+                    ),
+                    None,
+                )
+                expected_result = (
+                    "UNKNOWN"
+                    if name == "restart_registered_unpaid"
+                    else "SUCCEEDED"
+                )
+                expected_issues = (
+                    {"MOCK_RESULT_NOT_FOUND"}
+                    if name == "restart_registered_unpaid"
+                    else set()
+                )
+                if (
+                    get_observation is None
+                    or get_observation["result"] != expected_result
+                    or set(get_observation["issues"]) != expected_issues
+                ):
+                    problems.append("us3-restart-get-http")
+                records = [
+                    record
+                    for record in scenario["records"]
+                    if record["source"] == "QUERY"
+                    and record["request_id"] == query["request_id"]
+                ]
+                if len(records) != 1:
+                    problems.append("us3-restart-query-record")
+                else:
+                    record = records[0]
+                    if name == "restart_registered_unpaid":
+                        if (
+                            record["decision"] != "KEEP_UNKNOWN"
+                            or record["result_before"] != "UNKNOWN"
+                            or record["result_after"] != "UNKNOWN"
+                            or record["reason_code"] != "MOCK_RESULT_NOT_FOUND"
+                        ):
+                            problems.append("us3-restart-registered-record")
+                    else:
+                        if (
+                            record["decision"] != "ACCEPT_CONFIRMATION"
+                            or record["result_before"] != "UNKNOWN"
+                            or record["result_after"] != "SUCCEEDED"
+                            or record["reason_code"] != ""
+                            or any(
+                                key not in record["evidence"]
+                                for key in (
+                                    "platform_reference_id",
+                                    "mock_transaction_id",
+                                    "amount",
+                                    "currency",
+                                    "result",
+                                )
+                            )
+                        ):
+                            problems.append("us3-restart-mock-record")
+            second = proofs_by_generation.get(2)
+            if (
+                second is None
+                or second["mode"] != "complete"
+                or not second["sealed"]
+                or not second["trusted"]
+                or not second["exact_counts"]
+                or second.get("receipt") is None
+                or second["receipt"]["last_seq"] == 0
+                or second.get("counts") is None
+                or second["counts"]["payment_calls"] != 0
+                or second["counts"]["query_calls"] != 1
+            ):
+                problems.append("us3-restart-gen2-seal")
+    elif scenario.get("joint") is not None:
+        problems.append("us3-joint-outside-controlled")
+
+    if name == "restart_unknown_no_confirm":
+        if not _us3_has_decision(scenario, "KEEP_UNKNOWN"):
+            problems.append("us3-restart-no-confirm-record")
+        if _us3_has_decision(scenario, "ACCEPT_CONFIRMATION"):
+            problems.append("us3-restart-no-confirm-accepted")
+    if name == "restart_unknown_then_confirmed":
+        if not _us3_has_decision(scenario, "ACCEPT_CONFIRMATION"):
+            problems.append("us3-restart-confirmed-record")
+
+    if is_cancel:
+        cancel = scenario.get("cancel")
+        if cancel is None:
+            problems.append("us3-lifecycle-cancel-missing")
+        else:
+            expected_phase = (
+                "BEFORE_MOCK"
+                if name == "lifecycle_cancel_before_mock"
+                else "AFTER_MOCK"
+            )
+            if cancel["phase"] != expected_phase:
+                problems.append("us3-lifecycle-cancel-phase")
+            if (
+                cancel["post_cancel_payment_calls"] != 0
+                or cancel["post_cancel_query_calls"] != 0
+            ):
+                problems.append("us3-lifecycle-post-cancel-calls")
+            if cancel["finish_checked_mock"]:
+                problems.append("us3-lifecycle-finish-check")
+            if cancel["rollback_claimed"]:
+                problems.append("us3-lifecycle-rollback-claim")
+        expected_cancel_fault = (
+            "REGISTRATION_INSERT_HOLD"
+            if name == "lifecycle_cancel_before_mock"
+            else "RESULT_HANDLING_INSERT_HOLD"
+        )
+        if expected_cancel_fault not in _us3_fault_kinds(scenario):
+            problems.append("us3-lifecycle-cancel-fault")
+        if not any(
+            fault["cleanup"]["kind"] == "TABLE_SHARE_LOCK"
+            for fault in scenario["faults"]
+        ):
+            problems.append("us3-lifecycle-cancel-cleanup")
+        before_counts = scenario["checks"]["counts_before"]
+        if _us3_lifecycle_counts(before_counts) != (0, 0, 0, 0, 0):
+            problems.append("us3-lifecycle-before-counts")
+        after_counts = scenario["checks"]["counts_after"]
+        after_call = next(
+            (
+                call
+                for call in scenario["calls"]
+                if call["generation"] == max(scenario["generations"])
+            ),
+            None,
+        )
+        if name == "lifecycle_cancel_before_mock":
+            if _us3_lifecycle_counts(after_counts) != (0, 0, 0, 0, 0):
+                problems.append("us3-lifecycle-before-after-counts")
+        else:
+            allowed_after = (
+                {"payment_calls": 1, "query_calls": 0, "order_rows": 1, "mock_rows": 1, "trace_rows": 0},
+                {"payment_calls": 1, "query_calls": 0, "order_rows": 1, "mock_rows": 1, "trace_rows": 1},
+            )
+            if after_counts not in allowed_after:
+                problems.append("us3-lifecycle-after-counts")
+            if pg_rows.get("ORDER", 0) != 1 or pg_rows.get("MOCK", 0) != 1:
+                problems.append("us3-lifecycle-after-pg")
+            if after_counts["trace_rows"] == 1:
+                if not any(
+                    record["source"] == "PAYMENT"
+                    and record["decision"] == "ACCEPT_CONFIRMATION"
+                    and record["result_before"] == "UNKNOWN"
+                    and record["result_after"] == "SUCCEEDED"
+                    for record in scenario["records"]
+                ):
+                    problems.append("us3-lifecycle-accept-record")
+        if after_call is not None:
+            expected_calls = (
+                0
+                if name == "lifecycle_cancel_before_mock"
+                else 1
+            )
+            if (
+                after_call["payment_calls"] != expected_calls
+                or after_call["query_calls"] != 0
+            ):
+                problems.append("us3-lifecycle-call-counts")
+
+    if is_exit:
+        budgets = scenario["budgets"]
+        if len(budgets) != 2:
+            problems.append("us3-lifecycle-exit-budgets")
+        else:
+            exit_budget = next(
+                (item for item in budgets if item["kind"] == "EXIT"), None
+            )
+            grace_budget = next(
+                (
+                    item
+                    for item in budgets
+                    if item["kind"] == "PROCESS_GRACE"
+                ),
+                None,
+            )
+            if (
+                exit_budget is None
+                or grace_budget is None
+                or exit_budget["class"] != "NORMAL"
+                or exit_budget["source"] != "APP"
+                or not exit_budget["pass_budget"]
+                or exit_budget["limit_ms"] != 20000
+                or grace_budget["class"] != "NORMAL"
+                or grace_budget["source"] != "HARNESS"
+                or grace_budget["pass_budget"]
+                or grace_budget["limit_ms"] != 25000
+            ):
+                problems.append("us3-lifecycle-exit-budgets")
+        shutdown = scenario.get("shutdown")
+        if shutdown is None:
+            problems.append("us3-lifecycle-shutdown-missing")
+        else:
+            if (
+                shutdown["exit_upper_bound_ms"] != 20000
+                or shutdown["observation_tolerance_ms"] != 250
+                or shutdown["exit_elapsed_ms"] > 20250
+                or shutdown["host_grace_ms"] != 25000
+                or shutdown["host_grace_pass_budget"]
+            ):
+                problems.append("us3-lifecycle-shutdown-budget")
+            if (
+                shutdown["post_shutdown_payment_calls"] != 0
+                or shutdown["post_shutdown_query_calls"] != 0
+                or shutdown["rollback_claimed"]
+            ):
+                problems.append("us3-lifecycle-shutdown-effect")
+            if not (
+                shutdown["no_unmanaged_goroutine"]
+                and shutdown["pool_closed_after_users"]
+                and shutdown["pool_closed_after_users_source"]
+                == "APP_UNIT_EVIDENCE"
+            ):
+                problems.append("us3-lifecycle-shutdown-pool")
+            if shutdown["no_unmanaged_goroutine"]:
+                if not any(
+                    proof["mode"] == "complete"
+                    and proof["sealed"]
+                    and proof["trusted"]
+                    for proof in scenario["generation_proofs"]
+                ):
+                    problems.append("us3-lifecycle-goroutine-proof")
+                if not any(
+                    command["kind"] == "process_stop"
+                    and command["exit"] == 0
+                    and not command["not_run"]
+                    for command in scenario["commands"]
+                ):
+                    problems.append("us3-lifecycle-goroutine-proof")
+        if _us3_lifecycle_counts(scenario["checks"]["counts_after"]) != (
+            0,
+            0,
+            0,
+            0,
+            0,
+        ):
+            problems.append("us3-lifecycle-exit-counts")
+        after_call = next(
+            (
+                call
+                for call in scenario["calls"]
+                if call["generation"] == max(scenario["generations"])
+            ),
+            None,
+        )
+        if after_call is not None and (
+            after_call["payment_calls"] != 0
+            or after_call["query_calls"] != 0
+        ):
+            problems.append("us3-lifecycle-exit-call-counts")
+        if not any(
+            fault["cleanup"]["kind"] == "TABLE_SHARE_LOCK"
+            for fault in scenario["faults"]
+        ):
+            problems.append("us3-lifecycle-exit-cleanup")
+
+    for record in scenario["records"]:
+        decision = record["decision"]
+        if decision == "ACCEPT_CONFIRMATION":
+            if record["reason_code"] != "":
+                problems.append("us3-accept-reason")
+            if (
+                record["result_before"] != "UNKNOWN"
+                or record["result_after"] != "SUCCEEDED"
+            ):
+                problems.append("us3-accept-transition")
+            evidence = record["evidence"]
+            for key in (
+                "platform_reference_id",
+                "mock_transaction_id",
+                "amount",
+                "currency",
+                "result",
+            ):
+                if key not in evidence:
+                    problems.append("us3-accept-evidence")
+                    break
+        elif decision == "KEEP_UNKNOWN":
+            if not record["reason_code"]:
+                problems.append("us3-keep-unknown-reason")
+            if record["result_before"] != record["result_after"]:
+                problems.append("us3-keep-unknown-result")
+        elif decision == "KEEP_CONFIRMED":
+            if not record["reason_code"]:
+                problems.append("us3-keep-confirmed-reason")
+            if record["result_before"] != record["result_after"]:
+                problems.append("us3-keep-confirmed-result")
+        elif decision == "REJECT_EVIDENCE":
+            if record["reason_code"] not in {
+                "MOCK_EVIDENCE_MISMATCH",
+                "MOCK_EVIDENCE_INVALID",
+            }:
+                problems.append("us3-reject-reason")
+            if record["result_before"] != record["result_after"]:
+                problems.append("us3-reject-result")
+            if not record["evidence"]["differences"]:
+                problems.append("us3-reject-differences")
+
+    if scenario["result"] == "PASS":
+        for command in scenario["commands"]:
+            if command["not_run"] or command["exit"] != 0:
+                problems.append("us3-command-not-run")
+                break
+    problems.extend(_us3_budget_companion_problems(scenario))
+    return sorted(set(problems))
+
+
+def _safe_us3_report(
+    source: dict[str, Any], db_safe: Mapping[str, Any]
+) -> dict[str, Any]:
+    if source.get("schema") != US3_SCHEMA:
+        raise CiError("unsupported-report-schema")
+    _us3_exact_keys(source, ("schema", "run_id", "scenarios"), "top")
+    run_id = _us3_hex32(source.get("run_id"), "run_id")
+    if run_id != db_safe.get("run_id"):
+        raise CiError("us3-run-id-mismatch")
+    scenarios_value = _require_list(source.get("scenarios"), "us3.scenarios")
+    if len(scenarios_value) > US3_SCENARIO_MAX:
+        raise CiError("unsafe-field-us3.scenarios")
+    scenarios: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in scenarios_value:
+        scenario = _us3_scenario(value, run_id)
+        if scenario["name"] in seen:
+            raise CiError("us3-scenario-duplicate")
+        seen.add(scenario["name"])
+        scenarios.append(scenario)
+
+    missing = [name for name in US3_SCENARIO_NAMES if name not in seen]
+    problems: list[str] = []
+    if missing:
+        problems.append("us3-missing-scenario")
+    if [item["name"] for item in scenarios] != list(US3_SCENARIO_NAMES):
+        if not missing:
+            problems.append("us3-scenario-order")
+    for scenario in scenarios:
+        if scenario["result"] != "PASS":
+            problems.append("us3-scenario-not-pass")
+        problems.extend(_us3_scenario_problems(scenario, run_id))
+
+    db_source = db_safe.get("source", {})
+    required = db_safe.get("required_test_results", {})
+    packages = db_safe.get("package_results", {})
+    db_green = (
+        db_safe.get("result") == "pass"
+        and db_safe.get("vet_exit") == 0
+        and db_safe.get("test_exit") == 0
+        and db_source.get("manifest_verification")
+        == MANIFEST_VERIFICATION_UNCHANGED
+        and all(required.get(name) == "pass" for name in DB_REQUIRED_TEST_KEYS)
+        and packages.get("tests", {}).get("status") == "pass"
+    )
+    if not db_green:
+        problems.append("us3-db-not-green")
+    result = "pass" if not problems else "fail"
+    return {
+        "schema": "payment-hub.ci-safe.us3.v1",
+        "status": "exported",
+        "source_schema": US3_SCHEMA,
+        "generated_at": utc_now(),
+        "run_id": run_id,
+        "result": result,
+        "scenarios": scenarios,
+        "missing_scenarios": missing,
+        "problems": sorted(set(problems)),
+        "source": {
+            "manifest_digest": db_source.get("manifest_digest"),
+            "manifest_verification": db_source.get("manifest_verification"),
+            "file_count": db_source.get("file_count", 0),
+        },
+    }
+
+
 def _safe_vulnerability_report(source: dict[str, Any]) -> dict[str, Any]:
     if source.get("schema") != VULNERABILITY_SCHEMA:
         raise CiError("unsupported-report-schema")
@@ -3602,6 +6194,35 @@ def _export_one(
             source_path, expected_parent=db_source_path.parent
         )
         safe = _safe_us2_report(source, db_safe)
+        return safe, {
+            "source": db_source_path.parent.name
+            + "/"
+            + REPORT_FILENAMES[name],
+            "source_sha256": source_hash,
+            "source_manifest_digest": db_safe["source"]["manifest_digest"],
+            "source_manifest_verification": db_safe["source"][
+                "manifest_verification"
+            ],
+        }
+    if name == "us3":
+        db_source_path = _find_db_report(db_root)
+        if db_source_path is None:
+            return _missing_report(name), None
+        db_source, _ = _read_source_json(
+            db_source_path, expected_parent=db_source_path.parent
+        )
+        if db_source.get("run_id") != db_source_path.parent.name:
+            raise CiError("unsafe-field-run_id")
+        db_safe = _safe_db_report(db_source)
+        source_path = db_source_path.parent / REPORT_FILENAMES[name]
+        if not source_path.exists():
+            return _missing_report(name), None
+        source, source_hash = _read_source_json(
+            source_path,
+            expected_parent=db_source_path.parent,
+            max_bytes=US3_REPORT_MAX_BYTES,
+        )
+        safe = _safe_us3_report(source, db_safe)
         return safe, {
             "source": db_source_path.parent.name
             + "/"
