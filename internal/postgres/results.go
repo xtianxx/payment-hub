@@ -131,6 +131,15 @@ func (s *Store) SaveObservation(ctx context.Context, observation payment.Observa
 		return payment.SaveObservationResult{Order: order, Record: existingRecord}, nil
 	}
 
+	// Fix the original committed confirmation, if any, before this attempt
+	// performs any write. Only this deep-copied snapshot may accompany the two
+	// trace-save markers; an UNKNOWN order or a confirmation accepted by this
+	// attempt is never marker-eligible.
+	originalConfirmation, err := snapshotOriginalConfirmation(order, observation)
+	if err != nil {
+		return payment.SaveObservationResult{}, err
+	}
+
 	confirmedAt := time.Now().UTC().Truncate(time.Microsecond)
 	updated, record, err := payment.DecideObservation(order, observation, confirmedAt)
 	if err != nil {
@@ -142,29 +151,71 @@ func (s *Store) SaveObservation(ctx context.Context, observation payment.Observa
 	}
 
 	if record.Decision == payment.DecisionAcceptConfirmation {
+		if originalConfirmation != nil {
+			// A locked original confirmation is never rewritten by this path.
+			return payment.SaveObservationResult{}, payment.ErrUnavailable
+		}
 		if err := updateOrderConfirmation(opCtx, tx, order, updated); err != nil {
 			return payment.SaveObservationResult{}, err
 		}
 	}
 
 	if err := insertResultHandlingRecord(opCtx, tx, record); err != nil {
+		rollbackErr := tx.Rollback(opCtx)
+		rollbackConfirmed := rollbackErr == nil
 		if isRecordPrimaryKeyConflict(err) {
-			if rbErr := tx.Rollback(opCtx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
-				return payment.SaveObservationResult{}, payment.ErrIndeterminate
+			if !rollbackConfirmed && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+				return traceSaveResult(originalConfirmation, payment.ErrTraceSaveIndeterminate)
 			}
-			return s.readBackDuplicateObservation(opCtx, observation)
+			result, readErr := s.readBackDuplicateObservation(opCtx, observation)
+			if readErr == nil {
+				return result, nil
+			}
+			if errors.Is(readErr, payment.ErrObservationConflict) {
+				return payment.SaveObservationResult{}, readErr
+			}
+			if originalConfirmation != nil {
+				return traceSaveResult(originalConfirmation, payment.ErrTraceSaveIndeterminate)
+			}
+			return payment.SaveObservationResult{}, readErr
+		}
+		if originalConfirmation != nil {
+			if rollbackConfirmed {
+				return traceSaveResult(originalConfirmation, payment.ErrTraceSaveFailed)
+			}
+			return traceSaveResult(originalConfirmation, payment.ErrTraceSaveIndeterminate)
+		}
+		if !rollbackConfirmed {
+			return payment.SaveObservationResult{}, payment.ErrIndeterminate
 		}
 		return payment.SaveObservationResult{}, classifySaveError(err)
 	}
 
 	if err := tx.Commit(opCtx); err != nil {
 		if errors.Is(err, pgx.ErrTxCommitRollback) {
+			if originalConfirmation != nil {
+				return traceSaveResult(originalConfirmation, payment.ErrTraceSaveFailed)
+			}
 			return payment.SaveObservationResult{}, payment.ErrUnavailable
 		}
 		// The commit outcome is unknown. End the transaction attempt and use
 		// the remaining deadline to verify the same record ID and scoped order.
 		_ = tx.Rollback(opCtx)
-		return s.readBackCommittedObservation(opCtx, observation)
+		result, readErr := s.readBackCommittedObservation(opCtx, observation)
+		if readErr == nil {
+			return result, nil
+		}
+		if errors.Is(readErr, payment.ErrObservationConflict) {
+			// A definite same-ID record with a different meaning is not a
+			// trace-save marker, even when the commit outcome was unknown.
+			return payment.SaveObservationResult{}, readErr
+		}
+		if originalConfirmation != nil {
+			// The original confirmation remains reliable even when the extra
+			// trace read-back cannot confirm this attempt's record.
+			return traceSaveResult(originalConfirmation, payment.ErrTraceSaveIndeterminate)
+		}
+		return payment.SaveObservationResult{}, readErr
 	}
 
 	if err := s.hooks.ResultCommitted(opCtx, order.ID); err != nil {
@@ -207,8 +258,11 @@ func (s *Store) readBackCommittedObservation(ctx context.Context, observation pa
 		return payment.SaveObservationResult{}, payment.ErrIndeterminate
 	}
 	match, matchErr := observationMatchesRecord(observation, record, order)
-	if matchErr != nil || !match {
+	if matchErr != nil {
 		return payment.SaveObservationResult{}, payment.ErrIndeterminate
+	}
+	if !match {
+		return payment.SaveObservationResult{}, payment.ErrObservationConflict
 	}
 	return payment.SaveObservationResult{Order: order, Record: record}, nil
 }
@@ -230,6 +284,54 @@ func (s *Store) readBackDuplicateObservation(ctx context.Context, observation pa
 		return payment.SaveObservationResult{}, payment.ErrObservationConflict
 	}
 	return payment.SaveObservationResult{Order: order, Record: record}, nil
+}
+
+// snapshotOriginalConfirmation fixes a deep copy of a locked order that was
+// already SUCCEEDED or FAILED before this save attempt wrote anything. The two
+// trace-save markers may carry only this snapshot. The scoped identity,
+// immutable order facts, confirmation time, and any available Mock association
+// are validated here; a failed validation never becomes a marker.
+func snapshotOriginalConfirmation(order payment.PaymentOrder, observation payment.Observation) (*payment.PaymentOrder, error) {
+	if order.Result == payment.ResultUnknown {
+		return nil, nil
+	}
+	if order.ID != observation.PaymentOrderID || order.ClientID != observation.ClientID {
+		return nil, payment.ErrUnavailable
+	}
+	if payment.ValidateUUIDv4(string(order.ID)) != nil ||
+		payment.ValidateClientID(order.ClientID) != nil ||
+		payment.ValidateBusinessOrderNo(order.BusinessOrderNo) != nil ||
+		payment.ValidateAmount(order.Amount) != nil ||
+		payment.ValidateCurrency(order.Currency) != nil ||
+		order.RegisteredAt.IsZero() ||
+		payment.ValidateUTC(order.RegisteredAt) != nil ||
+		payment.ValidateResultTime(order.Result, order.ConfirmedAt) != nil {
+		return nil, payment.ErrUnavailable
+	}
+	if order.MockTransactionID != nil && payment.ValidateUUIDv4(string(*order.MockTransactionID)) != nil {
+		return nil, payment.ErrUnavailable
+	}
+	snapshot := clonePaymentOrder(order)
+	return &snapshot, nil
+}
+
+// traceSaveResult returns the original confirmation snapshot only for the two
+// trace-save markers. A nil snapshot can never produce either marker: it is an
+// UNKNOWN order or a confirmation owned by this attempt, so the ordinary
+// indeterminate error is returned with an empty result. The record is always
+// empty: neither marker proves that this attempt's trace was saved.
+func traceSaveResult(snapshot *payment.PaymentOrder, sentinel error) (payment.SaveObservationResult, error) {
+	if snapshot == nil {
+		return payment.SaveObservationResult{}, payment.ErrIndeterminate
+	}
+	return payment.SaveObservationResult{Order: clonePaymentOrder(*snapshot)}, sentinel
+}
+
+func clonePaymentOrder(in payment.PaymentOrder) payment.PaymentOrder {
+	out := in
+	out.ConfirmedAt = cloneTimePointer(in.ConfirmedAt)
+	out.MockTransactionID = cloneMockIDPointer(in.MockTransactionID)
+	return out
 }
 
 func validateObservationInput(observation payment.Observation) error {
@@ -364,6 +466,16 @@ func observationMatchesRecord(observation payment.Observation, record payment.Re
 	if record.ResultBefore == payment.ResultUnknown {
 		historical.ConfirmedAt = nil
 		historical.MockTransactionID = nil
+		// A historical KEEP_UNKNOWN or UNKNOWN-after REJECT_EVIDENCE record may
+		// later be followed by a legitimate confirmation; that same-ID retry
+		// still reads the current reliable facts. A historical acceptance, or
+		// any record whose after-state is already confirmed, must instead agree
+		// with the current confirmation and its known transaction basis.
+		if record.ResultAfter != payment.ResultUnknown || record.Decision == payment.DecisionAcceptConfirmation {
+			if !confirmedHistoryMatchesCurrent(record, currentOrder) {
+				return false, nil
+			}
+		}
 	} else {
 		if currentOrder.Result != record.ResultBefore {
 			return false, nil
@@ -390,6 +502,43 @@ func observationMatchesRecord(observation payment.Observation, record payment.Re
 		return false, nil
 	}
 	return true, nil
+}
+
+// confirmedHistoryMatchesCurrent verifies that a historical record whose
+// after-state was already confirmed still describes the current order
+// confirmation. It rejects an opposite current result, an unusable
+// confirmation time, and a missing or conflicting known Mock association,
+// while allowing historical evidence fields that were not obtained to remain
+// absent.
+func confirmedHistoryMatchesCurrent(record payment.ResultHandlingRecord, current payment.PaymentOrder) bool {
+	if current.Result != record.ResultAfter {
+		return false
+	}
+	if payment.ValidateResultTime(current.Result, current.ConfirmedAt) != nil {
+		return false
+	}
+	if current.MockTransactionID != nil && payment.ValidateUUIDv4(string(*current.MockTransactionID)) != nil {
+		return false
+	}
+	if record.Evidence.PlatformReferenceID != nil && *record.Evidence.PlatformReferenceID != current.ID {
+		return false
+	}
+	if record.Evidence.Amount != nil && *record.Evidence.Amount != current.Amount {
+		return false
+	}
+	if record.Evidence.Currency != nil && *record.Evidence.Currency != current.Currency {
+		return false
+	}
+	if record.Evidence.Result != nil && *record.Evidence.Result != current.Result {
+		return false
+	}
+	if record.Evidence.MockTransactionID != nil {
+		if current.MockTransactionID == nil ||
+			*record.Evidence.MockTransactionID != *current.MockTransactionID {
+			return false
+		}
+	}
+	return true
 }
 
 func updateOrderConfirmation(ctx context.Context, tx pgx.Tx, locked, updated payment.PaymentOrder) error {
