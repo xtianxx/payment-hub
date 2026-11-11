@@ -36,6 +36,16 @@ var paymentIssueMessages = map[string]string{
 	payment.IssueCodeTraceSaveError:        "trace save error",
 }
 
+const (
+	paymentTraceSaveFailedMessage        = "本次追踪保存失败"
+	paymentTraceSaveIndeterminateMessage = "保存状态未确认"
+)
+
+var paymentTraceSaveIssueMessages = map[string]string{
+	paymentTraceSaveFailedMessage:        "trace save failed",
+	paymentTraceSaveIndeterminateMessage: "trace save state unconfirmed",
+}
+
 type paymentEnvelope struct {
 	RequestID string                 `json:"request_id"`
 	Payment   *paymentOrderResponse  `json:"payment,omitempty"`
@@ -186,7 +196,7 @@ func paymentIssueResponses(issues []payment.Issue) []paymentIssueResponse {
 	responses := make([]paymentIssueResponse, 0, len(issues))
 	seen := make(map[string]bool, len(issues))
 	for _, issue := range issues {
-		message, ok := paymentIssueMessages[issue.Code]
+		message, ok := paymentIssueMessage(issue)
 		if !ok || seen[issue.Code] {
 			continue
 		}
@@ -197,6 +207,19 @@ func paymentIssueResponses(issues []payment.Issue) []paymentIssueResponse {
 		return nil
 	}
 	return responses
+}
+
+// paymentIssueMessage maps only the two controlled trace-save variants to
+// distinct external messages. Every other Issue.Message is ignored so raw
+// error text can never pass through the HTTP boundary.
+func paymentIssueMessage(issue payment.Issue) (string, bool) {
+	if issue.Code == payment.IssueCodeTraceSaveError {
+		if message, ok := paymentTraceSaveIssueMessages[issue.Message]; ok {
+			return message, true
+		}
+	}
+	message, ok := paymentIssueMessages[issue.Code]
+	return message, ok
 }
 
 func paymentErrorMessage(code string) string {
