@@ -1,0 +1,98 @@
+name: Paired image acceptance (linux/amd64)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOENV: "off"
+  GOWORK: "off"
+  GOFLAGS: ""
+  GOTELEMETRY: "off"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  image-acceptance:
+    name: Paired image acceptance (linux/amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Isolate image acceptance Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-images"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; image acceptance cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+          check-latest: false
+          cache: false
+
+      - name: Build and accept paired images
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOMAXPROCS: "2"
+        run: |
+          set -euo pipefail
+          python3 -B scripts/build-images.py \
+            --go "$(command -v go)" \
+            --cache-dir "$RUNNER_TEMP/payment-hub-images" \
+            --artifact-root "$RUNNER_TEMP/payment-hub-images/artifacts" \
+            --prepare-inputs
+
+      - name: Upload safe image acceptance summaries
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-acceptance-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/payment-hub-images/artifacts/upload/build-summary.json
+            ${{ runner.temp }}/payment-hub-images/artifacts/upload/images-summary.json
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false

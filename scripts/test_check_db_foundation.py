@@ -69,6 +69,8 @@ TEST_US3_PROTECTION = "TestUS3Protection"
 TEST_US3_RESTART = "TestUS3Restart"
 TEST_US3_LIFECYCLE = "TestUS3Lifecycle"
 TEST_US3_REPORT_SAFETY = "TestUS3ReportSafety"
+CROSS_ENTRY_SECURITY = "TestCrossEntrySecurity"
+HTTP_DEMO = "TestHTTPDemo"
 HARNESS_PACKAGE = "payment-hub/tests/harness"
 TESTS_PACKAGE = "payment-hub/tests"
 POSTGRES_PACKAGE = "payment-hub/internal/postgres"
@@ -99,6 +101,8 @@ REQUIRED_TEST_PACKAGE = {
     TEST_US3_RESTART: TESTS_PACKAGE,
     TEST_US3_LIFECYCLE: TESTS_PACKAGE,
     TEST_US3_REPORT_SAFETY: TESTS_PACKAGE,
+    CROSS_ENTRY_SECURITY: TESTS_PACKAGE,
+    HTTP_DEMO: TESTS_PACKAGE,
 }
 
 
@@ -241,6 +245,8 @@ def all_required_pass_output():
         + us1_required_pass_output()
         + us2_required_pass_output()
         + us3_required_pass_output()
+        + required_pass_output(CROSS_ENTRY_SECURITY)
+        + required_pass_output(HTTP_DEMO)
     )
 
 
@@ -269,6 +275,8 @@ def roots_only_required_pass_output():
         + required_root_pass_output(TEST_US3_RESTART)
         + required_root_pass_output(TEST_US3_LIFECYCLE)
         + required_root_pass_output(TEST_US3_REPORT_SAFETY)
+        + required_root_pass_output(CROSS_ENTRY_SECURITY)
+        + required_root_pass_output(HTTP_DEMO)
     )
 
 
@@ -811,6 +819,54 @@ class CheckDBFoundationMockTests(unittest.TestCase):
             tuple("payment-hub/" + name for name in MOD.PACKAGES),
         )
 
+    def test_http_demo_required_binding_uses_tests_root(self):
+        self.assertEqual(MOD.REQUIRED_TEST_PACKAGES.get(HTTP_DEMO), TESTS_PACKAGE)
+        self.assertNotEqual(
+            MOD.REQUIRED_TEST_PACKAGES.get(HTTP_DEMO), HARNESS_PACKAGE
+        )
+        self.assertIn(HTTP_DEMO, CI_MOD.DB_REQUIRED_TEST_KEYS)
+
+    def test_http_demo_required_root_mutations_are_not_green(self):
+        stdout = PACKAGE_OK_OUTPUT + all_required_pass_output()
+        with self.subTest(mutation="missing"):
+            required, problems = self.launcher._parse_required_test_results(
+                without_test_events(stdout, HTTP_DEMO)
+            )
+            self.assertEqual(required.get(HTTP_DEMO), "missing")
+            self.assertIn("required-test-missing", problems)
+        for action in ("skip", "fail"):
+            with self.subTest(mutation=action):
+                required, problems = (
+                    self.launcher._parse_required_test_results(
+                        replace_test_terminal(
+                            stdout, TESTS_PACKAGE, HTTP_DEMO, action
+                        )
+                    )
+                )
+                self.assertEqual(required.get(HTTP_DEMO), action)
+                self.assertIn("required-test-" + action, problems)
+        with self.subTest(mutation="wrong-package"):
+            wrong = without_test_events(stdout, HTTP_DEMO)
+            wrong += json_event("run", HARNESS_PACKAGE, HTTP_DEMO)
+            wrong += json_event(
+                "pass", HARNESS_PACKAGE, HTTP_DEMO, elapsed=0.01
+            )
+            required, problems = self.launcher._parse_required_test_results(
+                wrong
+            )
+            self.assertEqual(required.get(HTTP_DEMO), "wrong-package")
+            self.assertIn("required-test-wrong-package", problems)
+        with self.subTest(mutation="duplicate"):
+            duplicate = stdout
+            duplicate += json_event("run", TESTS_PACKAGE, HTTP_DEMO)
+            duplicate += json_event(
+                "pass", TESTS_PACKAGE, HTTP_DEMO, elapsed=0.01
+            )
+            required, _ = self.launcher._parse_required_test_results(
+                duplicate
+            )
+            self.assertEqual(required.get(HTTP_DEMO), "duplicate")
+
     def test_us1_required_bindings_use_storage_and_mock_roots(self):
         self.assertEqual(
             MOD.REQUIRED_TEST_PACKAGES.get(T023_REQUIRED_INTEGRATION_TEST),
@@ -908,7 +964,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 self.assertEqual(required.get(name), "missing")
         self.assertIn("required-test-missing", problems)
 
-    def test_us2_parser_accepts_all_twenty_four_required_roots(self):
+    def test_us2_parser_accepts_all_twenty_six_required_roots(self):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 0
         )
@@ -1096,6 +1152,58 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 self.assertEqual(required.get(target), "missing")
                 self.assertIn("required-test-missing", problems)
 
+    def test_cross_entry_security_required_binding_and_mutations(self):
+        target = CROSS_ENTRY_SECURITY
+        self.assertEqual(MOD.REQUIRED_TEST_PACKAGES.get(target), TESTS_PACKAGE)
+        self.assertIn(target, CI_MOD.DB_REQUIRED_TEST_KEYS)
+        required, problems = self.launcher._parse_required_test_results(
+            PACKAGE_OK_OUTPUT + all_required_pass_output()
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(required.get(target), "pass")
+        required, problems = self.launcher._parse_required_test_results(
+            without_test_events(
+                PACKAGE_OK_OUTPUT + all_required_pass_output(), target
+            )
+        )
+        self.assertEqual(required.get(target), "missing")
+        self.assertIn("required-test-missing", problems)
+        for action in ("skip", "fail"):
+            with self.subTest(action=action):
+                required, problems = (
+                    self.launcher._parse_required_test_results(
+                        replace_test_terminal(
+                            PACKAGE_OK_OUTPUT + all_required_pass_output(),
+                            TESTS_PACKAGE,
+                            target,
+                            action,
+                        )
+                    )
+                )
+                self.assertEqual(required.get(target), action)
+                self.assertIn("required-test-" + action, problems)
+        with self.subTest(action="wrong-package"):
+            stdout = without_test_events(
+                PACKAGE_OK_OUTPUT + all_required_pass_output(), target
+            )
+            stdout += json_event("run", HARNESS_PACKAGE, target)
+            stdout += json_event(
+                "pass", HARNESS_PACKAGE, target, elapsed=0.01
+            )
+            required, problems = self.launcher._parse_required_test_results(
+                stdout
+            )
+            self.assertEqual(required.get(target), "wrong-package")
+            self.assertIn("required-test-wrong-package", problems)
+        with self.subTest(action="duplicate"):
+            stdout = PACKAGE_OK_OUTPUT + all_required_pass_output()
+            stdout += json_event("run", TESTS_PACKAGE, target)
+            stdout += json_event(
+                "pass", TESTS_PACKAGE, target, elapsed=0.01
+            )
+            required, _ = self.launcher._parse_required_test_results(stdout)
+            self.assertEqual(required.get(target), "duplicate")
+
     def test_us3_required_bindings_use_storage_and_tests_roots(self):
         self.assertEqual(
             MOD.REQUIRED_TEST_PACKAGES.get(US3_OBSERVATION_FAULT),
@@ -1157,7 +1265,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(required.get(name), "pass")
 
-    def test_parser_accepts_all_twenty_four_required_roots(self):
+    def test_parser_accepts_all_twenty_six_required_roots(self):
         _, problems = self.launcher._parse_test_output(
             PACKAGE_OK_OUTPUT + all_required_pass_output(), "", 0
         )
@@ -1330,6 +1438,30 @@ class CheckDBFoundationMockTests(unittest.TestCase):
                 )
                 self.assertEqual(required.get(target), "missing")
                 self.assertIn("required-test-missing", problems)
+
+    def test_source_manifest_includes_both_cli_wrappers(self):
+        self.assertIn("scripts/demo.sh", MOD.SOURCE_MANIFEST_EXPLICIT)
+        self.assertIn("scripts/release.sh", MOD.SOURCE_MANIFEST_EXPLICIT)
+        fixture = self._write_manifest_fixture(
+            Path(self.temp.name) / "manifest-cli-wrappers-fixture"
+        )
+        self.launcher.repo = fixture
+        self.launcher.collect_source_manifest()
+        manifest_paths = {
+            entry["path"] for entry in self.launcher.source["manifest"]
+        }
+        self.assertIn("scripts/demo.sh", manifest_paths)
+        self.assertIn("scripts/release.sh", manifest_paths)
+
+    def test_source_manifest_release_shell_membership_is_explicit(self):
+        self.assertIn("scripts/release.sh", MOD.SOURCE_MANIFEST_EXPLICIT)
+        reduced = tuple(
+            path
+            for path in MOD.SOURCE_MANIFEST_EXPLICIT
+            if path != "scripts/release.sh"
+        )
+        self.assertNotIn("scripts/release.sh", reduced)
+        self.assertIn("scripts/demo.sh", reduced)
 
     def test_source_manifest_globs_cover_us1_go_files(self):
         fixture = self._write_manifest_fixture(
@@ -2335,7 +2467,7 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
                 ]
                 self.assertEqual(actual_paths, paths)
                 self.assertEqual(step["with"]["if-no-files-found"], "error")
-                self.assertEqual(step["with"]["retention-days"], 14)
+                self.assertEqual(step["with"]["retention-days"], 30)
                 self.assertIs(step["with"]["include-hidden-files"], False)
                 export_steps = [
                     candidate

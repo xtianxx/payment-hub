@@ -127,11 +127,17 @@ EXPECTED_US3_DEFAULT_REQUIRED = {
     "TestSubmitTraceFailureProtection": PAYMENT,
     "TestTraceSaveIssueVariants": HTTPAPI,
 }
+# Delivery additions frozen after the historical 55-entry inventory. Keep the
+# old groups above intact and append only the new untagged root.
+EXPECTED_DELIVERY_DEFAULT_REQUIRED = {
+    "TestReleaseGates": TESTS,
+}
 EXPECTED_DEFAULT_REQUIRED_TOTAL = {
     **EXPECTED_DEFAULT_REQUIRED,
     **EXPECTED_US1_DEFAULT_REQUIRED,
     **EXPECTED_US2_DEFAULT_REQUIRED,
     **EXPECTED_US3_DEFAULT_REQUIRED,
+    **EXPECTED_DELIVERY_DEFAULT_REQUIRED,
 }
 
 PAYMENT_DIRECTIVE_DEFAULT_ROOTS = (
@@ -169,6 +175,13 @@ EXPECTED_DB_REQUIRED = {
     "TestUS3Restart": TESTS,
     "TestUS3Lifecycle": TESTS,
     "TestUS3ReportSafety": TESTS,
+    "TestCrossEntrySecurity": TESTS,
+    "TestHTTPDemo": TESTS,
+}
+EXPECTED_PRE_DELIVERY_DB_REQUIRED = {
+    name: package
+    for name, package in EXPECTED_DB_REQUIRED.items()
+    if name != "TestHTTPDemo"
 }
 EXPECTED_PR3_DB_REQUIRED = {
     name: package
@@ -1103,7 +1116,12 @@ class DefaultInventoryTests(unittest.TestCase):
             len(MOD.DEFAULT_REQUIRED_TESTS),
             len(EXPECTED_DEFAULT_REQUIRED_TOTAL),
         )
-        self.assertEqual(len(EXPECTED_DEFAULT_REQUIRED_TOTAL), 55)
+        self.assertEqual(len(EXPECTED_DEFAULT_REQUIRED_TOTAL), 56)
+        self.assertEqual(
+            len(EXPECTED_DEFAULT_REQUIRED_TOTAL)
+            - len(EXPECTED_DELIVERY_DEFAULT_REQUIRED),
+            55,
+        )
         roots = {
             name.split("/", 1)[0]
             for name in MOD.DEFAULT_REQUIRED_TESTS
@@ -1113,7 +1131,7 @@ class DefaultInventoryTests(unittest.TestCase):
             for name in EXPECTED_DEFAULT_REQUIRED_TOTAL
         }
         self.assertEqual(roots, expected_roots)
-        self.assertEqual(len(roots), 53)
+        self.assertEqual(len(roots), 54)
         subtests = [
             name
             for name in MOD.DEFAULT_REQUIRED_TESTS
@@ -1288,7 +1306,7 @@ class DefaultInventoryTests(unittest.TestCase):
                 self.assertIn(name, MOD.DB_REQUIRED_TEST_KEYS)
                 self.assertNotIn(name, MOD.DEFAULT_REQUIRED_TESTS)
 
-    def test_db_required_keys_are_the_twenty_four_explicit_bindings(self):
+    def test_db_required_keys_are_the_twenty_six_explicit_bindings(self):
         self.assertEqual(
             MOD.DB_REQUIRED_TEST_KEYS,
             (
@@ -1316,12 +1334,20 @@ class DefaultInventoryTests(unittest.TestCase):
                 "TestUS3Restart",
                 "TestUS3Lifecycle",
                 "TestUS3ReportSafety",
+                "TestCrossEntrySecurity",
+                "TestHTTPDemo",
             ),
         )
         self.assertEqual(
             tuple(MOD.DB_REQUIRED_TEST_KEYS), tuple(EXPECTED_DB_REQUIRED)
         )
-        self.assertEqual(len(MOD.DB_REQUIRED_TEST_KEYS), 24)
+        self.assertEqual(len(MOD.DB_REQUIRED_TEST_KEYS), 26)
+        self.assertEqual(
+            tuple(MOD.DB_REQUIRED_TEST_KEYS)[
+                : len(EXPECTED_PRE_DELIVERY_DB_REQUIRED)
+            ],
+            tuple(EXPECTED_PRE_DELIVERY_DB_REQUIRED),
+        )
 
     def test_db_required_keys_are_the_eleven_explicit_bindings(self):
         # Historical 11-entry subset remains the exact prefix of the frozen
@@ -1433,7 +1459,7 @@ class DefaultInventoryTests(unittest.TestCase):
 
 
 class DbRequiredParserTests(unittest.TestCase):
-    """Parser-level DB launcher inventory for the twenty-four explicit bindings."""
+    """Parser-level DB launcher inventory for the twenty-six explicit bindings."""
 
     def parse(self, stdout, required=None):
         mapping = {
@@ -1454,7 +1480,7 @@ class DbRequiredParserTests(unittest.TestCase):
             (POSTGRES, MOCK, HARNESS, TESTS), EXPECTED_DB_REQUIRED
         )
 
-    def test_full_twenty_four_binding_stream_is_green(self):
+    def test_full_twenty_six_binding_stream_is_green(self):
         result = self.parse(self.full_stream())
         self.assertEqual(result["problems"], [])
         self.assertEqual(
@@ -1510,6 +1536,7 @@ class DbRequiredParserTests(unittest.TestCase):
             "TestUS3Restart",
             "TestUS3Lifecycle",
             "TestUS3ReportSafety",
+            "TestCrossEntrySecurity",
         ):
             with self.subTest(target=target):
                 result = self.parse(
@@ -1519,6 +1546,63 @@ class DbRequiredParserTests(unittest.TestCase):
                     result["required_test_results"].get(target), "missing"
                 )
                 self.assertIn("required-test-missing", result["problems"])
+
+    def test_http_demo_root_mutations_are_not_green(self):
+        target = "TestHTTPDemo"
+        package = TESTS
+        with self.subTest(mutation="missing"):
+            result = self.parse(
+                without_test_events(self.full_stream(), target)
+            )
+            self.assertEqual(
+                result["required_test_results"].get(target), "missing"
+            )
+            self.assertIn("required-test-missing", result["problems"])
+        for action in ("skip", "fail"):
+            with self.subTest(mutation=action):
+                result = self.parse(
+                    replace_test_terminal(
+                        self.full_stream(), package, target, action
+                    )
+                )
+                self.assertEqual(
+                    result["required_test_results"].get(target), action
+                )
+                self.assertIn(
+                    "required-test-" + action, result["problems"]
+                )
+        with self.subTest(mutation="wrong-package"):
+            stdout = without_test_events(self.full_stream(), target)
+            stdout += event("run", HARNESS, target)
+            stdout += event("pass", HARNESS, target, elapsed=0.01)
+            result = self.parse(stdout)
+            self.assertEqual(
+                result["required_test_results"].get(target), "wrong-package"
+            )
+            self.assertIn(
+                "required-test-wrong-package", result["problems"]
+            )
+        with self.subTest(mutation="duplicate"):
+            stdout = self.full_stream()
+            stdout += event("run", package, target)
+            stdout += event("pass", package, target, elapsed=0.01)
+            result = self.parse(stdout)
+            self.assertEqual(
+                result["required_test_results"].get(target), "duplicate"
+            )
+        with self.subTest(mutation="output-spoof"):
+            stdout = without_test_events(self.full_stream(), target)
+            stdout += event(
+                "output",
+                package,
+                test=target,
+                output="--- PASS: " + target + " (0.00s)\n",
+            )
+            result = self.parse(stdout)
+            self.assertEqual(
+                result["required_test_results"].get(target), "missing"
+            )
+            self.assertIn("required-test-missing", result["problems"])
 
     def test_new_db_root_skip_is_not_green(self):
         target = "TestOrderRegistrationIntegration"
@@ -1704,6 +1788,44 @@ class DbRequiredParserTests(unittest.TestCase):
                 )
                 self.assertIn("required-test-missing", result["problems"])
 
+    def test_cross_entry_security_root_is_required_and_fail_closed(self):
+        target = "TestCrossEntrySecurity"
+        package = EXPECTED_DB_REQUIRED[target]
+        self.assertEqual(package, TESTS)
+        result = self.parse(self.full_stream())
+        self.assertEqual(result["required_test_results"].get(target), "pass")
+        result = self.parse(without_test_events(self.full_stream(), target))
+        self.assertEqual(result["required_test_results"].get(target), "missing")
+        self.assertIn("required-test-missing", result["problems"])
+        for action in ("skip", "fail"):
+            with self.subTest(mutation=action):
+                result = self.parse(
+                    replace_test_terminal(
+                        self.full_stream(), package, target, action
+                    )
+                )
+                self.assertEqual(
+                    result["required_test_results"].get(target), action
+                )
+                self.assertIn("required-test-" + action, result["problems"])
+        with self.subTest(mutation="wrong-package"):
+            stdout = without_test_events(self.full_stream(), target)
+            stdout += event("run", HARNESS, target)
+            stdout += event("pass", HARNESS, target, elapsed=0.01)
+            result = self.parse(stdout)
+            self.assertEqual(
+                result["required_test_results"].get(target), "wrong-package"
+            )
+            self.assertIn("required-test-wrong-package", result["problems"])
+        with self.subTest(mutation="duplicate"):
+            stdout = self.full_stream()
+            stdout += event("run", package, target)
+            stdout += event("pass", package, target, elapsed=0.01)
+            result = self.parse(stdout)
+            self.assertEqual(
+                result["required_test_results"].get(target), "duplicate"
+            )
+
     def test_us2_db_roots_skip_and_fail_are_not_green(self):
         for target in (
             "TestOrderRegistrationConcurrencyIntegration",
@@ -1810,6 +1932,7 @@ class Us2DefaultRequiredParserTests(unittest.TestCase):
         MOCK,
         TESTCONTROL,
         POSTGRES,
+        TESTS,
     )
 
     def parse(self, stdout):
@@ -1825,7 +1948,7 @@ class Us2DefaultRequiredParserTests(unittest.TestCase):
     def full_stream(self):
         return default_stream(self.PACKAGES, MOD.DEFAULT_REQUIRED_TESTS)
 
-    def test_full_fifty_five_binding_stream_is_green(self):
+    def test_full_fifty_six_binding_stream_is_green(self):
         result = self.parse(self.full_stream())
         self.assertEqual(result["problems"], [])
         self.assertEqual(
@@ -1919,6 +2042,7 @@ class Us3DefaultRequiredParserTests(unittest.TestCase):
         MOCK,
         TESTCONTROL,
         POSTGRES,
+        TESTS,
     )
 
     def parse(self, stdout):
@@ -1934,7 +2058,7 @@ class Us3DefaultRequiredParserTests(unittest.TestCase):
     def full_stream(self):
         return default_stream(self.PACKAGES, MOD.DEFAULT_REQUIRED_TESTS)
 
-    def test_full_fifty_five_binding_stream_is_green(self):
+    def test_full_fifty_six_binding_stream_is_green(self):
         result = self.parse(self.full_stream())
         self.assertEqual(result["problems"], [])
         self.assertEqual(
@@ -2011,6 +2135,51 @@ class Us3DefaultRequiredParserTests(unittest.TestCase):
                 self.assertIn("required-test-missing", result["problems"])
 
 
+    def test_release_gates_default_root_mutations_are_not_green(self):
+        target = "TestReleaseGates"
+        package = TESTS
+        with self.subTest(mutation="missing"):
+            result = self.parse(
+                without_test_events(self.full_stream(), target)
+            )
+            self.assertEqual(
+                result["required_test_results"].get(target), "missing"
+            )
+            self.assertIn("required-test-missing", result["problems"])
+        for action in ("skip", "fail"):
+            with self.subTest(mutation=action):
+                result = self.parse(
+                    replace_test_terminal(
+                        self.full_stream(), package, target, action
+                    )
+                )
+                self.assertEqual(
+                    result["required_test_results"].get(target), action
+                )
+                self.assertIn(
+                    "required-test-" + action, result["problems"]
+                )
+        with self.subTest(mutation="wrong-package"):
+            stdout = without_test_events(self.full_stream(), target)
+            stdout += event("run", HARNESS, target)
+            stdout += event("pass", HARNESS, target, elapsed=0.01)
+            result = self.parse(stdout)
+            self.assertEqual(
+                result["required_test_results"].get(target), "wrong-package"
+            )
+            self.assertIn(
+                "required-test-wrong-package", result["problems"]
+            )
+        with self.subTest(mutation="duplicate"):
+            stdout = self.full_stream()
+            stdout += event("run", package, target)
+            stdout += event("pass", package, target, elapsed=0.01)
+            result = self.parse(stdout)
+            self.assertEqual(
+                result["required_test_results"].get(target), "duplicate"
+            )
+
+
 class RunDefaultTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ci-checks-run-")
@@ -2027,7 +2196,9 @@ class RunDefaultTests(unittest.TestCase):
             POSTGRES,
             TESTCONTROL,
             HARNESS,
+            TESTS,
         ]
+        self.packages.sort()
         self.list_stdout = "\n".join(self.packages) + "\n"
         self.xdg_config = str(self.root / "xdg-config")
         self.controlled_env = {
@@ -2868,7 +3039,11 @@ class ProcessGroupTests(unittest.TestCase):
         )
         with mock.patch.object(
             MOD.subprocess, "Popen", return_value=fake
-        ) as popen, mock.patch.object(MOD.os, "killpg") as killpg:
+        ) as popen, mock.patch.object(
+            MOD.os, "killpg"
+        ) as killpg, mock.patch.object(
+            MOD.os, "getpgid", return_value=fake.pid
+        ):
             result = MOD._run_process_group(
                 ["go", "test"], {"PATH": "/bin"}, 120
             )
@@ -2877,7 +3052,7 @@ class ProcessGroupTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 124)
         self.assertEqual(result.stdout, b"out")
         self.assertEqual(result.stderr, b"err")
-        killpg.assert_called_once_with(fake.pid, signal.SIGKILL)
+        killpg.assert_any_call(fake.pid, signal.SIGKILL)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
     def test_timeout_reap_unconfirmed_is_not_reaped(self):
@@ -2890,33 +3065,45 @@ class ProcessGroupTests(unittest.TestCase):
         )
         with mock.patch.object(
             MOD.subprocess, "Popen", return_value=fake
-        ), mock.patch.object(MOD.os, "killpg") as killpg:
+        ), mock.patch.object(
+            MOD.os, "killpg"
+        ) as killpg, mock.patch.object(
+            MOD.os, "getpgid", return_value=fake.pid
+        ):
             result = MOD._run_process_group(
                 ["go", "test"], {"PATH": "/bin"}, 120
             )
         self.assertTrue(result.timed_out)
         self.assertFalse(getattr(result, "reaped", True))
         self.assertEqual(result.exit_code, 124)
-        killpg.assert_called_once_with(fake.pid, signal.SIGKILL)
+        killpg.assert_any_call(fake.pid, signal.SIGKILL)
 
     def test_oserror_kills_group_and_maps_ci_error(self):
         fake = self.FakeProcess([OSError("pipe"), (b"", b"")])
         with mock.patch.object(
             MOD.subprocess, "Popen", return_value=fake
-        ), mock.patch.object(MOD.os, "killpg") as killpg:
+        ), mock.patch.object(
+            MOD.os, "killpg"
+        ) as killpg, mock.patch.object(
+            MOD.os, "getpgid", return_value=fake.pid
+        ):
             with self.assertRaises(MOD.CiError) as raised:
                 MOD._run_process_group(
                     ["go", "test"], {"PATH": "/bin"}, 120
                 )
         self.assertEqual(raised.exception.category, "process-io-failed")
-        killpg.assert_called_once_with(fake.pid, signal.SIGKILL)
+        killpg.assert_any_call(fake.pid, signal.SIGKILL)
 
     def test_keyboard_interrupt_kills_group_and_maps_ci_error(self):
         fake = self.FakeProcess([KeyboardInterrupt(), (b"", b"")])
         category = None
         with mock.patch.object(
             MOD.subprocess, "Popen", return_value=fake
-        ), mock.patch.object(MOD.os, "killpg") as killpg:
+        ), mock.patch.object(
+            MOD.os, "killpg"
+        ) as killpg, mock.patch.object(
+            MOD.os, "getpgid", return_value=fake.pid
+        ):
             try:
                 MOD._run_process_group(
                     ["go", "test"], {"PATH": "/bin"}, 120
@@ -2930,11 +3117,13 @@ class ProcessGroupTests(unittest.TestCase):
             else:
                 self.fail("CiError not raised")
         self.assertEqual(category, "process-interrupted")
-        killpg.assert_called_once_with(fake.pid, signal.SIGKILL)
+        killpg.assert_any_call(fake.pid, signal.SIGKILL)
 
     def test_success_records_wait_elapsed_from_supervision_clock(self):
         fake = self.FakeProcess([(b"out", b"err")])
-        with mock.patch.object(MOD.subprocess, "Popen", return_value=fake):
+        with mock.patch.object(
+            MOD.subprocess, "Popen", return_value=fake
+        ), mock.patch.object(MOD.os, "getpgid", return_value=fake.pid):
             with monotonic_clock(100.0, 101.25) as clock:
                 result = MOD._run_process_group(
                     ["go", "test"], {"PATH": "/bin"}, 570
@@ -2953,7 +3142,11 @@ class ProcessGroupTests(unittest.TestCase):
         )
         with mock.patch.object(
             MOD.subprocess, "Popen", return_value=fake
-        ), mock.patch.object(MOD.os, "killpg"):
+        ), mock.patch.object(
+            MOD.os, "killpg"
+        ), mock.patch.object(
+            MOD.os, "getpgid", return_value=fake.pid
+        ):
             with monotonic_clock(200.0, 770.5, 1070.5) as clock:
                 result = MOD._run_process_group(
                     ["go", "test"], {"PATH": "/bin"}, 570
@@ -2965,6 +3158,158 @@ class ProcessGroupTests(unittest.TestCase):
         # The third fake clock value is the fake kill/reap cost and must not
         # be included in the supervision measurement.
         self.assertEqual(clock.call_count, 2)
+
+
+class CancellationSupervisionTests(unittest.TestCase):
+    """Focused cancel supervision tests; no real Go or signal is delivered."""
+
+    class FakeProcess:
+        pid = 4242
+
+        def __init__(self, effect=None):
+            self.effect = effect
+            self.returncode = -9
+            self.calls = 0
+            self.killed = False
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.effect is not None:
+                value = self.effect
+                self.effect = None
+                if callable(value):
+                    value()
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+            return b"", b""
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+
+    def setUp(self):
+        MOD._reset_cancellation()
+        self.addCleanup(MOD._reset_cancellation)
+        self.addCleanup(
+            lambda: setattr(MOD, "_ACTIVE_GROUP_PID", None)
+        )
+
+    def test_sigterm_handler_latches_and_terminates_recorded_group(self):
+        MOD._ACTIVE_GROUP_PID = 4242
+        with mock.patch.object(MOD.os, "killpg") as killpg:
+            with self.assertRaises(MOD._CancellationRequested):
+                MOD._handle_cancel(signal.SIGTERM, None)
+        self.assertEqual(MOD._cancelled_signal(), signal.SIGTERM)
+        killpg.assert_called_once_with(4242, signal.SIGTERM)
+
+    def test_sigint_handler_latches_and_terminates_recorded_group(self):
+        MOD._ACTIVE_GROUP_PID = 4242
+        with mock.patch.object(MOD.os, "killpg") as killpg:
+            with self.assertRaises(MOD._CancellationRequested):
+                MOD._handle_cancel(signal.SIGINT, None)
+        self.assertEqual(MOD._cancelled_signal(), signal.SIGINT)
+        killpg.assert_called_once_with(4242, signal.SIGINT)
+
+    def test_unowned_group_is_rejected_without_killing(self):
+        fake = self.FakeProcess()
+        with mock.patch.object(
+            MOD.subprocess, "Popen", return_value=fake
+        ), mock.patch.object(
+            MOD.os, "getpgid", return_value=9999
+        ), mock.patch.object(MOD.os, "killpg") as killpg:
+            with self.assertRaises(MOD.CiError) as raised:
+                MOD._run_process_group(
+                    ["go", "test"], {"PATH": "/bin"}, 120
+                )
+        self.assertEqual(raised.exception.category, "process-group-not-owned")
+        self.assertTrue(fake.killed)
+        killpg.assert_not_called()
+
+    def test_cancellation_kills_recorded_group_and_maps_interrupted(self):
+        fake = self.FakeProcess()
+
+        def cancel():
+            MOD._CANCEL_SIGNAL = signal.SIGTERM
+            raise MOD._CancellationRequested()
+
+        fake.effect = cancel
+        with mock.patch.object(
+            MOD.subprocess, "Popen", return_value=fake
+        ), mock.patch.object(
+            MOD.os, "getpgid", return_value=fake.pid
+        ), mock.patch.object(MOD.os, "killpg") as killpg:
+            with self.assertRaises(MOD.CiError) as raised:
+                MOD._run_process_group(
+                    ["go", "test"], {"PATH": "/bin"}, 570
+                )
+        self.assertEqual(raised.exception.category, "interrupted")
+        killpg.assert_any_call(fake.pid, signal.SIGKILL)
+
+    def test_cancel_after_go_list_does_not_start_go_test(self):
+        with tempfile.TemporaryDirectory(
+            prefix="ci-checks-cancel-list-"
+        ) as temp:
+            report_dir = Path(temp)
+
+            def list_then_cancel(*_args, **_kwargs):
+                MOD._CANCEL_SIGNAL = signal.SIGTERM
+                return MOD.ProcResult(
+                    0,
+                    b"payment-hub/cmd/payment-hub\n",
+                    b"",
+                    False,
+                    True,
+                )
+
+            with mock.patch.object(
+                MOD, "_isolated_go_env", return_value=({}, [])
+            ), mock.patch.object(
+                MOD,
+                "_run_process_group",
+                side_effect=list_then_cancel,
+            ) as runner:
+                code = MOD.run_default("/bin/true", str(report_dir))
+            self.assertEqual(code, 1)
+            self.assertEqual(runner.call_count, 1)
+            report = json.loads(
+                (report_dir / "go-default.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        self.assertEqual(report["result"], "fail")
+        self.assertIn("interrupted", report["problems"])
+
+    def test_run_default_cancellation_writes_interrupted_report(self):
+        with tempfile.TemporaryDirectory(
+            prefix="ci-checks-cancel-report-"
+        ) as temp:
+            report_dir = Path(temp)
+            def cancel_then_raise(*_args, **_kwargs):
+                MOD._CANCEL_SIGNAL = signal.SIGTERM
+                raise MOD.CiError("interrupted")
+
+            with mock.patch.object(
+                MOD, "_isolated_go_env", return_value=({}, [])
+            ), mock.patch.object(
+                MOD,
+                "_run_process_group",
+                side_effect=cancel_then_raise,
+            ):
+                code = MOD.run_default("/bin/true", str(report_dir))
+            self.assertEqual(code, 1)
+            report = json.loads(
+                (report_dir / "go-default.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        self.assertEqual(report["result"], "fail")
+        self.assertIn("interrupted", report["problems"])
 
 
 class ExportReportsTests(unittest.TestCase):
@@ -3003,6 +3348,7 @@ class ExportReportsTests(unittest.TestCase):
                 PAYMENT,
                 TESTCONTROL,
                 HARNESS,
+                TESTS,
             ],
             "package_results": {
                 APP: {"status": "pass", "duration": "0.1s"},
@@ -3011,6 +3357,7 @@ class ExportReportsTests(unittest.TestCase):
                 PAYMENT: {"status": "pass", "duration": "0.15s"},
                 TESTCONTROL: {"status": "pass", "duration": "0.18s"},
                 HARNESS: {"status": "pass", "duration": "0.2s"},
+                TESTS: {"status": "pass", "duration": "0.22s"},
                 CMD: {"status": "no-test-files"},
             },
             "required_test_results": {
@@ -3305,6 +3652,26 @@ class ExportReportsTests(unittest.TestCase):
         value = self.go_default()
         value["required_test_results"] = {
             name: "pass" for name in EXPECTED_DEFAULT_REQUIRED
+        }
+        self.write(self.report_dir / "go-default.json", value)
+        code, _ = self.export()
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "go-default.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "error")
+        self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_default_old_fifty_five_report_missing_release_gates_cannot_pass(
+        self,
+    ):
+        value = self.go_default()
+        value["required_test_results"] = {
+            name: "pass"
+            for name in EXPECTED_DEFAULT_REQUIRED_TOTAL
+            if name != "TestReleaseGates"
         }
         self.write(self.report_dir / "go-default.json", value)
         code, _ = self.export()
@@ -3806,7 +4173,7 @@ class ExportReportsTests(unittest.TestCase):
 
     def test_export_db_old_fail_report_backfills_eleven_non_green(self):
         # Historical 11-entry report remains non-green and backfills the old
-        # subset; the full 24-key assertion lives in the next test.
+        # subset; the full 26-key assertion lives in the next test.
         value = self.db_report(result="fail")
         value["tests"]["required_test_results"] = {
             name: "pass" for name in EXPECTED_PR3_DB_REQUIRED
@@ -3829,7 +4196,35 @@ class ExportReportsTests(unittest.TestCase):
                     safe["required_test_results"].get(name), "missing"
                 )
 
-    def test_export_db_old_fail_report_backfills_twenty_four_non_green(self):
+    def test_export_db_old_twenty_four_report_missing_cross_entry_cannot_pass(
+        self,
+    ):
+        value = self.db_report()
+        value["tests"]["required_test_results"].pop(
+            "TestCrossEntrySecurity", None
+        )
+        self.write_db(value)
+        code, _ = self.export(["db"])
+        self.assertEqual(code, 1)
+        safe = self.read_safe_db()
+        self.assertEqual(safe["status"], "error")
+        self.assertEqual(safe["error"], "unsafe-field-required_test_results")
+        self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_db_old_twenty_five_report_missing_http_demo_cannot_pass(
+        self,
+    ):
+        value = self.db_report()
+        value["tests"]["required_test_results"].pop("TestHTTPDemo", None)
+        self.write_db(value)
+        code, _ = self.export(["db"])
+        self.assertEqual(code, 1)
+        safe = self.read_safe_db()
+        self.assertEqual(safe["status"], "error")
+        self.assertEqual(safe["error"], "unsafe-field-required_test_results")
+        self.assertNotEqual(safe.get("result"), "pass")
+
+    def test_export_db_old_fail_report_backfills_twenty_six_non_green(self):
         value = self.db_report(result="fail")
         value["tests"]["required_test_results"] = {
             name: "pass" for name in EXPECTED_PR3_DB_REQUIRED
@@ -3869,6 +4264,8 @@ class ExportReportsTests(unittest.TestCase):
             "TestUS3Restart",
             "TestUS3Lifecycle",
             "TestUS3ReportSafety",
+            "TestCrossEntrySecurity",
+            "TestHTTPDemo",
         ):
             with self.subTest(name=name):
                 self.assertEqual(
@@ -3876,18 +4273,19 @@ class ExportReportsTests(unittest.TestCase):
                 )
 
     def test_export_db_required_results_cover_eleven_bindings(self):
-        # Historical 11-entry subset remains present in the 24-entry report.
+        # Historical 11-entry subset remains present in the 26-entry report.
         required = self.db_report()["tests"]["required_test_results"]
         for name in EXPECTED_LEGACY_DB_REQUIRED:
             with self.subTest(name=name):
                 self.assertIn(name, required)
 
-    def test_export_db_required_results_cover_twenty_four_bindings(self):
+    def test_export_db_required_results_cover_twenty_six_bindings(self):
         self.assertEqual(
             set(self.db_report()["tests"]["required_test_results"]),
             set(EXPECTED_DB_REQUIRED),
         )
-        self.assertEqual(len(EXPECTED_DB_REQUIRED), 24)
+        self.assertEqual(len(EXPECTED_DB_REQUIRED), 26)
+        self.assertEqual(len(EXPECTED_PRE_DELIVERY_DB_REQUIRED), 25)
 
     def test_export_db_digest_mismatch_fails_without_raw_fields(self):
         value = self.db_report()

@@ -465,6 +465,8 @@ DB_REQUIRED_TEST_KEYS = (
     "TestUS3Restart",
     "TestUS3Lifecycle",
     "TestUS3ReportSafety",
+    "TestCrossEntrySecurity",
+    "TestHTTPDemo",
 )
 DB_PACKAGE_KEYS = (
     "internal/postgres",
@@ -473,16 +475,17 @@ DB_PACKAGE_KEYS = (
     "tests",
 )
 
-# Frozen default inventory: 53 required roots plus two focused subtest entries
+# Frozen default inventory: 54 required roots plus two focused subtest entries
 # (TestPaymentRequestBoundary/POST_rejection_priority and
-# TestPaymentRequestBoundary/POST_business_value_delegation), i.e. 55 required
+# TestPaymentRequestBoundary/POST_business_value_delegation), i.e. 56 required
 # mapping entries total. Roots cover the original 26 PR3 roots, first-batch
 # US1 core roots, query/HTTP contract roots, payment-directive
-# protocol/client/consumer roots, runtime/router wiring, and the US3
-# query-scenario/reconciliation/cancellation additions. The twenty-four DB
-# integration checks (including the explicit lifecycle subtest) are build-tagged
-# integration and remain required in the DB launcher (REQUIRED_TEST_PACKAGES),
-# not in the untagged default ./... gate.
+# protocol/client/consumer roots, runtime/router wiring, the US3
+# query-scenario/reconciliation/cancellation additions, and the final
+# TestReleaseGates delivery root. The twenty-six DB integration checks
+# (including the explicit lifecycle subtest) are build-tagged integration and
+# remain required in the DB launcher (REQUIRED_TEST_PACKAGES), not in the
+# untagged default ./... gate.
 DEFAULT_REQUIRED_TESTS = {
     "TestStartupDiagnosticsDatabaseOpenFailure": "payment-hub/internal/app",
     "TestStartupDiagnosticsPingRetryExhaustion": "payment-hub/internal/app",
@@ -541,6 +544,7 @@ DEFAULT_REQUIRED_TESTS = {
     "TestNextCommittedPointBarrier": "payment-hub/tests/harness",
     "TestSubmitTraceFailureProtection": "payment-hub/internal/payment",
     "TestTraceSaveIssueVariants": "payment-hub/internal/httpapi",
+    "TestReleaseGates": "payment-hub/tests",
 }
 
 
@@ -559,6 +563,95 @@ class CiError(RuntimeError):
     def __init__(self, category: str) -> None:
         self.category = category
         super().__init__(category)
+
+
+class _CancellationRequested(BaseException):
+    """Internal wake-up for a run-default wait after SIGTERM/SIGINT."""
+
+
+_CANCEL_SIGNAL: int | None = None
+_ACTIVE_GROUP_PID: int | None = None
+_IN_CLEANUP = False
+
+
+def _reset_cancellation() -> None:
+    global _CANCEL_SIGNAL
+    _CANCEL_SIGNAL = None
+
+
+def _cancelled_signal() -> int | None:
+    return _CANCEL_SIGNAL
+
+
+def _signal_group(pgid: int, signum: int) -> bool:
+    try:
+        os.killpg(pgid, signum)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def _group_absent(pgid: int) -> bool:
+    """Confirm the recorded owned group has no non-zombie member left."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().split()
+        except OSError:
+            continue
+        if len(fields) < 5:
+            continue
+        try:
+            member_pgid = int(fields[4])
+        except ValueError:
+            continue
+        if member_pgid == pgid and fields[2] != "Z":
+            return False
+    return True
+
+
+def _verify_owned_group(process: Any) -> int | None:
+    """Admit only the new session/group this call created as its leader."""
+    try:
+        pgid = os.getpgid(process.pid)
+    except ProcessLookupError:
+        # The leader can exit before this check; its pid is still the PGID
+        # recorded at creation, so a residual descendant group remains
+        # reclaimable.
+        return process.pid
+    except (PermissionError, OSError):
+        return None
+    return process.pid if pgid == process.pid else None
+
+
+def _handle_cancel(signum: int, _frame: object) -> None:
+    """Latch a real cancel and wake an active owned-group wait.
+
+    Outside an active wait the signal is only latched; run_default then fails
+    closed and still writes its safe report.  During cleanup a repeated signal
+    must not interrupt the bounded reap.
+    """
+    global _CANCEL_SIGNAL
+    if signum not in (signal.SIGINT, signal.SIGTERM):
+        return
+    _CANCEL_SIGNAL = signum
+    pgid = _ACTIVE_GROUP_PID
+    if pgid is None:
+        return
+    _signal_group(pgid, signum)
+    if not _IN_CLEANUP:
+        raise _CancellationRequested()
 
 
 def utc_now() -> str:
@@ -1232,37 +1325,57 @@ def _isolated_go_env() -> tuple[dict[str, str], list[str]]:
     return env, sorted(set(problems))
 
 
-def _terminate_owned_group(process: Any) -> tuple[bool, bytes, bytes]:
+def _terminate_owned_group(
+    process: Any, owned_pgid: int | None = None
+) -> tuple[bool, bytes, bytes]:
     """Best-effort kill/reap of the process group created by this call.
 
-    This does not cover grandchildren that create their own process group or
-    session, nor a runner hard-kill; it only prevents this call from leaving
-    its own direct child group behind on controlled errors.
+    The creation-time verified PGID is used instead of trusting a possibly
+    already-exited leader.  This does not cover grandchildren that create their
+    own process group or session, nor a runner hard-kill; it only prevents this
+    call from leaving its own direct child group behind on controlled errors.
     """
+    global _IN_CLEANUP
+    pgid = process.pid if owned_pgid is None else owned_pgid
+    _IN_CLEANUP = True
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        stdout, stderr = process.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        return False, b"", b""
-    except (OSError, ValueError):
         try:
-            process.wait(timeout=5)
-        except (subprocess.TimeoutExpired, OSError, ValueError):
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
             return False, b"", b""
+        except (OSError, ValueError):
+            try:
+                process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                return False, b"", b""
+            except BaseException:
+                return False, b"", b""
+            return (
+                process.poll() is not None and _group_absent(pgid),
+                b"",
+                b"",
+            )
         except BaseException:
             return False, b"", b""
-        return process.poll() is not None, b"", b""
-    except BaseException:
-        return False, b"", b""
-    return process.poll() is not None, stdout, stderr
+        return (
+            process.poll() is not None and _group_absent(pgid),
+            stdout,
+            stderr,
+        )
+    finally:
+        _IN_CLEANUP = False
 
 
 def _run_process_group(
     argv: Sequence[str], env: Mapping[str, str], timeout: int
 ) -> ProcResult:
+    global _ACTIVE_GROUP_PID
+    if _cancelled_signal() is not None:
+        raise CiError("interrupted")
     started = time.monotonic()
     try:
         process = subprocess.Popen(
@@ -1276,38 +1389,84 @@ def _run_process_group(
         )
     except OSError as exc:
         raise CiError("process-start-failed") from exc
+    owned_pgid = _verify_owned_group(process)
+    if owned_pgid is None:
+        try:
+            process.kill()
+        except (OSError, ValueError):
+            pass
+        try:
+            process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+        raise CiError("process-group-not-owned")
+    _ACTIVE_GROUP_PID = owned_pgid
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # Measure at the timeout instant, before kill/reap cleanup.
+        if _cancelled_signal() is not None:
+            raise _CancellationRequested()
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Measure at the timeout instant, before kill/reap cleanup.
+            wait_elapsed = time.monotonic() - started
+            reaped, stdout, stderr = _terminate_owned_group(
+                process, owned_pgid
+            )
+            return ProcResult(124, stdout, stderr, True, reaped, wait_elapsed)
+        except OSError as exc:
+            reaped, _, _ = _terminate_owned_group(process, owned_pgid)
+            category = (
+                "process-io-failed"
+                if reaped
+                else "process-io-failed-reap-unconfirmed"
+            )
+            raise CiError(category) from exc
+        except BaseException as exc:
+            reaped, _, _ = _terminate_owned_group(process, owned_pgid)
+            if _cancelled_signal() is not None:
+                category = (
+                    "interrupted"
+                    if reaped
+                    else "interrupted-reap-unconfirmed"
+                )
+            else:
+                category = (
+                    "process-interrupted"
+                    if reaped
+                    else "process-interrupted-reap-unconfirmed"
+                )
+            raise CiError(category) from exc
         wait_elapsed = time.monotonic() - started
-        reaped, stdout, stderr = _terminate_owned_group(process)
-        return ProcResult(124, stdout, stderr, True, reaped, wait_elapsed)
-    except OSError as exc:
-        reaped, _, _ = _terminate_owned_group(process)
+        reaped = process.poll() is not None and _group_absent(owned_pgid)
+        if process.poll() is not None and not reaped:
+            # The leader exited but left a member in this call's recorded
+            # group.  Reap that residual group within the existing 5s budget
+            # instead of only closing pipes and claiming success.
+            _signal_group(owned_pgid, signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not _group_absent(
+                owned_pgid
+            ):
+                time.sleep(0.05)
+            reaped = _group_absent(owned_pgid)
+        return ProcResult(
+            process.returncode,
+            stdout,
+            stderr,
+            False,
+            reaped,
+            wait_elapsed,
+        )
+    except _CancellationRequested as exc:
+        # A signal that lands after the inner wait returns but before the
+        # active-group slot is cleared must still reap the owned group.
+        reaped, _, _ = _terminate_owned_group(process, owned_pgid)
         category = (
-            "process-io-failed"
-            if reaped
-            else "process-io-failed-reap-unconfirmed"
+            "interrupted" if reaped else "interrupted-reap-unconfirmed"
         )
         raise CiError(category) from exc
-    except BaseException as exc:
-        reaped, _, _ = _terminate_owned_group(process)
-        category = (
-            "process-interrupted"
-            if reaped
-            else "process-interrupted-reap-unconfirmed"
-        )
-        raise CiError(category) from exc
-    wait_elapsed = time.monotonic() - started
-    return ProcResult(
-        process.returncode,
-        stdout,
-        stderr,
-        False,
-        process.poll() is not None,
-        wait_elapsed,
-    )
+    finally:
+        _ACTIVE_GROUP_PID = None
 
 
 def _decode(value: bytes) -> str:
@@ -1418,6 +1577,9 @@ def _base_go_report(go: str) -> dict[str, Any]:
 def _finish_go_report(
     report_dir: Path, report: dict[str, Any]
 ) -> int:
+    if _cancelled_signal() is not None:
+        report["problems"].append("interrupted")
+        report["result"] = "fail"
     report["problems"] = sorted(set(report["problems"]))
     report["result"] = (
         "pass"
@@ -1428,6 +1590,13 @@ def _finish_go_report(
         and not report["timed_out"]
         else "fail"
     )
+    # A signal that lands after the first latch check must still not let a
+    # green report escape; the report write itself is never interrupted.
+    if _cancelled_signal() is not None:
+        report["problems"] = sorted(
+            set(report["problems"]) | {"interrupted"}
+        )
+        report["result"] = "fail"
     try:
         path = _write_json_report(report_dir, "go-default.json", report)
     except CiError as exc:
@@ -1442,6 +1611,33 @@ def _finish_go_report(
 
 
 def run_default(go: str, report_dir: str) -> int:
+    """Run one bounded default Go gate under owned-group cancel supervision."""
+    old_int = signal.signal(signal.SIGINT, _handle_cancel)
+    old_term = signal.signal(signal.SIGTERM, _handle_cancel)
+    try:
+        return _run_default_impl(go, report_dir)
+    except _CancellationRequested:
+        # Keep the safe report even if a signal lands outside the wait that
+        # already reaped the owned group.
+        report = _base_go_report(go)
+        report["problems"] = ["interrupted"]
+        report["result"] = "fail"
+        target = Path(report_dir)
+        try:
+            if not target.is_absolute():
+                return 1
+            target.mkdir(parents=True, exist_ok=True)
+            return _finish_go_report(target, report)
+        except (OSError, CiError):
+            print("ERROR: interrupted", file=sys.stderr)
+            print("result: fail stage=run-default kind=interrupted")
+            return 1
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+
+
+def _run_default_impl(go: str, report_dir: str) -> int:
     """Run one bounded default Go gate and write a safe go-default.json."""
     report_dir_path = Path(report_dir)
     if not report_dir_path.is_absolute():
@@ -1499,7 +1695,18 @@ def run_default(go: str, report_dir: str) -> int:
     try:
         listed = _run_process_group(list_argv, env, 60)
     except CiError as exc:
-        problems.append("go-list-" + exc.category)
+        if _cancelled_signal() is not None:
+            problems.append("interrupted")
+            if exc.category.endswith("reap-unconfirmed"):
+                problems.append("process-reap-unconfirmed")
+        else:
+            problems.append("go-list-" + exc.category)
+        report["problems"] = problems
+        return _finish_go_report(report_dir_path, report)
+    if _cancelled_signal() is not None:
+        problems.append("interrupted")
+        if not listed.reaped:
+            problems.append("process-reap-unconfirmed")
         report["problems"] = problems
         return _finish_go_report(report_dir_path, report)
     report["list_exit_code"] = listed.exit_code
@@ -1539,7 +1746,12 @@ def run_default(go: str, report_dir: str) -> int:
             test_argv, env, GO_TEST_BATCH_TIMEOUT_SECONDS
         )
     except CiError as exc:
-        problems.append("go-test-" + exc.category)
+        if _cancelled_signal() is not None:
+            problems.append("interrupted")
+            if exc.category.endswith("reap-unconfirmed"):
+                problems.append("process-reap-unconfirmed")
+        else:
+            problems.append("go-test-" + exc.category)
         report["problems"] = problems
         return _finish_go_report(report_dir_path, report)
     wait_elapsed = getattr(tested, "wait_elapsed_seconds", None)

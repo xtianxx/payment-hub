@@ -1,0 +1,88 @@
+# T074 fixed application overlay. Always combine with the PG-only base and test
+# files, for example:
+#   docker compose --env-file <envfile> \
+#     -f deploy/compose.yaml -f deploy/compose.test.yaml \
+#     -f deploy/compose.app.yaml -p <project> ...
+# This file adds app, app-test, and migrate only. It does not add top-level
+# volumes or networks and does not modify the PG-only base/test files.
+services:
+  app:
+    image: "${PAYMENT_HUB_APP_IMAGE:?}"
+    platform: "linux/amd64"
+    pull_policy: "never"
+    profiles: ["app"]
+    restart: "no"
+    stop_grace_period: "25s"
+    environment:
+      PAYMENT_HUB_CLIENT_ID: "${PAYMENT_HUB_CLIENT_ID:?}"
+      PAYMENT_HUB_API_KEY: "${PAYMENT_HUB_API_KEY:?}"
+      PAYMENT_HUB_DATABASE_URL: "${PAYMENT_HUB_DATABASE_URL:?}"
+      PAYMENT_HUB_HTTP_ADDR: "0.0.0.0:8080"
+      PAYMENT_HUB_TEST_MODE: "off"
+      TZ: "UTC"
+      HOME: "/tmp"
+    ports:
+      - "127.0.0.1:${PAYMENT_HUB_TEST_HTTP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  app-test:
+    image: "${PAYMENT_HUB_APP_IMAGE:?}"
+    platform: "linux/amd64"
+    pull_policy: "never"
+    profiles: ["app-test"]
+    restart: "no"
+    stop_grace_period: "25s"
+    user: "${PAYMENT_HUB_TEST_UID:?}:${PAYMENT_HUB_TEST_GID:?}"
+    environment:
+      PAYMENT_HUB_CLIENT_ID: "${PAYMENT_HUB_CLIENT_ID:?}"
+      PAYMENT_HUB_API_KEY: "${PAYMENT_HUB_API_KEY:?}"
+      PAYMENT_HUB_DATABASE_URL: "${PAYMENT_HUB_DATABASE_URL:?}"
+      PAYMENT_HUB_HTTP_ADDR: "0.0.0.0:8080"
+      PAYMENT_HUB_TEST_MODE: "on"
+      PAYMENT_HUB_TEST_CONTROL_SOCKET: "${PAYMENT_HUB_TEST_CONTROL_SOCKET:-}"
+      PAYMENT_HUB_TEST_RUN_ID: "${PAYMENT_HUB_TEST_RUN_ID:-}"
+      PAYMENT_HUB_TEST_OBSERVER_EPOCH: "${PAYMENT_HUB_TEST_OBSERVER_EPOCH:-}"
+      PAYMENT_HUB_TEST_GENERATION: "${PAYMENT_HUB_TEST_GENERATION:-}"
+      PAYMENT_HUB_TEST_CONTROL_VERSION: "${PAYMENT_HUB_TEST_CONTROL_VERSION:-}"
+      TZ: "UTC"
+      HOME: "/tmp"
+    ports:
+      - "127.0.0.1:${PAYMENT_HUB_TEST_HTTP_PORT:-8080}:8080"
+    volumes:
+      - type: bind
+        source: "${PAYMENT_HUB_TEST_SOCKET_DIR:?}"
+        target: "/run/ph-test"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  migrate:
+    image: "${PAYMENT_HUB_MIGRATE_IMAGE:?}"
+    platform: "linux/amd64"
+    pull_policy: "never"
+    profiles: ["migrate"]
+    restart: "no"
+    stop_grace_period: "25s"
+    command: ["validate"]
+    environment:
+      GOOSE_DRIVER: "postgres"
+      GOOSE_DBSTRING: "${PAYMENT_HUB_DATABASE_URL:?}"
+      TZ: "UTC"
+      HOME: "/tmp"
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"

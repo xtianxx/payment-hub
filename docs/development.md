@@ -486,6 +486,30 @@ T024–T041据对应证据完成并更新quickstart；T023当前测试通过，�
 
 父核对除两目标文件外195个文件在修复验证前后不变，原未提交工作保留。组合用例已归既有精确CI根覆盖，无需新增根或放宽570秒预算。本批没有重跑PG/真实TCP/US1集成、Python工具、漏洞或取消实验，不把旧PG报告当作R1修改后验证；R2–R6/P3未处理，T023历史证据限制不变。未提交、推送或启用CD。
 
+### Phase 6当前验证入口（2026-11-12，最终接受待完成）
+
+**交付审查修复补充**：外部审查随后发现临时目录、DB连接环境转发、unit取消收割、发布委派超时排空与timeout分类五项缺陷。此前正常路径通过不覆盖这些反例。该批修复的命令、退出码、进程缺席及统一回归结论以`artifacts/phase6/delivery-review-fixes/acceptance.json`为准；记录产生前不视为修复已接受。临时目录应尊重TMPDIR，不依赖agent专属路径；DB显式Docker连接配置应交给原launcher核验；取消和超时必须回收本次已确认归属的进程，有界排空，无法确认则失败，不把普通timeout误报为用户signal。进程树跟踪不是cgroup/subreaper，不宣称能完全收割任意自行脱离的恶意后代或承受宿主硬杀。业务、依赖与原预算不因修复放宽。
+
+**最终决定**：用户已确认首版无早期发布基线，旧版本/schema升级兼容本次不适用，未来升级另验；本节下文“待确认/待完成”保留为执行过程快照。最终本地范围已收口，外部发布未验证。
+
+本节后已完成最终本地运行，见`artifacts/phase6/final-validation/run-20261112T033948Z-67d8d604/acceptance.json`：768项Python、56/26必需绑定、三真实演示、取消、七类安全导出及新候选配对镜像通过。有效扫描为用户另批的一次诊断运行，可达0/未可达3；首次扫描失败保留且根因未确定。历史pair与新pair只读比较表明文件系统层、入口、用户及平台相同，不是旧发布版本/schema升级兼容证明。此兼容基线待确认，外部发布未验证；不将本地门禁通过扩写为完整交付承诺。
+
+下文各批次数字是历史快照。当前必需绑定为default56（54根、2个焦点子项）及DB26/四包，新增`TestReleaseGates`与`TestHTTPDemo`；新增绑定不等于已经执行。T070–T075历史本机接受见`artifacts/phase6/local-image-acceptance.json`，不能用其605项Python或旧镜像清单替代后续交付代码的复验。
+
+已实现的本地入口如下；`GO`必须指向已准备的Go1.27.4绝对路径，`CACHE`为仓库外缓存，`OUT`每次使用全新绝对目录。不要把占位变量原样当作可执行环境。
+
+```sh
+bash scripts/check.sh --scope format --go "$GO" --cache-dir "$CACHE" --artifact-root "$OUT"
+# static、unit、db分别使用同一入口及各自全新OUT；db内部负责归属清理。
+python3 -B scripts/build-images.py --go "$GO" --cache-dir "$CACHE" --artifact-root "$OUT"
+```
+
+builder各构建一次配对镜像并验收原产物，不认证、上传或部署。默认不拉基础镜像或准备宿主模块；只有显式`--prepare-inputs`才进行这两项固定输入准备。Dockerfile本身仍可下载固定checksum模块，不称完全离线。成功摘要仅位于`OUT/upload/build-summary.json`和`images-summary.json`，构建记录为`OUT/build-record.json`，验收报告为`OUT/validation/<run_id>/images.json`。已有镜像单独验收使用`check.sh --scope image`，并显式提供两个镜像引用和匹配当前源码的`PAYMENT_HUB_IMAGE_BUILD_RECORD`；不得重贴旧标签绕过清单。
+
+原120秒integration包、570秒批次及业务期限不变；镜像测试180秒，到期即失败，另批最多15秒只收割进程。新增镜像CI的30分钟只是job外层上限；本地配置检查不代表Actions已执行。setup的`CI gate`仍仅汇总原三个执行job，新镜像job是独立check context，未自动配置远端required checks。
+
+**失败诊断与兼容性边界**：`TestApplicationLifecycleIntegration`包含真实二进制缺迁移、启动timeout/cancel/listen失败的停止及脱敏诊断断言，历史fresh PG证据已存在，当前树仍需复验。镜像迁移命令失败后的停止/清理目前有受控runner回归，不冒称已做真实镜像故障实验。遇迁移或启动失败应停止，保存固定分类并收割本次进程，再单独核对本轮资源归属；不清演示卷、不自动重付。当前镜像核对schema版本1/2/3及源码身份，只能证明当前配对适配；没有旧版本镜像兼容实验，不能宣称旧镜像可直接使用新schema。旧构建记录与当前源码失配应拒绝，而不是放宽检查。
+
 ### CI与代码防漂移（2026-11-10）
 
 当前默认必需清单保留38个根，并显式绑定R1焦点子测试`TestPaymentRequestBoundary/POST_rejection_priority`，合计39项；根pass但该子组缺失、skip、fail、错包或重复都不能绿。DB仍为四包、11项。工作流摘要直接由`check-ci-contract.py --summary default|db`读取常量生成，不手抄名单；默认摘要的包数是必需绑定包数，不是整套测试包数。
