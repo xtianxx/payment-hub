@@ -175,6 +175,12 @@ REQUIRED_TEST_PACKAGES[
 REQUIRED_TEST_PACKAGES[
     "TestUS3ReportSafety"
 ] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestCrossEntrySecurity"
+] = f"{EXPECTED_MODULE}/tests"
+REQUIRED_TEST_PACKAGES[
+    "TestHTTPDemo"
+] = f"{EXPECTED_MODULE}/tests"
 EXPECTED_PACKAGE_PATHS = tuple(
     f"{EXPECTED_MODULE}/{name}" for name in PACKAGES
 )
@@ -203,6 +209,9 @@ SOURCE_MANIFEST_EXPLICIT = (
     "go.mod",
     "go.sum",
     "scripts/check-setup.py",
+    "scripts/check.sh",
+    "scripts/demo.sh",
+    "scripts/release.sh",
     "scripts/check-db-foundation.py",
     "scripts/test_check_db_foundation.py",
     "scripts/ci_checks.py",
