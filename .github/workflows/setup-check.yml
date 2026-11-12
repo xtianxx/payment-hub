@@ -183,7 +183,7 @@ jobs:
             ${{ runner.temp }}/payment-hub-setup/reports/upload/go-default.safe.json
             ${{ runner.temp }}/payment-hub-setup/reports/upload/provenance.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
           include-hidden-files: false
 
   database-foundation:
@@ -330,7 +330,7 @@ jobs:
             ${{ runner.temp }}/payment-hub-db/reports/upload/us3.safe.json
             ${{ runner.temp }}/payment-hub-db/reports/upload/provenance.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
           include-hidden-files: false
 
   vulnerability-check:
@@ -482,7 +482,7 @@ jobs:
             ${{ runner.temp }}/payment-hub-vulnerability/reports/upload/vulnerability.safe.json
             ${{ runner.temp }}/payment-hub-vulnerability/reports/upload/provenance.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
           include-hidden-files: false
 
   ci-gate:

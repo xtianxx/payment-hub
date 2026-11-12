@@ -2,7 +2,7 @@
 """Safe CI contract preflight for the payment-hub workflow.
 
 The preflight is deliberately project-specific and standard-library only.  It
-validates the one approved workflow shape, the source-manifest coverage, the
+validates the two approved workflow shapes, the source-manifest coverage, the
 launcher/default inventory cross-links, and two read-only ``go list`` metadata
 passes.  It never runs tests, starts PostgreSQL/Docker, downloads modules, or
 prints raw tool output.  Unsupported YAML shapes fail closed instead of being
@@ -24,7 +24,9 @@ from typing import Any, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_RELATIVE = Path(".github/workflows/setup-check.yml")
-APPROVED_WORKFLOW_FILES = ("setup-check.yml",)
+CHECK_RELATIVE = Path(".github/workflows/check.yml")
+PUBLISH_RELATIVE = Path(".github/workflows/publish.yml")
+APPROVED_WORKFLOW_FILES = ("check.yml", "publish.yml", "setup-check.yml")
 EXPECTED_MODULE = "payment-hub"
 METADATA_TIMEOUT_SECONDS = 90
 
@@ -104,6 +106,63 @@ EXPECTED_EXPORTS = {
     "database-foundation": "--expect db,cancellation,us1,us2,us3",
     "vulnerability-check": "--expect vulnerability",
 }
+
+CHECK_WORKFLOW_NAME = "Paired image acceptance (linux/amd64)"
+CHECK_JOB_ID = "image-acceptance"
+CHECK_JOB_NAME = "Paired image acceptance (linux/amd64)"
+CHECK_TIMEOUT_MINUTES = 30
+CHECK_TOP_ENV = {**EXPECTED_TOP_ENV, "GOTELEMETRY": "off"}
+CHECK_EXPECTED_ACTION_COUNTS = {CHECKOUT: 1, SETUP_GO: 1, UPLOAD: 1}
+CHECK_UPLOAD_NAME = (
+    "image-acceptance-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}"
+)
+CHECK_UPLOAD_PATHS = (
+    "${{ runner.temp }}/payment-hub-images/artifacts/upload/build-summary.json",
+    "${{ runner.temp }}/payment-hub-images/artifacts/upload/images-summary.json",
+)
+CHECK_BUILDER_SCRIPT = "python3 -B scripts/build-images.py"
+DOWNLOAD = (
+    "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
+)
+PUBLISH_WORKFLOW_NAME = "Manual paired image publish / 人工配对镜像发布"
+PUBLISH_JOBS = ("prepare", "upload")
+PUBLISH_TIMEOUT_MINUTES = 30
+PUBLISH_TOP_ENV = {**EXPECTED_TOP_ENV, "GOTELEMETRY": "off"}
+PUBLISH_EXPECTED_ACTION_PINS = {CHECKOUT, SETUP_GO, UPLOAD, DOWNLOAD}
+PUBLISH_ACTION_COUNTS = {CHECKOUT: 2, SETUP_GO: 2, UPLOAD: 2, DOWNLOAD: 1}
+PUBLISH_INPUT_NAMES = ("publish_authorized", "packages_verified")
+PUBLISH_BUNDLE_PATHS = (
+    "${{ runner.temp }}/payment-hub-release-prepare/bundle/pair.tar",
+    "${{ runner.temp }}/payment-hub-release-prepare/bundle/descriptor.json",
+    "${{ runner.temp }}/payment-hub-release-prepare/bundle/build-record.json",
+    "${{ runner.temp }}/payment-hub-release-prepare/bundle/accepted-images.json",
+)
+PUBLISH_SUMMARY_PATH = (
+    "${{ runner.temp }}/payment-hub-release-publish/release-summary.json"
+)
+PUBLISH_HANDOFF_PATH = (
+    "${{ runner.temp }}/payment-hub-release-prepare/handoff.json"
+)
+PUBLISH_DOWNLOAD_PATH = "${{ runner.temp }}/payment-hub-release-handoff"
+PUBLISH_PREPARE_COMMAND = "bash scripts/release.sh --stage prepare"
+PUBLISH_PUBLISH_COMMAND = "bash scripts/release.sh --stage publish"
+CHECK_FORBIDDEN_TOKENS = (
+    "pull_request_target",
+    "workflow_run",
+    "workflow_dispatch",
+    "workflow_call",
+    "secrets.",
+    "packages: write",
+    "id-token: write",
+    "contents: write",
+    "docker build",
+    "docker push",
+    "docker login",
+    "ghcr.io",
+    "set -x",
+    "printenv",
+    "tee ",
+)
 FORBIDDEN_WORKFLOW_TOKENS = (
     "26 个",
     "38 个",
@@ -236,6 +295,8 @@ def _parse_scalar(key: str, value: str) -> Any:
         "continue-on-error",
         "check-latest",
         "cache",
+        "persist-credentials",
+        "merge-multiple",
     ):
         return _parse_bool(value)
     if key == "needs":
@@ -283,6 +344,52 @@ def _parse_mapping(
     return mapping, index
 
 
+def _parse_workflow_dispatch(
+    lines: list[tuple[int, str, int]], index: int
+) -> tuple[dict[str, Any], int]:
+    result: dict[str, Any] = {}
+    while index < len(lines) and lines[index][0] > 2:
+        indent, content, number = lines[index]
+        if indent != 4:
+            raise ContractError("workflow-syntax")
+        key, value = _split_kv(content, number)
+        if key != "inputs" or value is not None or "inputs" in result:
+            raise ContractError("workflow-syntax")
+        index += 1
+        inputs: dict[str, Any] = {}
+        while index < len(lines) and lines[index][0] > 4:
+            input_indent, input_content, input_number = lines[index]
+            if input_indent != 6:
+                raise ContractError("workflow-syntax")
+            name, input_value = _split_kv(input_content, input_number)
+            if input_value is not None or name in inputs:
+                raise ContractError("workflow-syntax")
+            index += 1
+            body: dict[str, Any] = {}
+            while index < len(lines) and lines[index][0] > 6:
+                body_indent, body_content, body_number = lines[index]
+                if body_indent != 8:
+                    raise ContractError("workflow-syntax")
+                body_key, body_value = _split_kv(body_content, body_number)
+                if body_key in body or body_value is None:
+                    raise ContractError("workflow-syntax")
+                if body_key == "required":
+                    body[body_key] = _parse_bool(body_value)
+                elif body_key == "default":
+                    if body_value in ("true", "false"):
+                        body[body_key] = _parse_bool(body_value)
+                    else:
+                        body[body_key] = _unquote(body_value)
+                elif body_key in ("description", "type"):
+                    body[body_key] = _unquote(body_value)
+                else:
+                    raise ContractError("workflow-syntax")
+                index += 1
+            inputs[name] = body
+        result["inputs"] = inputs
+    return result, index
+
+
 def _parse_on(
     lines: list[tuple[int, str, int]], index: int
 ) -> tuple[dict[str, Any], int]:
@@ -292,6 +399,12 @@ def _parse_on(
         if indent != 2:
             raise ContractError("workflow-syntax")
         event, value = _split_kv(content, number)
+        if event == "workflow_dispatch":
+            if value is not None or event in result:
+                raise ContractError("workflow-syntax")
+            body, index = _parse_workflow_dispatch(lines, index + 1)
+            result[event] = body
+            continue
         if event not in ("push", "pull_request") or value is not None:
             raise ContractError("workflow-syntax")
         if event in result:
@@ -348,7 +461,7 @@ def _parse_step(
                 raise ContractError("workflow-syntax")
             mapping, index = _parse_mapping(lines, index + 1, 10)
             step[key] = mapping
-        elif key in ("shell", "if", "uses", "continue-on-error"):
+        elif key in ("shell", "if", "uses", "continue-on-error", "id"):
             if value is None:
                 raise ContractError("workflow-syntax")
             step[key] = _parse_scalar(key, value)
@@ -382,7 +495,7 @@ def _parse_job(
                 step, index = _parse_step(lines, index)
                 steps.append(step)
             job["steps"] = steps
-        elif key in ("env", "permissions"):
+        elif key in ("env", "permissions", "outputs"):
             if value is not None:
                 raise ContractError("workflow-syntax")
             mapping, index = _parse_mapping(lines, index + 1, 6)
@@ -671,7 +784,7 @@ def validate_workflow(
             add("workflow-upload", job_id)
         if upload.get("with", {}).get("if-no-files-found") != "error":
             add("workflow-upload", job_id)
-        if upload.get("with", {}).get("retention-days") != 14:
+        if upload.get("with", {}).get("retention-days") != 30:
             add("workflow-upload", job_id)
         if upload.get("with", {}).get("include-hidden-files") is not False:
             add("workflow-upload", job_id)
@@ -744,6 +857,723 @@ def validate_workflow(
         add("workflow-forbidden-trigger")
 
     issues.extend(check_workflow_policy(repo))
+    return issues
+
+
+def validate_check_workflow(
+    workflow: dict[str, Any], text: str, repo: Path = REPO_ROOT
+) -> list[ContractIssue]:
+    issues: list[ContractIssue] = []
+
+    def add(kind: str, package: str | None = None) -> None:
+        issues.append(ContractIssue(kind, package))
+
+    if set(workflow) - {"name", "on", "concurrency", "permissions", "env", "jobs"}:
+        add("check-workflow-top-level")
+    if workflow.get("name") != CHECK_WORKFLOW_NAME:
+        add("check-workflow-name")
+    if workflow.get("on") != {
+        "push": {"branches": ["main"]},
+        "pull_request": {"branches": ["main"]},
+    }:
+        add("check-workflow-triggers")
+    if workflow.get("permissions") != {"contents": "read"}:
+        add("check-workflow-permissions")
+    if workflow.get("concurrency") != {
+        "group": CONCURRENCY_GROUP,
+        "cancel-in-progress": False,
+    }:
+        add("check-workflow-concurrency")
+    if workflow.get("env") != CHECK_TOP_ENV:
+        add("check-workflow-env")
+
+    jobs = workflow.get("jobs", {})
+    if tuple(jobs) != (CHECK_JOB_ID,):
+        add("check-workflow-jobs")
+    job = jobs.get(CHECK_JOB_ID)
+    if not isinstance(job, dict):
+        add("check-workflow-jobs", CHECK_JOB_ID)
+        for token in CHECK_FORBIDDEN_TOKENS:
+            if token in text:
+                add("check-forbidden-token")
+        return issues
+
+    if job.get("name") != CHECK_JOB_NAME:
+        add("check-job-name")
+    if job.get("runs-on") != "ubuntu-24.04":
+        add("check-job-runs-on")
+    if job.get("timeout-minutes") != CHECK_TIMEOUT_MINUTES:
+        add("check-job-timeout")
+    if "permissions" in job:
+        add("check-job-permissions")
+    if "needs" in job:
+        add("check-job-needs")
+    if "if" in job:
+        add("check-job-condition")
+    if "env" in job:
+        add("check-job-env")
+
+    steps = job.get("steps", [])
+    expected_steps = (
+        "Isolate image acceptance Go config and caches",
+        "Check out repository",
+        "Set up Go 1.27.4",
+        "Build and accept paired images",
+        "Upload safe image acceptance summaries",
+    )
+    names = [step.get("name") for step in steps]
+    if tuple(names) != expected_steps:
+        add("check-workflow-steps")
+    for step in steps:
+        if "continue-on-error" in step:
+            add("check-continue-on-error")
+
+    uses = [step.get("uses") for step in steps if "uses" in step]
+    if set(uses) != EXPECTED_ACTION_PINS:
+        add("check-action-pins")
+    for pin, count in CHECK_EXPECTED_ACTION_COUNTS.items():
+        if uses.count(pin) != count:
+            add("check-action-pins")
+
+    isolation = _find_step(job, "Isolate image acceptance Go config and caches")
+    if isolation is None:
+        add("check-isolation-missing")
+    else:
+        if isolation.get("shell") != "bash":
+            add("check-isolation-shell")
+        run = isolation.get("run", "")
+        for token in (
+            "set -euo pipefail",
+            "command -v go",
+            "go telemetry off",
+            "GITHUB_ENV",
+            "payment-hub-images",
+            "XDG_CONFIG_HOME",
+            "GOPATH",
+            "GOMODCACHE",
+            "GOCACHE",
+            "TMPDIR",
+        ):
+            if token not in run:
+                add("check-isolation-command")
+        for token in ("set -x", "printenv", "tee ", "env |"):
+            if token in run:
+                add("check-isolation-unsafe")
+
+    checkout = _find_step(job, "Check out repository")
+    if checkout is None:
+        add("check-checkout-missing")
+    else:
+        if checkout.get("uses") != CHECKOUT:
+            add("check-checkout-action")
+        checkout_with = checkout.get("with", {})
+        if checkout_with.get("persist-credentials") is not False:
+            add("check-checkout-credentials")
+        if checkout_with.get("fetch-depth") != "1":
+            add("check-checkout-depth")
+
+    setup_go = _find_step(job, "Set up Go 1.27.4")
+    if setup_go is None:
+        add("check-setup-go-missing")
+    else:
+        if setup_go.get("uses") != SETUP_GO:
+            add("check-setup-go-action")
+        setup_with = setup_go.get("with", {})
+        if setup_with.get("go-version") != "1.27.4":
+            add("check-setup-go-version")
+        if setup_with.get("check-latest") is not False:
+            add("check-setup-go-latest")
+        if setup_with.get("cache") is not False:
+            add("check-setup-go-cache")
+
+    build = _find_step(job, "Build and accept paired images")
+    if build is None:
+        add("check-build-missing")
+    else:
+        if build.get("shell") != "bash":
+            add("check-build-shell")
+        if build.get("env") != {"CGO_ENABLED": "1", "GOMAXPROCS": "2"}:
+            add("check-build-env")
+        run = build.get("run", "")
+        for token in (
+            "set -euo pipefail",
+            CHECK_BUILDER_SCRIPT,
+            '--go "$(command -v go)"',
+            '--cache-dir "$RUNNER_TEMP/payment-hub-images"',
+            '--artifact-root "$RUNNER_TEMP/payment-hub-images/artifacts"',
+            "--prepare-inputs",
+        ):
+            if token not in run:
+                add("check-build-command")
+        for token in (
+            "tee ",
+            "docker build",
+            "docker push",
+            "docker login",
+            "secrets.",
+        ):
+            if token in run:
+                add("check-build-unsafe")
+
+    uploads = [step for step in steps if step.get("uses") == UPLOAD]
+    if len(uploads) != 1:
+        add("check-upload")
+    else:
+        upload = uploads[0]
+        if upload.get("name") != "Upload safe image acceptance summaries":
+            add("check-upload-step")
+        if upload.get("if") != "always()":
+            add("check-upload-condition")
+        upload_with = upload.get("with", {})
+        if upload_with.get("name") != CHECK_UPLOAD_NAME:
+            add("check-upload-name")
+        if upload_with.get("if-no-files-found") != "error":
+            add("check-upload-missing")
+        if upload_with.get("retention-days") != 30:
+            add("check-upload-retention")
+        if upload_with.get("include-hidden-files") is not False:
+            add("check-upload-hidden")
+        paths = _upload_paths(upload)
+        if tuple(paths) != CHECK_UPLOAD_PATHS:
+            add("check-upload-paths")
+        for path in paths:
+            if "*" in path or "?" in path or "[" in path:
+                add("check-upload-wildcard")
+            if not path.endswith(".json"):
+                add("check-upload-paths")
+            if "/artifacts/" in path and "/upload/" not in path:
+                add("check-upload-paths")
+        if set(upload_with) != {
+            "name",
+            "path",
+            "if-no-files-found",
+            "retention-days",
+            "include-hidden-files",
+        }:
+            add("check-upload-with")
+
+    for token in CHECK_FORBIDDEN_TOKENS:
+        if token in text:
+            add("check-forbidden-token")
+    if re.search(r"(?m)^\s*[A-Za-z0-9_-]+:\s*write\s*$", text):
+        add("check-write-permissions")
+    return issues
+
+
+def _publish_inputs_ok(workflow: dict[str, Any]) -> bool:
+    on_value = workflow.get("on")
+    if not isinstance(on_value, dict) or set(on_value) != {"workflow_dispatch"}:
+        return False
+    dispatch = on_value["workflow_dispatch"]
+    if not isinstance(dispatch, dict) or set(dispatch) != {"inputs"}:
+        return False
+    inputs = dispatch["inputs"]
+    if not isinstance(inputs, dict) or set(inputs) != set(PUBLISH_INPUT_NAMES):
+        return False
+    for name in PUBLISH_INPUT_NAMES:
+        body = inputs.get(name)
+        if not isinstance(body, dict):
+            return False
+        if set(body) != {"description", "required", "default", "type"}:
+            return False
+        if body.get("required") is not True or body.get("default") is not False:
+            return False
+        if body.get("type") != "boolean":
+            return False
+        description = body.get("description")
+        if not isinstance(description, str) or not description.strip():
+            return False
+    return True
+
+
+def validate_publish_workflow(
+    workflow: dict[str, Any], text: str, repo: Path = REPO_ROOT
+) -> list[ContractIssue]:
+    issues: list[ContractIssue] = []
+
+    def add(kind: str, package: str | None = None) -> None:
+        issues.append(ContractIssue(kind, package))
+
+    if set(workflow) - {"name", "on", "concurrency", "permissions", "env", "jobs"}:
+        add("publish-workflow-top-level")
+    if workflow.get("name") != PUBLISH_WORKFLOW_NAME:
+        add("publish-workflow-name")
+    if not _publish_inputs_ok(workflow):
+        add("publish-workflow-trigger-inputs")
+    if workflow.get("permissions") != {"contents": "read"}:
+        add("publish-workflow-permissions")
+    if workflow.get("concurrency") != {
+        "group": "${{ github.workflow }}-${{ github.ref }}",
+        "cancel-in-progress": False,
+    }:
+        add("publish-workflow-concurrency")
+    if workflow.get("env") != PUBLISH_TOP_ENV:
+        add("publish-workflow-env")
+
+    jobs = workflow.get("jobs", {})
+    if tuple(jobs) != PUBLISH_JOBS:
+        add("publish-workflow-jobs")
+    prepare = jobs.get("prepare")
+    upload = jobs.get("upload")
+    if not isinstance(prepare, dict):
+        add("publish-workflow-jobs", "prepare")
+    if not isinstance(upload, dict):
+        add("publish-workflow-jobs", "upload")
+
+    uses = [
+        step.get("uses")
+        for job in jobs.values()
+        if isinstance(job, dict)
+        for step in job.get("steps", [])
+        if "uses" in step
+    ]
+    if set(uses) != PUBLISH_EXPECTED_ACTION_PINS:
+        add("publish-action-pins")
+    for pin, count in PUBLISH_ACTION_COUNTS.items():
+        if uses.count(pin) != count:
+            add("publish-action-pins")
+
+    if isinstance(prepare, dict):
+        if prepare.get("name") != "Prepare release handoff (linux/amd64)":
+            add("publish-prepare-name")
+        if prepare.get("runs-on") != "ubuntu-24.04":
+            add("publish-prepare-runs-on")
+        if prepare.get("timeout-minutes") != PUBLISH_TIMEOUT_MINUTES:
+            add("publish-prepare-timeout")
+        if "permissions" in prepare:
+            add("publish-prepare-permissions")
+        if "needs" in prepare:
+            add("publish-prepare-needs")
+        if "if" in prepare:
+            add("publish-prepare-condition")
+        if prepare.get("outputs") != {
+            "artifact_id": "${{ steps.bundle.outputs.artifact-id }}",
+            "artifact_digest": "${{ steps.bundle.outputs.artifact-digest }}",
+            "source_sha": "${{ steps.handoff.outputs.source_sha }}",
+            "descriptor_sha256": "${{ steps.handoff.outputs.descriptor_sha256 }}",
+        }:
+            add("publish-prepare-outputs")
+        names = _step_names(prepare)
+        if tuple(names) != (
+            "Verify manual publish preconditions",
+            "Isolate release Go config and caches",
+            "Check out repository",
+            "Set up Go 1.27.4",
+            "Prepare release handoff",
+            "Read trusted prepare outputs",
+            "Upload release bundle",
+        ):
+            add("publish-prepare-steps")
+        gate = _find_step(prepare, "Verify manual publish preconditions")
+        if gate is None:
+            add("publish-prepare-gate-missing")
+        else:
+            if gate.get("shell") != "bash":
+                add("publish-prepare-gate-shell")
+            if "if" in gate or "continue-on-error" in gate:
+                add("publish-prepare-gate-skip")
+            if gate.get("env") != {
+                "SOURCE_SHA": "${{ github.sha }}",
+                "EVENT_NAME": "${{ github.event_name }}",
+                "REF_NAME": "${{ github.ref }}",
+                "REPOSITORY": "${{ github.repository }}",
+                "PUBLISH_AUTHORIZED": "${{ inputs.publish_authorized }}",
+                "PACKAGES_VERIFIED": "${{ inputs.packages_verified }}",
+            }:
+                add("publish-prepare-gate-env")
+            run = gate.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                'if [[ "$EVENT_NAME" != "workflow_dispatch" ]]',
+                'if [[ "$REF_NAME" != "refs/heads/main" ]]',
+                'if [[ "$REPOSITORY" != "xtianxx/payment-hub" ]]',
+                'if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]',
+                'if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]',
+                "exit 1",
+            ):
+                if token not in run:
+                    add("publish-prepare-gate-run")
+        isolation = _find_step(prepare, "Isolate release Go config and caches")
+        if isolation is None:
+            add("publish-prepare-isolation-missing")
+        else:
+            if isolation.get("shell") != "bash":
+                add("publish-prepare-isolation-shell")
+            run = isolation.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                "command -v go",
+                "go telemetry off",
+                "GITHUB_ENV",
+                "payment-hub-release-cache",
+                "XDG_CONFIG_HOME",
+                "GOPATH",
+                "GOMODCACHE",
+                "GOCACHE",
+                "TMPDIR",
+            ):
+                if token not in run:
+                    add("publish-prepare-isolation-command")
+            for token in ("set -x", "printenv", "tee ", "env |"):
+                if token in run:
+                    add("publish-prepare-isolation-unsafe")
+        checkout = _find_step(prepare, "Check out repository")
+        if checkout is None:
+            add("publish-prepare-checkout-missing")
+        else:
+            if checkout.get("uses") != CHECKOUT:
+                add("publish-prepare-checkout-action")
+            checkout_with = checkout.get("with", {})
+            if checkout_with.get("ref") != "${{ github.sha }}":
+                add("publish-prepare-checkout-ref")
+            if checkout_with.get("persist-credentials") is not False:
+                add("publish-prepare-checkout-credentials")
+            if checkout_with.get("fetch-depth") != "1":
+                add("publish-prepare-checkout-depth")
+        setup_go = _find_step(prepare, "Set up Go 1.27.4")
+        if setup_go is None:
+            add("publish-prepare-setup-go-missing")
+        else:
+            if setup_go.get("uses") != SETUP_GO:
+                add("publish-prepare-setup-go-action")
+            setup_with = setup_go.get("with", {})
+            if setup_with.get("go-version") != "1.27.4":
+                add("publish-prepare-setup-go-version")
+            if setup_with.get("check-latest") is not False:
+                add("publish-prepare-setup-go-latest")
+            if setup_with.get("cache") is not False:
+                add("publish-prepare-setup-go-cache")
+        prepare_step = _find_step(prepare, "Prepare release handoff")
+        if prepare_step is None:
+            add("publish-prepare-command-missing")
+        else:
+            if prepare_step.get("shell") != "bash":
+                add("publish-prepare-command-shell")
+            if prepare_step.get("env") != {"SOURCE_SHA": "${{ github.sha }}"}:
+                add("publish-prepare-command-env")
+            run = prepare_step.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                PUBLISH_PREPARE_COMMAND,
+                '--source-sha "$SOURCE_SHA"',
+                '--go "$(command -v go)"',
+                '--cache-dir "$RUNNER_TEMP/payment-hub-release-cache"',
+                '--artifact-root "$RUNNER_TEMP/payment-hub-release-prepare"',
+                "--prepare-inputs",
+            ):
+                if token not in run:
+                    add("publish-prepare-command-run")
+            for token in ("GITHUB_TOKEN", "secrets.", "docker build", "docker save"):
+                if token in run:
+                    add("publish-prepare-command-unsafe")
+        handoff = _find_step(prepare, "Read trusted prepare outputs")
+        if handoff is None:
+            add("publish-prepare-handoff-missing")
+        else:
+            if handoff.get("id") != "handoff":
+                add("publish-prepare-handoff-id")
+            run = handoff.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                "handoff.json",
+                "GITHUB_OUTPUT",
+                "source_sha",
+                "descriptor_sha256",
+                "40",
+                "64",
+            ):
+                if token not in run:
+                    add("publish-prepare-handoff-run")
+            if "GITHUB_TOKEN" in run or "secrets." in run:
+                add("publish-prepare-handoff-unsafe")
+        bundle = _find_step(prepare, "Upload release bundle")
+        if bundle is None:
+            add("publish-bundle-upload-missing")
+        else:
+            if bundle.get("id") != "bundle":
+                add("publish-bundle-upload-id")
+            if bundle.get("uses") != UPLOAD:
+                add("publish-bundle-upload-action")
+            if "if" in bundle:
+                add("publish-bundle-upload-condition")
+            bundle_with = bundle.get("with", {})
+            if bundle_with.get("name") != (
+                "release-bundle-${{ github.run_id }}-${{ github.run_attempt }}"
+            ):
+                add("publish-bundle-upload-name")
+            if bundle_with.get("if-no-files-found") != "error":
+                add("publish-bundle-upload-missing-policy")
+            if bundle_with.get("retention-days") != 30:
+                add("publish-bundle-upload-retention")
+            if bundle_with.get("include-hidden-files") is not False:
+                add("publish-bundle-upload-hidden")
+            paths = _upload_paths(bundle)
+            if tuple(paths) != PUBLISH_BUNDLE_PATHS:
+                add("publish-bundle-upload-paths")
+            for path in paths:
+                if "*" in path or "?" in path or "[" in path:
+                    add("publish-bundle-upload-wildcard")
+                if not path.startswith(
+                    "${{ runner.temp }}/payment-hub-release-prepare/bundle/"
+                ):
+                    add("publish-bundle-upload-paths")
+
+    if isinstance(upload, dict):
+        if upload.get("name") != "Publish paired images (linux/amd64)":
+            add("publish-upload-name")
+        if upload.get("runs-on") != "ubuntu-24.04":
+            add("publish-upload-runs-on")
+        if upload.get("timeout-minutes") != PUBLISH_TIMEOUT_MINUTES:
+            add("publish-upload-timeout")
+        if upload.get("needs") != "prepare":
+            add("publish-upload-needs")
+        if upload.get("permissions") != {
+            "contents": "read",
+            "packages": "write",
+        }:
+            add("publish-upload-permissions")
+        if "if" in upload:
+            add("publish-upload-condition")
+        names = _step_names(upload)
+        if tuple(names) != (
+            "Verify release handoff identity",
+            "Isolate release Go config and caches",
+            "Check out repository",
+            "Set up Go 1.27.4",
+            "Prepare handoff download directory",
+            "Download release bundle",
+            "Restrict handoff bundle permissions",
+            "Publish paired images",
+            "Upload release summary",
+        ):
+            add("publish-upload-steps")
+        gate = _find_step(upload, "Verify release handoff identity")
+        if gate is None:
+            add("publish-upload-gate-missing")
+        else:
+            if gate.get("shell") != "bash":
+                add("publish-upload-gate-shell")
+            if "if" in gate or "continue-on-error" in gate:
+                add("publish-upload-gate-skip")
+            if gate.get("env") != {
+                "SOURCE_SHA": "${{ github.sha }}",
+                "PREPARED_SHA": "${{ needs.prepare.outputs.source_sha }}",
+                "EXPECTED_DESCRIPTOR_SHA": (
+                    "${{ needs.prepare.outputs.descriptor_sha256 }}"
+                ),
+            }:
+                add("publish-upload-gate-env")
+            run = gate.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                'if [[ "$PREPARED_SHA" != "$SOURCE_SHA" ]]',
+                'if [[ ! "$EXPECTED_DESCRIPTOR_SHA" =~ ^[0-9a-f]{64}$ ]]',
+                "exit 1",
+            ):
+                if token not in run:
+                    add("publish-upload-gate-run")
+        isolation = _find_step(upload, "Isolate release Go config and caches")
+        if isolation is None:
+            add("publish-upload-isolation-missing")
+        else:
+            if isolation.get("shell") != "bash":
+                add("publish-upload-isolation-shell")
+            run = isolation.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                "command -v go",
+                "go telemetry off",
+                "GITHUB_ENV",
+                "payment-hub-release-cache",
+                "XDG_CONFIG_HOME",
+                "GOPATH",
+                "GOMODCACHE",
+                "GOCACHE",
+                "TMPDIR",
+            ):
+                if token not in run:
+                    add("publish-upload-isolation-command")
+            for token in ("set -x", "printenv", "tee ", "env |"):
+                if token in run:
+                    add("publish-upload-isolation-unsafe")
+        checkout = _find_step(upload, "Check out repository")
+        if checkout is None:
+            add("publish-upload-checkout-missing")
+        else:
+            if checkout.get("uses") != CHECKOUT:
+                add("publish-upload-checkout-action")
+            checkout_with = checkout.get("with", {})
+            if checkout_with.get("ref") != "${{ github.sha }}":
+                add("publish-upload-checkout-ref")
+            if checkout_with.get("persist-credentials") is not False:
+                add("publish-upload-checkout-credentials")
+            if checkout_with.get("fetch-depth") != "1":
+                add("publish-upload-checkout-depth")
+        setup_go = _find_step(upload, "Set up Go 1.27.4")
+        if setup_go is None:
+            add("publish-upload-setup-go-missing")
+        else:
+            if setup_go.get("uses") != SETUP_GO:
+                add("publish-upload-setup-go-action")
+            setup_with = setup_go.get("with", {})
+            if setup_with.get("go-version") != "1.27.4":
+                add("publish-upload-setup-go-version")
+            if setup_with.get("check-latest") is not False:
+                add("publish-upload-setup-go-latest")
+            if setup_with.get("cache") is not False:
+                add("publish-upload-setup-go-cache")
+        download_dir = _find_step(upload, "Prepare handoff download directory")
+        if download_dir is None:
+            add("publish-download-dir-missing")
+        else:
+            run = download_dir.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                "install -d -m 0700",
+                "payment-hub-release-handoff",
+            ):
+                if token not in run:
+                    add("publish-download-dir-run")
+        download = _find_step(upload, "Download release bundle")
+        if download is None:
+            add("publish-download-missing")
+        else:
+            if download.get("uses") != DOWNLOAD:
+                add("publish-download-action")
+            download_with = download.get("with", {})
+            if set(download_with) != {
+                "artifact-ids",
+                "path",
+                "merge-multiple",
+                "digest-mismatch",
+            }:
+                add("publish-download-with")
+            if download_with.get("artifact-ids") != (
+                "${{ needs.prepare.outputs.artifact_id }}"
+            ):
+                add("publish-download-artifact-id")
+            if download_with.get("path") != PUBLISH_DOWNLOAD_PATH:
+                add("publish-download-path")
+            if download_with.get("merge-multiple") is not True:
+                add("publish-download-merge")
+            if download_with.get("digest-mismatch") != "error":
+                add("publish-download-digest")
+        restrict = _find_step(upload, "Restrict handoff bundle permissions")
+        if restrict is None:
+            add("publish-handoff-permissions-missing")
+        else:
+            run = restrict.get("run", "")
+            if "chmod 0600" not in run:
+                add("publish-handoff-permissions-run")
+            for name in (
+                "pair.tar",
+                "descriptor.json",
+                "build-record.json",
+                "accepted-images.json",
+            ):
+                if name not in run:
+                    add("publish-handoff-permissions-run")
+        publish_step = _find_step(upload, "Publish paired images")
+        if publish_step is None:
+            add("publish-command-missing")
+        else:
+            if publish_step.get("shell") != "bash":
+                add("publish-command-shell")
+            if publish_step.get("env") != {
+                "SOURCE_SHA": "${{ github.sha }}",
+                "EXPECTED_DESCRIPTOR_SHA": (
+                    "${{ needs.prepare.outputs.descriptor_sha256 }}"
+                ),
+                "GITHUB_TOKEN": "${{ github.token }}",
+            }:
+                add("publish-command-env")
+            run = publish_step.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                PUBLISH_PUBLISH_COMMAND,
+                '--source-sha "$SOURCE_SHA"',
+                '--go "$(command -v go)"',
+                '--cache-dir "$RUNNER_TEMP/payment-hub-release-cache"',
+                '--artifact-root "$RUNNER_TEMP/payment-hub-release-publish"',
+                '--bundle-dir "$RUNNER_TEMP/payment-hub-release-handoff"',
+                '--expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA"',
+                "--approve-external",
+                "--package-preconditions-verified",
+                "--prepare-inputs",
+            ):
+                if token not in run:
+                    add("publish-command-run")
+            for token in (
+                "secrets.",
+                "docker push",
+                "docker login",
+                "docker build",
+                "ghcr.io",
+                "cosign",
+                "attest",
+                "deploy",
+            ):
+                if token in run:
+                    add("publish-command-unsafe")
+        summary = _find_step(upload, "Upload release summary")
+        if summary is None:
+            add("publish-summary-upload-missing")
+        else:
+            if summary.get("if") != "always()":
+                add("publish-summary-upload-condition")
+            if summary.get("uses") != UPLOAD:
+                add("publish-summary-upload-action")
+            summary_with = summary.get("with", {})
+            if summary_with.get("name") != (
+                "release-summary-${{ github.run_id }}-${{ github.run_attempt }}"
+            ):
+                add("publish-summary-upload-name")
+            if summary_with.get("if-no-files-found") != "error":
+                add("publish-summary-upload-missing-policy")
+            if summary_with.get("retention-days") != 30:
+                add("publish-summary-upload-retention")
+            if summary_with.get("include-hidden-files") is not False:
+                add("publish-summary-upload-hidden")
+            paths = _upload_paths(summary)
+            if tuple(paths) != (PUBLISH_SUMMARY_PATH,):
+                add("publish-summary-upload-paths")
+            for path in paths:
+                if "*" in path or "?" in path or "[" in path:
+                    add("publish-summary-upload-wildcard")
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if "GITHUB_TOKEN" in job.get("env", {}):
+            add("publish-token-location")
+        for step in job.get("steps", []):
+            if "continue-on-error" in step:
+                add("publish-continue-on-error")
+            if "GITHUB_TOKEN" in step.get("env", {}):
+                if job_id != "upload" or step.get("name") != "Publish paired images":
+                    add("publish-token-location")
+            if step.get("uses") == DOWNLOAD and job_id != "upload":
+                add("publish-download-location")
+    if "GITHUB_TOKEN" in workflow.get("env", {}):
+        add("publish-token-location")
+
+    for token in (
+        "pull_request_target",
+        "workflow_run",
+        "workflow_call",
+        "secrets.",
+        "id-token",
+        "attestations",
+        "contents: write",
+        "actions: read",
+        "ghcr.io",
+        "docker push",
+        "docker login",
+        "docker build",
+        "cosign",
+        "environment:",
+    ):
+        if token in text:
+            add("publish-forbidden-token")
     return issues
 
 
@@ -1085,11 +1915,15 @@ def check_all(go: str, repo: Path = REPO_ROOT) -> list[ContractIssue]:
     issues: list[ContractIssue] = []
     issues.extend(check_binding_inventory())
     issues.extend(check_manifest_coverage(repo))
-    try:
-        workflow, text = load_workflow(repo / WORKFLOW_RELATIVE)
-        issues.extend(validate_workflow(workflow, text, repo))
-    except ContractError as exc:
-        issues.append(ContractIssue(exc.kind))
+    for relative, validator in (
+        (WORKFLOW_RELATIVE, validate_workflow),
+        (CHECK_RELATIVE, validate_check_workflow),
+    ):
+        try:
+            workflow, text = load_workflow(repo / relative)
+            issues.extend(validator(workflow, text, repo))
+        except ContractError as exc:
+            issues.append(ContractIssue(exc.kind))
     if issues:
         return issues
     default_output = run_go_list(go, repo)
