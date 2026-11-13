@@ -1,6 +1,26 @@
 # 本地镜像与受控发布
 
-## 当前状态（2026-11-12）
+## 发布环境修复（2026-11-13）
+
+真实Actions运行`43371460609`的prepare job在`Prepare release handoff`失败，日志为`image/descriptor-missing`，后续上传job跳过。失败发生在构建后的镜像身份检查，不是GHCR认证失败；没有产生成功发布结论。下方2026-11-12记录保留为历史证据，不再代表Actions从未运行。
+
+本次修复为prepare和upload两个job配置相同的独立Docker daemon，固定Engine **29.9.3**并显式启用containerd image store；不依赖runner预装Docker的版本或存储默认值。官方setup action固定commit，显式不传GitHub token；匿名版本元数据请求仍可能受限流影响，失败时停止，不借用发布凭据重试。原有OCI index、归档和镜像身份校验保持不变，不用缺少`Descriptor`时降级为其他摘要来绕过门禁。
+
+环境检查在耗时构建/导入前核对版本、存储类型和daemon身份，并验证临时空`DOCKER_CONFIG`仍连接同一daemon。必须保留`set-host: true`导出的`DOCKER_HOST`：publish会切换到隔离认证目录，仅设置Docker context不足以维持连接。
+
+29.9.3是本次固定的安全补丁版本；历史本地save/load证据来自29.6.1，不能冒称29.9.3已经通过真实往返验证。本次本地合同/回归检查不等于修复已在GitHub runner生效，也不证明GHCR上传与按digest拉回成功；真实工作流复验仍待修复提交后另行授权。本次不自动提交、推送、重跑工作流或发布。
+
+### 合并前预检与正式发布的分工
+
+`check.yml`在目标为main的PR及push main时自动运行：先构建并验收原始配对镜像，再调用`check-image-handoff.py`验证save、归档结构、导入前缺席、load后镜像内容身份保持。它与发布使用相同固定Docker环境，不登录GHCR、不申请包写权限、不上传镜像归档，也不将PR产物标记为已批准发布。为避免load命中现存镜像而产生假阳性，仅允许在显式隔离的临时daemon内移除本次无共享引用、无容器使用的配对镜像，禁止影响普通本地daemon及无关资源。
+
+`publish.yml`仍为main人工发布。prepare开始耗时工作前，以及upload真正发布入口之前，`check-main-ci.py`查询同一源码SHA的两个必要工作流：`setup-check.yml`、`check.yml`。按工作流路径识别，只接受该SHA最新push/main运行的成功结果；旧成功不能掩盖最新失败、取消或运行中状态。查询失败、没有匹配运行或权限不足都停止，不降级为人工勾选通过。查询步骤只读使用`GITHUB_TOKEN`，各发布job增加`actions: read`；包写权限仍只属于upload job，凭据不写摘要。
+
+建议顺序：修复分支开PR → 两项自动工作流通过 → 合并main → 对合并后SHA的两项工作流通过 → 核实包权限并人工发布。PR绿灯不能代替main合并提交绿灯；发布门禁不会自动等待、重跑CI或改变远端规则。
+
+本轮只读确认main已有active ruleset，但未设置必需状态检查。管理员仍需单独配置`CI gate`与`Paired image acceptance (linux/amd64)`为必需检查；本次未修改远端规则。配置后的正式Actions执行、29.9.3真实归档往返、跨job交接及GHCR全链验证仍分别保留证据，不以本地fake测试替代。
+
+## 历史本地状态（2026-11-12）
 
 交付审查后，发布委派清理与工具timeout分类另行修复；其最新范围接受以`artifacts/phase6/delivery-review-fixes/acceptance.json`为准，不由下方历史正常路径绿灯替代。此次脚本变更会使旧全仓库镜像清单失配，未自动重构建或重贴旧镜像。受控进程测试与真实GHCR发布仍是不同证据，外部操作继续未授权/未验证。
 

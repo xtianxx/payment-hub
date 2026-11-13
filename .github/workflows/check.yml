@@ -72,6 +72,41 @@ jobs:
           check-latest: false
           cache: false
 
+      - name: Set up Docker 29.9.3 with containerd image store
+        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
+        with:
+          version: v29.9.3
+          context: payment-hub-check
+          set-host: true
+          runtime-basedir: ${{ runner.temp }}/payment-hub-docker
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+          github-token: ""
+
+      - name: Verify Docker image store
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DOCKER_HOST:-}" ]]; then
+            echo "::error::DOCKER_HOST is not set; DOCKER_CONFIG overrides would bypass the dedicated daemon"
+            exit 1
+          fi
+          if [[ "$(docker version --format '{{.Server.Version}}')" != "29.9.3" ]]; then
+            echo "::error::unexpected Docker server version"
+            exit 1
+          fi
+          driver_status="$(docker info --format '{{range .DriverStatus}}{{index . 0}}={{index . 1}}{{"\n"}}{{end}}')"
+          if ! grep -Fxq 'driver-type=io.containerd.snapshotter.v1' <<<"$driver_status"; then
+            echo "::error::Docker image store is not the containerd snapshotter"
+            exit 1
+          fi
+          daemon_id="$(docker info --format '{{.ID}}')"
+          auth_dir="$(mktemp -d)"
+          trap 'rm -rf "$auth_dir"' EXIT
+          if [[ "$(DOCKER_CONFIG="$auth_dir" docker info --format '{{.ID}}')" != "$daemon_id" ]]; then
+            echo "::error::empty DOCKER_CONFIG reaches a different Docker daemon"
+            exit 1
+          fi
+
       - name: Build and accept paired images
         shell: bash
         env:
@@ -85,6 +120,12 @@ jobs:
             --artifact-root "$RUNNER_TEMP/payment-hub-images/artifacts" \
             --prepare-inputs
 
+      - name: Verify image handoff without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/check-image-handoff.py --build-root "$RUNNER_TEMP/payment-hub-images/artifacts" --artifact-root "$RUNNER_TEMP/payment-hub-handoff-preflight" --isolated-daemon
+
       - name: Upload safe image acceptance summaries
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -93,6 +134,7 @@ jobs:
           path: |
             ${{ runner.temp }}/payment-hub-images/artifacts/upload/build-summary.json
             ${{ runner.temp }}/payment-hub-images/artifacts/upload/images-summary.json
+            ${{ runner.temp }}/payment-hub-images/artifacts/upload/handoff-preflight.safe.json
           if-no-files-found: error
           retention-days: 30
           include-hidden-files: false
