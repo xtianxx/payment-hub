@@ -7,9 +7,11 @@ on:
   pull_request:
     branches:
       - main
+  schedule:
+    - cron: '17 2 * * *'
 
 concurrency:
-  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-daily' || '' }}"
   cancel-in-progress: false
 
 permissions:
@@ -25,6 +27,7 @@ env:
 jobs:
   setup-check:
     name: Setup and foundation units (linux/amd64)
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -487,7 +490,7 @@ jobs:
 
   ci-gate:
     name: CI gate
-    if: ${{ always() }}
+    if: ${{ always() && github.event_name != 'schedule' }}
     needs: [setup-check, database-foundation, vulnerability-check]
     runs-on: ubuntu-24.04
     timeout-minutes: 1

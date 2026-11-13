@@ -510,17 +510,21 @@ builder各构建一次配对镜像并验收原产物，不认证、上传或部�
 
 **失败诊断与兼容性边界**：`TestApplicationLifecycleIntegration`包含真实二进制缺迁移、启动timeout/cancel/listen失败的停止及脱敏诊断断言，历史fresh PG证据已存在，当前树仍需复验。镜像迁移命令失败后的停止/清理目前有受控runner回归，不冒称已做真实镜像故障实验。遇迁移或启动失败应停止，保存固定分类并收割本次进程，再单独核对本轮资源归属；不清演示卷、不自动重付。当前镜像核对schema版本1/2/3及源码身份，只能证明当前配对适配；没有旧版本镜像兼容实验，不能宣称旧镜像可直接使用新schema。旧构建记录与当前源码失配应拒绝，而不是放宽检查。
 
-### 工作流职责与运行时机（2026-11-13修订）
+### 工作流职责与运行时机（2026-11-14修订）
 
-本轮仍保留三个工作流，不新增手动PR检查、不将正式发布搬到PR。以下为修复分支的配置，提交、推送与真实Actions复验前，不代表远端已经生效。
+仍保留三个工作流，不新增手动PR检查、不将正式发布搬到PR。交接预检与发布门禁已随PR #10合并；本次每日漏洞扫描配置仍在`ci/daily-vulnerability-scan`分支，合并main前不会启用定时任务。
 
 | 工作流 | 用途 | 运行时机 | 权限与边界 |
 |---|---|---|---|
-| `setup-check.yml` | 格式/静态、单元/race、真实数据库集成、取消清理、漏洞扫描，最后由`CI gate`汇总 | 目标分支为main的PR创建/更新；push main | `contents: read`；保持原有检查不变 |
-| `check.yml` | 同一对镜像构建一次、验收，再做真实save/load内容身份交接预检 | 同上，合并前验证，合并main后再验证 | `contents: read`；无GHCR登录、上传或部署 |
+| `setup-check.yml` | PR/main运行全部基础门禁；每日定时仅运行漏洞扫描 | 目标分支为main的PR创建/更新；push main；每日02:17 UTC（北京时间10:17） | `contents: read`；PR/main原有检查不变，定时跳过setup、数据库与`CI gate` |
+| `check.yml` | 同一对镜像构建一次、验收，再做真实save/load内容身份交接预检 | 目标分支为main的PR创建/更新；push main，不参与每日扫描 | `contents: read`；无GHCR登录、上传或部署 |
 | `publish.yml` | 检查当前main提交的必要CI成功，再受控构建、交接、上传与按摘要拉回复验 | 仅main的人工触发，仍需两项发布确认 | CI查询增加`actions: read`；仅upload job有`packages: write`；不自动部署 |
 
-仅推送功能分支而未创建目标为main的PR，不触发前两项。`pull_request.branches: main`限制的是PR目标，不是源分支。没有新增定时扫描、tag发布或merge queue触发。
+仅推送功能分支而未创建目标为main的PR，不触发前两项。`pull_request.branches: main`限制的是PR目标，不是源分支。每日扫描只在默认分支main最新提交上运行；不增加tag发布或merge queue触发。
+
+每日任务复用现有`Vulnerability scan (linux/amd64, read-only)`作业和固定govulncheck v1.9.0，按source/symbol模式扫描所有Go包，包含integration标签与测试代码；不会每天执行数据库、构建镜像或发布。发现可达漏洞或扫描工具/网络失败均为失败，不吞错；只上传现有白名单安全报告，保留30天。测试代码可达不等于生产暴露，需结合报告判断。定时任务使用独立并发组，不替换main检查的待运行任务。
+
+GitHub定时调度为尽力运行，可能延迟，高负载时甚至丢弃待运行任务；10:17不是准点保证。可在Actions的`Setup and unit checks / 准备与单元检查`中查看事件为`schedule`的运行，只有漏洞作业实际执行，其余作业应为skipped。公开仓库连续60天无活动可能自动禁用定时任务；当前为私有仓库，仍需留意工作流禁用状态。每日扫描结果不会替代发布所需的同SHA push/main成功记录，也不会自动创建修复、升级依赖或发布。
 
 镜像预检与发布统一固定Docker 29.9.3/containerd环境。预检只消费本次builder已验收的配对产物，不重构建；在本次临时daemon中确认镜像无额外共享引用、无容器使用后，仅移除本次配对镜像，再确认缺席、从归档导入并核对内容身份。普通本地daemon禁止执行此移除路径；不prune、不清理无关镜像或卷。交接归档仅临时保存，CI只上传白名单安全摘要。这能验证本地归档往返，不等于跨job artifact传递、GHCR上传或真实渠道验证。
 

@@ -192,21 +192,30 @@ class WorkflowContractTests(unittest.TestCase):
         )
         self.assertNotIn("needs", _job(self.workflow, "vulnerability-check"))
 
-    def test_triggers_are_only_push_and_pull_request_to_main(self):
+    def test_triggers_are_push_pull_request_and_daily_schedule_to_main(self):
         self.assertEqual(
             self.workflow.get("on", {}),
             {
                 "push": {"branches": ["main"]},
                 "pull_request": {"branches": ["main"]},
+                "schedule": [{"cron": "17 2 * * *"}],
             },
+        )
+        self.assertEqual(
+            self.workflow["on"]["schedule"],
+            [{"cron": MOD.SETUP_SCHEDULE_CRON}],
         )
 
     def test_no_paths_filter_or_workflow_dispatch(self):
-        for event, value in self.workflow.get("on", {}).items():
+        for event in ("push", "pull_request"):
+            value = self.workflow.get("on", {}).get(event, {})
             with self.subTest(event=event):
                 self.assertEqual(tuple(value), ("branches",))
                 self.assertNotIn("paths", value)
                 self.assertNotIn("paths-ignore", value)
+        schedule = self.workflow.get("on", {}).get("schedule", [])
+        self.assertEqual(len(schedule), 1)
+        self.assertEqual(tuple(schedule[0]), ("cron",))
         self.assertNotIn("workflow_dispatch", self.text)
         self.assertNotIn("workflow_call", self.text)
 
@@ -224,7 +233,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(
             self.workflow.get("concurrency", {}).get("group"),
             "${{ github.workflow }}-${{ github.event.pull_request.number "
-            "|| github.ref }}",
+            "|| github.ref }}${{ github.event_name == 'schedule' && '-daily' "
+            "|| '' }}",
         )
         self.assertIs(
             self.workflow.get("concurrency", {}).get("cancel-in-progress"),
@@ -436,7 +446,9 @@ class WorkflowContractTests(unittest.TestCase):
         gate = _job(self.workflow, "ci-gate")
         self.assertEqual(gate["name"], "CI gate")
         self.assertEqual(gate["runs-on"], "ubuntu-24.04")
-        self.assertEqual(gate["if"], "${{ always() }}")
+        self.assertEqual(
+            gate["if"], "${{ always() && github.event_name != 'schedule' }}"
+        )
         self.assertEqual(
             set(gate["needs"]),
             {"setup-check", "database-foundation", "vulnerability-check"},
@@ -445,8 +457,80 @@ class WorkflowContractTests(unittest.TestCase):
             set(gate["needs"]),
             set(self.workflow.get("jobs", {})) - {"ci-gate"},
         )
-        for job_id in ("setup-check", "database-foundation", "vulnerability-check"):
+        self.assertEqual(
+            _job(self.workflow, "setup-check")["if"],
+            "${{ github.event_name != 'schedule' }}",
+        )
+        for job_id in ("database-foundation", "vulnerability-check"):
             self.assertNotIn("if", _job(self.workflow, job_id))
+
+    def test_schedule_runs_only_vulnerability_scan(self):
+        setup = _job(self.workflow, "setup-check")
+        database = _job(self.workflow, "database-foundation")
+        vulnerability = _job(self.workflow, "vulnerability-check")
+        gate = _job(self.workflow, "ci-gate")
+        self.assertEqual(
+            setup["if"], "${{ github.event_name != 'schedule' }}"
+        )
+        self.assertEqual(database["needs"], "setup-check")
+        self.assertNotIn("if", database)
+        self.assertNotIn("needs", vulnerability)
+        self.assertNotIn("if", vulnerability)
+        self.assertNotIn("continue-on-error", vulnerability)
+        self.assertEqual(
+            gate["if"], "${{ always() && github.event_name != 'schedule' }}"
+        )
+
+    @staticmethod
+    def _guard_allows(expression, event_name):
+        if expression is None:
+            return True
+        match = re.fullmatch(r"\$\{\{ (.*) \}\}", expression)
+        if match is None:
+            raise AssertionError(f"unsupported guard expression: {expression}")
+        body = match.group(1)
+        if body == "always()":
+            return True
+        if body == "github.event_name != 'schedule'":
+            return event_name != "schedule"
+        if body == "always() && github.event_name != 'schedule'":
+            return event_name != "schedule"
+        raise AssertionError(f"unsupported guard expression: {expression}")
+
+    def test_event_matrix_keeps_all_checks_on_push_and_only_scan_on_schedule(self):
+        jobs = self.workflow.get("jobs", {})
+        expected = {
+            "push": {
+                "setup-check": True,
+                "database-foundation": True,
+                "vulnerability-check": True,
+                "ci-gate": True,
+            },
+            "pull_request": {
+                "setup-check": True,
+                "database-foundation": True,
+                "vulnerability-check": True,
+                "ci-gate": True,
+            },
+            "schedule": {
+                "setup-check": False,
+                "database-foundation": False,
+                "vulnerability-check": True,
+                "ci-gate": False,
+            },
+        }
+        for event_name, expected_runs in expected.items():
+            executed = {}
+            for job_id, job in jobs.items():
+                runs = self._guard_allows(job.get("if"), event_name)
+                if runs and "needs" in job:
+                    needs = job["needs"]
+                    if isinstance(needs, str):
+                        needs = [needs]
+                    runs = all(executed.get(item) for item in needs)
+                executed[job_id] = runs
+            with self.subTest(event=event_name):
+                self.assertEqual(executed, expected_runs)
 
     def test_gate_env_binds_exact_needs_results(self):
         gate = _job(self.workflow, "ci-gate")
@@ -631,6 +715,138 @@ class WorkflowContractTests(unittest.TestCase):
         text = self.text.split("  ci-gate:\n", 1)[0]
         issues = self._issues_for_mutation(text)
         self.assertTrue(issues)
+
+    def test_validation_detects_removed_schedule(self):
+        text = self.text.replace(
+            "  schedule:\n    - cron: '17 2 * * *'\n", "", 1
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("workflow-triggers", {issue.kind for issue in issues})
+
+    def test_validation_detects_wrong_schedule_cron(self):
+        text = self.text.replace("17 2 * * *", "17 2 * * 1", 1)
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("workflow-triggers", {issue.kind for issue in issues})
+
+    def test_parser_rejects_empty_schedule_cron(self):
+        text = self.text.replace("- cron: '17 2 * * *'", "- cron: ''", 1)
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertEqual([issue.kind for issue in issues], ["parse"])
+
+    def test_parser_rejects_non_list_schedule(self):
+        text = self.text.replace(
+            "  schedule:\n    - cron: '17 2 * * *'",
+            "  schedule:\n    cron: '17 2 * * *'",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertEqual([issue.kind for issue in issues], ["parse"])
+
+    def test_parser_rejects_schedule_timezone_extension(self):
+        text = self.text.replace(
+            "  schedule:\n    - cron: '17 2 * * *'\n",
+            "  schedule:\n    - cron: '17 2 * * *'\n      timezone: UTC\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertEqual([issue.kind for issue in issues], ["parse"])
+
+    def test_validation_detects_missing_setup_schedule_guard(self):
+        text = self.text.replace(
+            "    if: ${{ github.event_name != 'schedule' }}\n", "", 1
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "workflow-job-condition", {issue.kind for issue in issues}
+        )
+
+    def test_validation_detects_inverted_setup_schedule_guard(self):
+        text = self.text.replace(
+            "    if: ${{ github.event_name != 'schedule' }}",
+            "    if: ${{ github.event_name == 'schedule' }}",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "workflow-job-condition", {issue.kind for issue in issues}
+        )
+
+    def test_validation_detects_skipped_vulnerability_job(self):
+        text = self.text.replace(
+            "  vulnerability-check:\n"
+            "    name: Vulnerability scan (linux/amd64, read-only)\n",
+            "  vulnerability-check:\n"
+            "    name: Vulnerability scan (linux/amd64, read-only)\n"
+            "    if: ${{ false }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "workflow-job-condition", {issue.kind for issue in issues}
+        )
+
+    def test_validation_detects_conditional_database_foundation(self):
+        text = self.text.replace(
+            "  database-foundation:\n"
+            "    name: PostgreSQL migration, constraints, and runtime harness "
+            "(linux/amd64)\n",
+            "  database-foundation:\n"
+            "    name: PostgreSQL migration, constraints, and runtime harness "
+            "(linux/amd64)\n"
+            "    if: ${{ always() }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "workflow-job-condition", {issue.kind for issue in issues}
+        )
+
+    def test_validation_detects_gate_losing_always(self):
+        text = self.text.replace(
+            "    if: ${{ always() && github.event_name != 'schedule' }}",
+            "    if: ${{ github.event_name != 'schedule' }}",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("workflow-gate-always", {issue.kind for issue in issues})
+
+    def test_validation_detects_gate_condition_removed(self):
+        text = self.text.replace(
+            "    if: ${{ always() && github.event_name != 'schedule' }}\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("workflow-gate-always", {issue.kind for issue in issues})
+
+    def test_validation_detects_missing_daily_concurrency_isolation(self):
+        text = self.text.replace(
+            "${{ github.event_name == 'schedule' && '-daily' || '' }}", "", 1
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "workflow-concurrency", {issue.kind for issue in issues}
+        )
+
+    def test_validation_detects_wrong_daily_concurrency_suffix(self):
+        text = self.text.replace("-daily", "-nightly", 1)
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "workflow-concurrency", {issue.kind for issue in issues}
+        )
 
     def test_gate_run_block_all_64_result_combinations(self):
         gate = _job(self.workflow, "ci-gate")
@@ -914,6 +1130,19 @@ class CheckWorkflowMutationTests(unittest.TestCase):
         except MOD.ContractError:
             return [MOD.ContractIssue("parse")]
         return MOD.validate_check_workflow(workflow, text, REPO)
+
+    def test_mutation_check_schedule_trigger_is_rejected(self):
+        text = self.text.replace(
+            "  pull_request:\n    branches:\n      - main\n",
+            "  pull_request:\n    branches:\n      - main\n"
+            "  schedule:\n    - cron: '17 2 * * *'\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "check-workflow-triggers", {issue.kind for issue in issues}
+        )
 
     def test_mutation_check_docker_setup_is_missing(self):
         text = self.text.replace(

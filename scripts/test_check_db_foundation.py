@@ -2394,14 +2394,15 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
     def test_ci_gate_timeout_is_one_minute_separate_from_original_three(self):
         self.assertEqual(self._job("ci-gate")["timeout-minutes"], 1)
 
-    def test_permissions_needs_concurrency_and_pins_unchanged(self):
+    def test_permissions_needs_pins_preserved_and_daily_concurrency_isolated(self):
         self.assertEqual(self.data["permissions"], {"contents": "read"})
         self.assertEqual(
             self.data["concurrency"],
             {
                 "group": (
                     "${{ github.workflow }}-${{ github.event.pull_request.number "
-                    "|| github.ref }}"
+                    "|| github.ref }}${{ github.event_name == 'schedule' "
+                    "&& '-daily' || '' }}"
                 ),
                 "cancel-in-progress": False,
             },
