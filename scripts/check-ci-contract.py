@@ -64,6 +64,18 @@ EXPECTED_TIMEOUTS = {
 CONCURRENCY_GROUP = (
     "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
 )
+SETUP_SCHEDULE_CRON = "17 2 * * *"
+SETUP_CONCURRENCY_GROUP = (
+    CONCURRENCY_GROUP
+    + "${{ github.event_name == 'schedule' && '-daily' || '' }}"
+)
+SETUP_JOB_IF = "${{ github.event_name != 'schedule' }}"
+SETUP_GATE_IF = "${{ always() && github.event_name != 'schedule' }}"
+SETUP_TRIGGERS = {
+    "push": {"branches": ["main"]},
+    "pull_request": {"branches": ["main"]},
+    "schedule": [{"cron": SETUP_SCHEDULE_CRON}],
+}
 EXPECTED_TOP_ENV = {
     "GOTOOLCHAIN": "local",
     "GOENV": "off",
@@ -472,6 +484,27 @@ def _parse_on(
             body, index = _parse_workflow_dispatch(lines, index + 1)
             result[event] = body
             continue
+        if event == "schedule":
+            if value is not None or event in result:
+                raise ContractError("workflow-syntax")
+            index += 1
+            schedule: list[dict[str, str]] = []
+            while index < len(lines) and lines[index][0] > 2:
+                entry_indent, entry_content, entry_number = lines[index]
+                if entry_indent != 4 or not entry_content.startswith("- "):
+                    raise ContractError("workflow-syntax")
+                key, key_value = _split_kv(entry_content[2:], entry_number)
+                if key != "cron" or key_value is None:
+                    raise ContractError("workflow-syntax")
+                cron = _unquote(key_value)
+                if not cron.strip():
+                    raise ContractError("workflow-syntax")
+                schedule.append({"cron": cron})
+                index += 1
+            if not schedule:
+                raise ContractError("workflow-syntax")
+            result[event] = schedule
+            continue
         if event not in ("push", "pull_request") or value is not None:
             raise ContractError("workflow-syntax")
         if event in result:
@@ -683,16 +716,13 @@ def validate_workflow(
 
     if set(workflow) - {"name", "on", "concurrency", "permissions", "env", "jobs"}:
         add("workflow-top-level")
-    if workflow.get("on") != {
-        "push": {"branches": ["main"]},
-        "pull_request": {"branches": ["main"]},
-    }:
+    if workflow.get("on") != SETUP_TRIGGERS:
         add("workflow-triggers")
     if workflow.get("permissions") != {"contents": "read"}:
         add("workflow-permissions")
     concurrency = workflow.get("concurrency", {})
     if concurrency != {
-        "group": CONCURRENCY_GROUP,
+        "group": SETUP_CONCURRENCY_GROUP,
         "cancel-in-progress": False,
     }:
         add("workflow-concurrency")
@@ -715,7 +745,10 @@ def validate_workflow(
             add("workflow-timeout", job_id)
         if "permissions" in job:
             add("workflow-job-permissions", job_id)
-        if "if" in job and job_id != "ci-gate":
+        if job_id == "setup-check":
+            if job.get("if") != SETUP_JOB_IF:
+                add("workflow-job-condition", job_id)
+        elif job_id != "ci-gate" and "if" in job:
             add("workflow-job-condition", job_id)
         for step in job.get("steps", []):
             if "continue-on-error" in step and step["continue-on-error"] is not False:
@@ -886,7 +919,7 @@ def validate_workflow(
         add("workflow-gate-runs-on")
     if gate.get("timeout-minutes") != 1:
         add("workflow-gate-timeout")
-    if gate.get("if") != "${{ always() }}":
+    if gate.get("if") != SETUP_GATE_IF:
         add("workflow-gate-always")
     gate_needs = gate.get("needs")
     if not isinstance(gate_needs, list):

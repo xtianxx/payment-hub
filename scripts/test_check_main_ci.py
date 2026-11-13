@@ -1029,6 +1029,17 @@ class GateTests(GateTestCase):
         self.fake.page_responses[(101, 1)] = json_response(make_runs(1, [run]))
         self.assertEqual(self.gate(), ("runs", "identity"))
 
+    def test_schedule_run_is_rejected_even_when_successful(self):
+        path = MOD.WORKFLOW_PATHS[0]
+        self.fake.workflow_responses["setup-check.yml"] = json_response(
+            make_workflow(path, 101)
+        )
+        run = make_run(
+            1001, 101, path, event="schedule", conclusion="success"
+        )
+        self.fake.page_responses[(101, 1)] = json_response(make_runs(1, [run]))
+        self.assertEqual(self.gate(), ("runs", "identity"))
+
     def test_pull_requests_field_alone_does_not_reject_push_run(self):
         path = MOD.WORKFLOW_PATHS[0]
         self.fake.workflow_responses["setup-check.yml"] = json_response(
