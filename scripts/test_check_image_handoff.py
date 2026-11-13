@@ -13,11 +13,15 @@ import io
 import json
 import os
 import shutil
+import signal
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +67,7 @@ SUMMARY_KEYS = {
     "archive",
     "absence",
     "load",
+    "cancellation",
 }
 
 
@@ -81,6 +86,40 @@ def temp_parent() -> Path:
     if candidate.is_dir():
         return candidate
     return Path(tempfile.gettempdir())
+
+
+def pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().split()
+    except OSError:
+        return False
+    return len(fields) > 2 and fields[2] != "Z"
+
+
+def cancel_tool_code(pidfile: Path, grandchild_pidfile: Path) -> str:
+    grandchild = (
+        "import os, signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        f"Path({str(grandchild_pidfile)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(60)\n"
+    )
+    return (
+        "import os, signal, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        f"Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}])\n"
+        "deadline = time.monotonic() + 5\n"
+        f"while not Path({str(grandchild_pidfile)!r}).exists() "
+        "and time.monotonic() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "time.sleep(60)\n"
+    )
 
 
 class Pair:
@@ -1370,5 +1409,355 @@ class HandoffTest(unittest.TestCase):
                 self.assertNotIn(key, env)
 
 
+    def _run_cancel_case(
+        self,
+        signum: int,
+        expect_kind: str,
+        *,
+        double: bool = False,
+    ) -> None:
+        case_root = Path(
+            tempfile.mkdtemp(prefix="cancel-", dir=str(self.root))
+        )
+        build_root = case_root / "build"
+        build_root.mkdir()
+        (build_root / "keep.json").write_text(
+            "keep-build", encoding="utf-8"
+        )
+        upload = build_root / "upload"
+        upload.mkdir(mode=0o700)
+        (upload / "images-summary.json").write_text(
+            "keep-upload", encoding="utf-8"
+        )
+        artifact_root = case_root / "artifact"
+        partial_path = artifact_root / "pair.tar"
+        keep_path = artifact_root / "keep.txt"
+        tool_pidfile = case_root / "tool.pid"
+        grandchild_pidfile = case_root / "grandchild.pid"
+        remove_marker = case_root / "remove.marker"
+        load_marker = case_root / "load.marker"
+        config = {
+            "build_root": str(build_root),
+            "artifact_root": str(artifact_root),
+            "partial_path": str(partial_path),
+            "keep_path": str(keep_path),
+            "remove_marker": str(remove_marker),
+            "load_marker": str(load_marker),
+            "tool_code": cancel_tool_code(
+                tool_pidfile, grandchild_pidfile
+            ),
+        }
+        config_path = case_root / "config.json"
+        config_path.write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+
+        product = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                str(Path(__file__).resolve()),
+                "--cancel-child",
+                str(config_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=os.environ.copy(),
+        )
+        tool_pid: int | None = None
+        grandchild_pid: int | None = None
+        try:
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if product.poll() is not None:
+                    break
+                if (
+                    tool_pidfile.exists()
+                    and grandchild_pidfile.exists()
+                ):
+                    break
+                time.sleep(0.01)
+            self.assertTrue(
+                tool_pidfile.exists() and grandchild_pidfile.exists(),
+                "tool/grandchild did not start; product stderr="
+                + (
+                    product.stderr.read().decode("utf-8", "replace")
+                    if product.poll() is not None
+                    else "<still-running>"
+                ),
+            )
+            tool_pid = int(tool_pidfile.read_text(encoding="utf-8"))
+            grandchild_pid = int(
+                grandchild_pidfile.read_text(encoding="utf-8")
+            )
+
+            product.send_signal(signum)
+            if double:
+                time.sleep(0.1)
+                try:
+                    product.send_signal(
+                        signal.SIGINT
+                        if signum == signal.SIGTERM
+                        else signal.SIGTERM
+                    )
+                except ProcessLookupError:
+                    pass
+            try:
+                _stdout, stderr = product.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.fail(
+                    "product did not exit within the bounded cancellation "
+                    "window"
+                )
+            self.assertEqual(
+                product.returncode,
+                1,
+                "product exit="
+                + str(product.returncode)
+                + " stderr="
+                + stderr.decode("utf-8", "replace"),
+            )
+            # These assertions must run before the test finally fallback.
+            self.assertFalse(
+                pid_alive(tool_pid),
+                "tool process survived cancellation: " + str(tool_pid),
+            )
+            self.assertFalse(
+                pid_alive(grandchild_pid),
+                "grandchild process survived cancellation: "
+                + str(grandchild_pid),
+            )
+            self.assertTrue(
+                check_images._group_absent(tool_pid),
+                "tool process group still has live members: "
+                + str(tool_pid),
+            )
+
+            summary_path = upload / handoff.SUMMARY_FILE
+            self.assertTrue(summary_path.is_file())
+            summary = json.loads(
+                summary_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["result"], "fail")
+            self.assertEqual(
+                summary["failure"],
+                {"stage": "interrupted", "kind": expect_kind},
+            )
+            cancellation = summary["cancellation"]
+            self.assertEqual(cancellation["signal"], expect_kind)
+            self.assertIs(cancellation["repeat_signal"], double)
+            self.assertIs(
+                cancellation["client_process_group_absent"], True
+            )
+            self.assertIs(cancellation["client_process_reaped"], True)
+            self.assertIs(
+                cancellation["runner_cleanup_failed"], False
+            )
+            self.assertEqual(
+                cancellation["archive_cleanup"], "removed"
+            )
+            self.assertIs(
+                cancellation["daemon_side_effects_rolled_back"], False
+            )
+            self.assertIs(
+                cancellation["daemon_side_effects_may_remain"], True
+            )
+            self.assertIn(
+                "client process group", cancellation["boundary"]
+            )
+            self.assertIn(
+                "no daemon-side rollback", cancellation["boundary"]
+            )
+            self.assertEqual(summary["counts"]["save"], 1)
+            self.assertEqual(summary["counts"]["remove"], 0)
+            self.assertEqual(summary["counts"]["load"], 0)
+            self.assertFalse(partial_path.exists())
+            self.assertTrue(keep_path.is_file())
+            self.assertTrue((build_root / "keep.json").is_file())
+            self.assertTrue(
+                (upload / "images-summary.json").is_file()
+            )
+            self.assertFalse(remove_marker.exists())
+            self.assertFalse(load_marker.exists())
+            self.assertEqual(
+                stat.S_IMODE(artifact_root.stat().st_mode), 0o700
+            )
+            self.assertEqual(
+                stat.S_IMODE(summary_path.stat().st_mode), 0o600
+            )
+        finally:
+            if product.poll() is None:
+                try:
+                    product.kill()
+                except OSError:
+                    pass
+            try:
+                product.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            for pid in (tool_pid, grandchild_pid):
+                if pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+            if tool_pid is not None and not check_images._group_absent(
+                tool_pid
+            ):
+                try:
+                    os.killpg(tool_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if not pid_alive(tool_pid) and not pid_alive(
+                    grandchild_pid
+                ):
+                    break
+                time.sleep(0.02)
+
+    def test_cancel_sigterm_reaps_tool_and_grandchild(self) -> None:
+        self._run_cancel_case(signal.SIGTERM, "sigterm")
+
+    def test_cancel_sigint_reaps_tool_and_grandchild(self) -> None:
+        self._run_cancel_case(signal.SIGINT, "sigint")
+
+    def test_cancel_double_signal_cleanup_completes(self) -> None:
+        self._run_cancel_case(
+            signal.SIGTERM, "sigterm", double=True
+        )
+
+    def test_run_restores_signal_handlers(self) -> None:
+        old_int = signal.getsignal(signal.SIGINT)
+        old_term = signal.getsignal(signal.SIGTERM)
+        args = handoff.argparse.Namespace(
+            build_root=str(self.root / "unused-build"),
+            artifact_root=str(self.root / "unused-artifact"),
+            isolated_daemon=True,
+        )
+        preflight = handoff.HandoffPreflight(args, env=os.environ)
+        preflight._prepare = lambda: None
+        preflight._verify_source_and_builder = lambda: None
+        preflight._docker_preflight = lambda: None
+        preflight._inspect_original_pair = lambda: None
+        preflight._save_pair = lambda: None
+        preflight._check_ownership = lambda: None
+        preflight._remove_pair = lambda: None
+        preflight._confirm_absence = lambda: None
+        preflight._load_pair = lambda: None
+        preflight._verify_loaded_pair = lambda: None
+        preflight._verify_source_unchanged = lambda: None
+        self.assertEqual(preflight.run(), 1)
+        self.assertIs(signal.getsignal(signal.SIGINT), old_int)
+        self.assertIs(signal.getsignal(signal.SIGTERM), old_term)
+
+    def test_timeout_path_still_reaps_without_signal(self) -> None:
+        pidfile = self.root / "timeout.pid"
+        code = (
+            "import os, time\n"
+            "from pathlib import Path\n"
+            f"Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+            "time.sleep(60)\n"
+        )
+        args = handoff.argparse.Namespace(
+            build_root=str(self.root / "unused-build"),
+            artifact_root=str(self.root / "unused-artifact"),
+            isolated_daemon=True,
+        )
+        preflight = handoff.HandoffPreflight(args, env=os.environ)
+        preflight.docker = sys.executable
+        preflight.docker_env = {
+            name: os.environ[name]
+            for name in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
+            if name in os.environ
+        }
+        pid: int | None = None
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                with self.assertRaises(handoff.HandoffError) as raised:
+                    preflight._run_docker(
+                        "save", "save", ["-c", code], 0.2
+                    )
+            self.assertEqual(
+                (raised.exception.stage, raised.exception.kind),
+                ("save", "timeout"),
+            )
+            self.assertTrue(pidfile.is_file())
+            pid = int(pidfile.read_text(encoding="utf-8"))
+            self.assertFalse(
+                pid_alive(pid),
+                "timeout path left a live tool: " + str(pid),
+            )
+            self.assertTrue(
+                check_images._group_absent(pid),
+                "timeout path left a live tool group: " + str(pid),
+            )
+        finally:
+            if pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+def _cancel_child_main(config_path: str) -> None:
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+
+    def fake_docker_preflight(self: Any) -> None:
+        self.docker = sys.executable
+        self.docker_env = {
+            name: os.environ[name]
+            for name in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
+            if name in os.environ
+        }
+
+    def fake_save(self: Any) -> None:
+        self.counts["save"] += 1
+        Path(config["partial_path"]).write_bytes(b"partial-archive")
+        Path(config["keep_path"]).write_bytes(b"keep-archive")
+        self._run_docker(
+            "save", "save", ["-c", config["tool_code"]], 300
+        )
+
+    def fake_remove(self: Any) -> None:
+        Path(config["remove_marker"]).write_text(
+            "remove", encoding="utf-8"
+        )
+
+    def fake_load(self: Any) -> None:
+        Path(config["load_marker"]).write_text(
+            "load", encoding="utf-8"
+        )
+
+    handoff.HandoffPreflight._docker_preflight = fake_docker_preflight
+    handoff.HandoffPreflight._verify_source_and_builder = (
+        lambda self: None
+    )
+    handoff.HandoffPreflight._inspect_original_pair = lambda self: None
+    handoff.HandoffPreflight._save_pair = fake_save
+    handoff.HandoffPreflight._check_ownership = lambda self: None
+    handoff.HandoffPreflight._remove_pair = fake_remove
+    handoff.HandoffPreflight._confirm_absence = lambda self: None
+    handoff.HandoffPreflight._load_pair = fake_load
+    handoff.HandoffPreflight._verify_loaded_pair = lambda self: None
+    handoff.HandoffPreflight._verify_source_unchanged = lambda self: None
+
+    code = handoff.main(
+        [
+            "--build-root",
+            config["build_root"],
+            "--artifact-root",
+            config["artifact_root"],
+            "--isolated-daemon",
+        ],
+        env=os.environ,
+    )
+    raise SystemExit(code)
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if len(sys.argv) > 2 and sys.argv[1] == "--cancel-child":
+        _cancel_child_main(sys.argv[2])
+    else:
+        unittest.main(verbosity=2)

@@ -20,6 +20,12 @@
 
 本轮只读确认main已有active ruleset，但未设置必需状态检查。管理员仍需单独配置`CI gate`与`Paired image acceptance (linux/amd64)`为必需检查；本次未修改远端规则。配置后的正式Actions执行、29.9.3真实归档往返、跨job交接及GHCR全链验证仍分别保留证据，不以本地fake测试替代。
 
+### 交接预检的取消边界
+
+交接预检收到SIGTERM/SIGINT后，停止后续操作并通知当前自有客户端进程组；宽限期后仍存活则强杀、有限等待回收，摘要记录固定的`interrupted/sigterm`或`interrupted/sigint`失败及回收状态。重复取消信号不会中断该清理。只有确认客户端已回收后，才删除本轮独占临时目录内的`pair.tar`；不删除builder已有报告或无关文件。
+
+这只保证客户端进程组的有界监督，不声称撤销Docker daemon已经接收的save/load等操作，也不自动回滚镜像状态。无法确认回收时保留归档并明确记录失败。真实子进程测试用Python替身验证忽略信号的子/孙进程及重复取消，不等于已在真实Docker中验证取消或回滚。
+
 ## 历史本地状态（2026-11-12）
 
 交付审查后，发布委派清理与工具timeout分类另行修复；其最新范围接受以`artifacts/phase6/delivery-review-fixes/acceptance.json`为准，不由下方历史正常路径绿灯替代。此次脚本变更会使旧全仓库镜像清单失配，未自动重构建或重贴旧镜像。受控进程测试与真实GHCR发布仍是不同证据，外部操作继续未授权/未验证。

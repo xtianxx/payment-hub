@@ -22,9 +22,13 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -64,6 +68,9 @@ IMAGE_LOAD_TIMEOUT_SECONDS = 300
 IMAGE_LIST_TIMEOUT_SECONDS = 30
 PS_TIMEOUT_SECONDS = 30
 SOURCE_MANIFEST_MAX_BYTES = 8 * 1024 * 1024
+CANCEL_TERM_GRACE_SECONDS = check_images.GROUP_TERM_GRACE_SECONDS
+CANCEL_ACTIVE_WAIT_SECONDS = 0.5
+CANCEL_DRAIN_SECONDS = check_images.MIN_GROUP_DRAIN_SECONDS + 0.5
 
 CHECK_NAMES = (
     "git_clean",
@@ -139,6 +146,17 @@ class HandoffPreflight:
         self.checks = {name: "not-run" for name in CHECK_NAMES}
         self.failure: dict[str, str] | None = None
         self.result = "fail"
+        self.interrupted: str | None = None
+        self.repeat_signal = False
+        self._cleanup_started = False
+        self._cancel_kill_scheduled = False
+        self._cancel_watchdog_thread: threading.Thread | None = None
+        self._cancel_pgid: int | None = None
+        self._cancel_process: subprocess.Popen[bytes] | None = None
+        self._cancel_runner_cleanup_failed = False
+        self._cancel_group_absent: bool | None = None
+        self._cancel_reaped: bool | None = None
+        self._archive_cleanup = "not-run"
         self._build_root_ready = False
         self._summary_written = False
 
@@ -236,6 +254,7 @@ class HandoffPreflight:
     # ------------------------------------------------------------------
 
     def _git(self, *arguments: str) -> check_images.ProcResult:
+        self._raise_if_interrupted()
         git = self.git_path or shutil.which("git", path=self.env.get("PATH"))
         if not git:
             raise HandoffError("source", "git-missing")
@@ -245,6 +264,10 @@ class HandoffPreflight:
             env=self._tool_env(),
             timeout=GIT_TIMEOUT_SECONDS,
         )
+        if self.interrupted is not None:
+            if result.cleanup_failed:
+                self._cancel_runner_cleanup_failed = True
+            raise HandoffError("interrupted", self.interrupted)
         if result.timed_out:
             raise HandoffError("source", "timeout")
         if result.cleanup_failed:
@@ -262,6 +285,7 @@ class HandoffPreflight:
         *,
         allow_failure: bool = False,
     ) -> check_images.ProcResult:
+        self._raise_if_interrupted()
         if self.docker is None:
             raise HandoffError("daemon", "docker-missing")
         result = self.runner(
@@ -270,6 +294,10 @@ class HandoffPreflight:
             env=dict(self.docker_env),
             timeout=budget,
         )
+        if self.interrupted is not None:
+            if result.cleanup_failed:
+                self._cancel_runner_cleanup_failed = True
+            raise HandoffError("interrupted", self.interrupted)
         if result.timed_out:
             raise HandoffError(stage, "timeout")
         if result.cleanup_failed:
@@ -277,6 +305,181 @@ class HandoffPreflight:
         if not allow_failure and result.exit_code != 0:
             raise HandoffError(stage, kind)
         return result
+
+    def _raise_if_interrupted(self) -> None:
+        if self.interrupted is not None:
+            raise HandoffError("interrupted", self.interrupted)
+
+    def _handle_signal(self, signum: int, _frame: object) -> None:
+        if self._cleanup_started:
+            self.repeat_signal = True
+            return
+        self.repeat_signal = self.interrupted is not None
+        if self.interrupted is None:
+            self.interrupted = (
+                "sigterm" if signum == signal.SIGTERM else "sigint"
+            )
+        check_images._CANCEL_REQUESTED = True
+        try:
+            check_images._signal_active(signum)
+        except Exception:
+            pass
+        self._start_cancel_watchdog()
+
+    def _start_cancel_watchdog(self) -> None:
+        if self._cancel_kill_scheduled:
+            return
+        self._cancel_kill_scheduled = True
+        process = check_images._ACTIVE_PROCESS
+        pgid = check_images._ACTIVE_PGID
+        self._cancel_process = process
+        self._cancel_pgid = pgid
+        thread = threading.Thread(
+            target=self._cancel_watchdog,
+            args=(process, pgid),
+            daemon=True,
+            name="handoff-cancel-watchdog",
+        )
+        self._cancel_watchdog_thread = thread
+        thread.start()
+
+    def _cancel_group_gone(
+        self,
+        pgid: int | None,
+        process: subprocess.Popen[bytes] | None,
+    ) -> bool:
+        if pgid is not None:
+            return check_images._group_absent(pgid)
+        return process is None or process.poll() is not None
+
+    def _cancel_watchdog(
+        self,
+        process: subprocess.Popen[bytes] | None,
+        pgid: int | None,
+    ) -> None:
+        try:
+            deadline = time.monotonic() + CANCEL_ACTIVE_WAIT_SECONDS
+            while (
+                process is None
+                and pgid is None
+                and time.monotonic() < deadline
+            ):
+                process = check_images._ACTIVE_PROCESS
+                pgid = check_images._ACTIVE_PGID
+                if process is None and pgid is None:
+                    time.sleep(0.01)
+            self._cancel_process = process
+            self._cancel_pgid = pgid
+            if process is None and pgid is None:
+                return
+            grace_deadline = time.monotonic() + CANCEL_TERM_GRACE_SECONDS
+            while time.monotonic() < grace_deadline:
+                if self._cancel_group_gone(pgid, process):
+                    return
+                time.sleep(0.02)
+            if self._cancel_group_gone(pgid, process):
+                return
+            if pgid is not None:
+                check_images._signal_group_id(pgid, signal.SIGKILL)
+            elif process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+    def _finalize_cancel_state(self) -> None:
+        if self.interrupted is None:
+            return
+        thread = self._cancel_watchdog_thread
+        if thread is not None:
+            thread.join(
+                timeout=CANCEL_ACTIVE_WAIT_SECONDS
+                + CANCEL_TERM_GRACE_SECONDS
+                + 1.0
+            )
+        pgid = self._cancel_pgid
+        process = self._cancel_process
+        if pgid is None:
+            pgid = check_images._ACTIVE_PGID
+        if process is None:
+            process = check_images._ACTIVE_PROCESS
+        self._cancel_pgid = pgid
+        self._cancel_process = process
+        gone = self._cancel_group_gone(pgid, process)
+        if not gone:
+            if pgid is not None:
+                check_images._signal_group_id(pgid, signal.SIGKILL)
+            elif process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            deadline = time.monotonic() + CANCEL_DRAIN_SECONDS
+            while (
+                time.monotonic() < deadline
+                and not self._cancel_group_gone(pgid, process)
+            ):
+                time.sleep(0.02)
+            gone = self._cancel_group_gone(pgid, process)
+        reaped = process is None or process.poll() is not None
+        if process is not None and not reaped:
+            try:
+                process.wait(timeout=CANCEL_DRAIN_SECONDS)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            reaped = process.poll() is not None
+        self._cancel_group_absent = gone
+        self._cancel_reaped = bool(
+            gone
+            and reaped
+            and not self._cancel_runner_cleanup_failed
+        )
+
+    def _cleanup_partial_archive(self) -> None:
+        if self._cancel_reaped is not True:
+            self._archive_cleanup = "skipped-unreaped"
+            return
+        if self.artifact_root is None or self.pair_path is None:
+            self._archive_cleanup = "not-created"
+            return
+        try:
+            root_info = self.artifact_root.lstat()
+        except OSError:
+            self._archive_cleanup = "not-present"
+            return
+        if (
+            self.artifact_root.is_symlink()
+            or not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+        ):
+            self._archive_cleanup = "skipped-unsafe-root"
+            return
+        if self.pair_path.parent != self.artifact_root:
+            self._archive_cleanup = "skipped-unsafe-path"
+            return
+        try:
+            info = self.pair_path.lstat()
+        except FileNotFoundError:
+            self._archive_cleanup = "not-present"
+            return
+        except OSError:
+            self._archive_cleanup = "failed"
+            return
+        if (
+            self.pair_path.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+        ):
+            self._archive_cleanup = "skipped-unsafe-file"
+            return
+        try:
+            self.pair_path.unlink()
+        except OSError:
+            self._archive_cleanup = "failed"
+            return
+        self._archive_cleanup = "removed"
 
     def _read_json(
         self, path: Path, stage: str, kind: str, maximum: int
@@ -291,6 +494,7 @@ class HandoffPreflight:
     # ------------------------------------------------------------------
 
     def _verify_source_and_builder(self) -> None:
+        self._raise_if_interrupted()
         head_result = self._git("rev-parse", "HEAD")
         head = head_result.stdout.strip()
         if not re.fullmatch(r"[0-9a-f]{40}", head):
@@ -480,6 +684,7 @@ class HandoffPreflight:
             raise HandoffError("daemon", "outside-runner-temp")
 
     def _docker_preflight(self) -> None:
+        self._raise_if_interrupted()
         if not self.args.isolated_daemon:
             raise HandoffError("daemon", "isolated-required")
         # Docker CLI precedence makes DOCKER_CONTEXT override DOCKER_HOST.
@@ -722,6 +927,7 @@ class HandoffPreflight:
                 raise HandoffError(stage, "repo-digests")
 
     def _inspect_original_pair(self) -> None:
+        self._raise_if_interrupted()
         if self.record is None:
             raise HandoffError("builder", "record")
         app_raw = self._inspect_raw(
@@ -768,6 +974,7 @@ class HandoffPreflight:
     # ------------------------------------------------------------------
 
     def _save_pair(self) -> None:
+        self._raise_if_interrupted()
         if self.record is None or self.pair_path is None:
             raise HandoffError("save", "artifact")
         if self.pair_path.exists() or self.pair_path.is_symlink():
@@ -836,6 +1043,7 @@ class HandoffPreflight:
     # ------------------------------------------------------------------
 
     def _check_ownership(self) -> None:
+        self._raise_if_interrupted()
         if self.record is None:
             raise HandoffError("builder", "record")
         app_raw = self._inspect_raw(
@@ -904,6 +1112,7 @@ class HandoffPreflight:
         self.checks["ownership"] = "pass"
 
     def _remove_pair(self) -> None:
+        self._raise_if_interrupted()
         if self.record is None:
             raise HandoffError("builder", "record")
         self.counts["remove"] += 1
@@ -936,6 +1145,7 @@ class HandoffPreflight:
             raise HandoffError("absence", "inspect-error")
 
     def _confirm_absence(self) -> None:
+        self._raise_if_interrupted()
         if self.record is None:
             raise HandoffError("builder", "record")
         for role in ROLES:
@@ -969,6 +1179,7 @@ class HandoffPreflight:
         self.checks["absence"] = "pass"
 
     def _load_pair(self) -> None:
+        self._raise_if_interrupted()
         if self.pair_path is None:
             raise HandoffError("load", "artifact")
         try:
@@ -991,6 +1202,7 @@ class HandoffPreflight:
         self.checks["load"] = "pass"
 
     def _verify_loaded_pair(self) -> None:
+        self._raise_if_interrupted()
         if self.record is None:
             raise HandoffError("builder", "record")
         for role in ROLES:
@@ -1010,6 +1222,7 @@ class HandoffPreflight:
         self.checks["loaded_images"] = "pass"
 
     def _verify_source_unchanged(self) -> None:
+        self._raise_if_interrupted()
         head_result = self._git("rev-parse", "HEAD")
         if head_result.stdout.strip() != self.git_head:
             raise HandoffError("source", "unchanged")
@@ -1133,6 +1346,24 @@ class HandoffPreflight:
                 "calls": self.counts["load"],
                 "images": loaded,
             },
+            "cancellation": {
+                "signal": self.interrupted,
+                "repeat_signal": self.repeat_signal,
+                "client_process_group_absent": self._cancel_group_absent,
+                "client_process_reaped": self._cancel_reaped,
+                "runner_cleanup_failed": (
+                    self._cancel_runner_cleanup_failed
+                ),
+                "archive_cleanup": self._archive_cleanup,
+                "daemon_side_effects_rolled_back": False,
+                "daemon_side_effects_may_remain": (
+                    self.interrupted is not None
+                ),
+                "boundary": (
+                    "client process group only; "
+                    "no daemon-side rollback claimed"
+                ),
+            },
         }
 
     def _write_summary(self) -> bool:
@@ -1195,29 +1426,78 @@ class HandoffPreflight:
             self.result = "fail"
 
     def run(self) -> int:
+        check_images._reset_process_cancel()
+        old_int = signal.getsignal(signal.SIGINT)
+        old_term = signal.getsignal(signal.SIGTERM)
+        installed_int = False
+        installed_term = False
         try:
-            self._prepare()
-            self._verify_source_and_builder()
-            self._docker_preflight()
-            self._inspect_original_pair()
-            self._save_pair()
-            self._check_ownership()
-            self._remove_pair()
-            self._confirm_absence()
-            self._load_pair()
-            self._verify_loaded_pair()
-            self._verify_source_unchanged()
-            self.result = "pass"
-        except HandoffError as exc:
-            self.failure = {"stage": exc.stage, "kind": exc.kind}
-        except release.ReleaseError as exc:
-            self.failure = {"stage": exc.stage, "kind": exc.kind}
-        except check_images.LauncherError as exc:
-            self.failure = {"stage": exc.stage, "kind": exc.kind}
-        except Exception:
-            self.failure = {"stage": "internal", "kind": "unexpected"}
+            try:
+                signal.signal(signal.SIGINT, self._handle_signal)
+                installed_int = True
+                signal.signal(signal.SIGTERM, self._handle_signal)
+                installed_term = True
+            except (AttributeError, OSError, ValueError):
+                if installed_int:
+                    try:
+                        signal.signal(signal.SIGINT, old_int)
+                    except (OSError, ValueError):
+                        pass
+                self.failure = {"stage": "interrupted", "kind": "handler"}
+                self._write_summary_best_effort()
+                return 1
+            try:
+                self._prepare()
+                self._raise_if_interrupted()
+                self._verify_source_and_builder()
+                self._docker_preflight()
+                self._inspect_original_pair()
+                self._save_pair()
+                self._check_ownership()
+                self._remove_pair()
+                self._confirm_absence()
+                self._load_pair()
+                self._verify_loaded_pair()
+                self._verify_source_unchanged()
+                self.result = "pass"
+            except HandoffError as exc:
+                self.failure = {"stage": exc.stage, "kind": exc.kind}
+            except release.ReleaseError as exc:
+                self.failure = {"stage": exc.stage, "kind": exc.kind}
+            except check_images.LauncherError as exc:
+                self.failure = {"stage": exc.stage, "kind": exc.kind}
+            except Exception:
+                self.failure = {"stage": "internal", "kind": "unexpected"}
+            finally:
+                self._cleanup_started = True
+                try:
+                    self._finalize_cancel_state()
+                except Exception:
+                    if self.interrupted is not None:
+                        self._cancel_group_absent = False
+                        self._cancel_reaped = False
+                if self.interrupted is not None:
+                    try:
+                        self._cleanup_partial_archive()
+                    except Exception:
+                        self._archive_cleanup = "failed"
+                    self.failure = {
+                        "stage": "interrupted",
+                        "kind": self.interrupted,
+                    }
+                    self.result = "fail"
+                self._write_summary_best_effort()
         finally:
-            self._write_summary_best_effort()
+            if installed_int:
+                try:
+                    signal.signal(signal.SIGINT, old_int)
+                except (OSError, ValueError):
+                    pass
+            if installed_term:
+                try:
+                    signal.signal(signal.SIGTERM, old_term)
+                except (OSError, ValueError):
+                    pass
         if self.failure is not None:
             self.result = "fail"
         return (
