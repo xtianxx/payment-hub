@@ -112,24 +112,83 @@ CHECK_JOB_ID = "image-acceptance"
 CHECK_JOB_NAME = "Paired image acceptance (linux/amd64)"
 CHECK_TIMEOUT_MINUTES = 30
 CHECK_TOP_ENV = {**EXPECTED_TOP_ENV, "GOTELEMETRY": "off"}
-CHECK_EXPECTED_ACTION_COUNTS = {CHECKOUT: 1, SETUP_GO: 1, UPLOAD: 1}
+SETUP_DOCKER = (
+    "docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6"
+)
+CHECK_EXPECTED_ACTION_PINS = {CHECKOUT, SETUP_GO, UPLOAD, SETUP_DOCKER}
+CHECK_EXPECTED_ACTION_COUNTS = {
+    CHECKOUT: 1,
+    SETUP_GO: 1,
+    UPLOAD: 1,
+    SETUP_DOCKER: 1,
+}
 CHECK_UPLOAD_NAME = (
     "image-acceptance-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}"
 )
 CHECK_UPLOAD_PATHS = (
     "${{ runner.temp }}/payment-hub-images/artifacts/upload/build-summary.json",
     "${{ runner.temp }}/payment-hub-images/artifacts/upload/images-summary.json",
+    "${{ runner.temp }}/payment-hub-images/artifacts/upload/handoff-preflight.safe.json",
 )
 CHECK_BUILDER_SCRIPT = "python3 -B scripts/build-images.py"
+CHECK_HANDOFF_STEP = "Verify image handoff without publishing"
+CHECK_HANDOFF_RUN = '''set -euo pipefail
+python3 -B scripts/check-image-handoff.py --build-root "$RUNNER_TEMP/payment-hub-images/artifacts" --artifact-root "$RUNNER_TEMP/payment-hub-handoff-preflight" --isolated-daemon'''
 DOWNLOAD = (
     "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
 )
+DOCKER_SETUP_STEP = "Set up Docker 29.9.3 with containerd image store"
+DOCKER_VERIFY_STEP = "Verify Docker image store"
+DOCKER_VERSION = "v29.9.3"
+DOCKER_RUNTIME_BASEDIR = "${{ runner.temp }}/payment-hub-docker"
+DOCKER_DAEMON_CONFIG = '{"features":{"containerd-snapshotter":true}}'
+DOCKER_VERIFY_RUN = """set -euo pipefail
+if [[ -z "${DOCKER_HOST:-}" ]]; then
+  echo "::error::DOCKER_HOST is not set; DOCKER_CONFIG overrides would bypass the dedicated daemon"
+  exit 1
+fi
+if [[ "$(docker version --format '{{.Server.Version}}')" != "29.9.3" ]]; then
+  echo "::error::unexpected Docker server version"
+  exit 1
+fi
+driver_status="$(docker info --format '{{range .DriverStatus}}{{index . 0}}={{index . 1}}{{"\\n"}}{{end}}')"
+if ! grep -Fxq 'driver-type=io.containerd.snapshotter.v1' <<<"$driver_status"; then
+  echo "::error::Docker image store is not the containerd snapshotter"
+  exit 1
+fi
+daemon_id="$(docker info --format '{{.ID}}')"
+auth_dir="$(mktemp -d)"
+trap 'rm -rf "$auth_dir"' EXIT
+if [[ "$(DOCKER_CONFIG="$auth_dir" docker info --format '{{.ID}}')" != "$daemon_id" ]]; then
+  echo "::error::empty DOCKER_CONFIG reaches a different Docker daemon"
+  exit 1
+fi"""
+CHECK_DOCKER_CONTEXT = "payment-hub-check"
 PUBLISH_WORKFLOW_NAME = "Manual paired image publish / 人工配对镜像发布"
 PUBLISH_JOBS = ("prepare", "upload")
 PUBLISH_TIMEOUT_MINUTES = 30
 PUBLISH_TOP_ENV = {**EXPECTED_TOP_ENV, "GOTELEMETRY": "off"}
-PUBLISH_EXPECTED_ACTION_PINS = {CHECKOUT, SETUP_GO, UPLOAD, DOWNLOAD}
-PUBLISH_ACTION_COUNTS = {CHECKOUT: 2, SETUP_GO: 2, UPLOAD: 2, DOWNLOAD: 1}
+PUBLISH_EXPECTED_ACTION_PINS = {
+    CHECKOUT,
+    SETUP_GO,
+    UPLOAD,
+    DOWNLOAD,
+    SETUP_DOCKER,
+}
+PUBLISH_ACTION_COUNTS = {
+    CHECKOUT: 2,
+    SETUP_GO: 2,
+    UPLOAD: 2,
+    DOWNLOAD: 1,
+    SETUP_DOCKER: 2,
+}
+PUBLISH_DOCKER_SETUP_STEP = DOCKER_SETUP_STEP
+PUBLISH_DOCKER_VERIFY_STEP = DOCKER_VERIFY_STEP
+PUBLISH_DOCKER_VERSION = DOCKER_VERSION
+PUBLISH_DOCKER_CONTEXT = "payment-hub-release"
+PUBLISH_DOCKER_RUNTIME_BASEDIR = DOCKER_RUNTIME_BASEDIR
+PUBLISH_DOCKER_DAEMON_CONFIG = DOCKER_DAEMON_CONFIG
+PUBLISH_DOCKER_VERIFY_RUN = DOCKER_VERIFY_RUN
 PUBLISH_INPUT_NAMES = ("publish_authorized", "packages_verified")
 PUBLISH_BUNDLE_PATHS = (
     "${{ runner.temp }}/payment-hub-release-prepare/bundle/pair.tar",
@@ -146,12 +205,20 @@ PUBLISH_HANDOFF_PATH = (
 PUBLISH_DOWNLOAD_PATH = "${{ runner.temp }}/payment-hub-release-handoff"
 PUBLISH_PREPARE_COMMAND = "bash scripts/release.sh --stage prepare"
 PUBLISH_PUBLISH_COMMAND = "bash scripts/release.sh --stage publish"
+PUBLISH_CI_GATE_STEP = "Require successful main CI"
+PUBLISH_CI_GATE_SUMMARY = (
+    "${{ runner.temp }}/payment-hub-ci-gate/ci-preflight.json"
+)
+PUBLISH_CI_GATE_RUN = '''set -euo pipefail
+python3 -B scripts/check-main-ci.py --source-sha "$SOURCE_SHA" --summary "$RUNNER_TEMP/payment-hub-ci-gate/ci-preflight.json"'''
 CHECK_FORBIDDEN_TOKENS = (
     "pull_request_target",
     "workflow_run",
     "workflow_dispatch",
     "workflow_call",
     "secrets.",
+    "GITHUB_TOKEN",
+    "github.token",
     "packages: write",
     "id-token: write",
     "contents: write",
@@ -918,7 +985,10 @@ def validate_check_workflow(
         "Isolate image acceptance Go config and caches",
         "Check out repository",
         "Set up Go 1.27.4",
+        DOCKER_SETUP_STEP,
+        DOCKER_VERIFY_STEP,
         "Build and accept paired images",
+        CHECK_HANDOFF_STEP,
         "Upload safe image acceptance summaries",
     )
     names = [step.get("name") for step in steps]
@@ -929,7 +999,7 @@ def validate_check_workflow(
             add("check-continue-on-error")
 
     uses = [step.get("uses") for step in steps if "uses" in step]
-    if set(uses) != EXPECTED_ACTION_PINS:
+    if set(uses) != CHECK_EXPECTED_ACTION_PINS:
         add("check-action-pins")
     for pin, count in CHECK_EXPECTED_ACTION_COUNTS.items():
         if uses.count(pin) != count:
@@ -986,6 +1056,14 @@ def validate_check_workflow(
         if setup_with.get("cache") is not False:
             add("check-setup-go-cache")
 
+    _validate_docker_steps(
+        CHECK_JOB_ID,
+        job,
+        add,
+        context=CHECK_DOCKER_CONTEXT,
+        prefix="check-docker",
+    )
+
     build = _find_step(job, "Build and accept paired images")
     if build is None:
         add("check-build-missing")
@@ -1015,6 +1093,32 @@ def validate_check_workflow(
             if token in run:
                 add("check-build-unsafe")
 
+    handoff = _find_step(job, CHECK_HANDOFF_STEP)
+    if handoff is None:
+        add("check-handoff-missing")
+    else:
+        if handoff.get("shell") != "bash":
+            add("check-handoff-shell")
+        if "if" in handoff or "continue-on-error" in handoff:
+            add("check-handoff-skip")
+        if "env" in handoff:
+            add("check-handoff-env")
+        run = handoff.get("run", "")
+        if run.strip() != CHECK_HANDOFF_RUN.strip():
+            add("check-handoff-run")
+        for token in (
+            "GITHUB_TOKEN",
+            "github.token",
+            "secrets.",
+            "build-images.py",
+            "pair.tar",
+            "descriptor.json",
+            "build-record.json",
+            "accepted-images.json",
+        ):
+            if token in run:
+                add("check-handoff-run")
+
     uploads = [step for step in steps if step.get("uses") == UPLOAD]
     if len(uploads) != 1:
         add("check-upload")
@@ -1036,12 +1140,21 @@ def validate_check_workflow(
         paths = _upload_paths(upload)
         if tuple(paths) != CHECK_UPLOAD_PATHS:
             add("check-upload-paths")
+        allowed_basenames = {
+            "build-summary.json",
+            "images-summary.json",
+            "handoff-preflight.safe.json",
+        }
         for path in paths:
             if "*" in path or "?" in path or "[" in path:
                 add("check-upload-wildcard")
             if not path.endswith(".json"):
                 add("check-upload-paths")
+            if path.rsplit("/", 1)[-1] not in allowed_basenames:
+                add("check-upload-paths")
             if "/artifacts/" in path and "/upload/" not in path:
+                add("check-upload-paths")
+            if path.endswith((".tar", ".tar.gz")):
                 add("check-upload-paths")
         if set(upload_with) != {
             "name",
@@ -1084,6 +1197,80 @@ def _publish_inputs_ok(workflow: dict[str, Any]) -> bool:
         if not isinstance(description, str) or not description.strip():
             return False
     return True
+
+
+def _validate_docker_steps(
+    job_id: str,
+    job: dict[str, Any],
+    add: Any,
+    *,
+    context: str,
+    prefix: str,
+) -> None:
+    setup = _find_step(job, DOCKER_SETUP_STEP)
+    if setup is None:
+        add(f"{prefix}-setup-missing", job_id)
+    else:
+        if setup.get("uses") != SETUP_DOCKER:
+            add(f"{prefix}-action", job_id)
+        if "if" in setup or "continue-on-error" in setup:
+            add(f"{prefix}-setup-skip", job_id)
+        setup_with = setup.get("with", {})
+        if set(setup_with) != {
+            "version",
+            "context",
+            "set-host",
+            "runtime-basedir",
+            "daemon-config",
+            "github-token",
+        }:
+            add(f"{prefix}-setup-with", job_id)
+        if setup_with.get("version") != DOCKER_VERSION:
+            add(f"{prefix}-version", job_id)
+        if setup_with.get("context") != context:
+            add(f"{prefix}-context", job_id)
+        if setup_with.get("set-host") not in (True, "true"):
+            add(f"{prefix}-set-host", job_id)
+        if setup_with.get("runtime-basedir") != DOCKER_RUNTIME_BASEDIR:
+            add(f"{prefix}-runtime-basedir", job_id)
+        if setup_with.get("daemon-config") != DOCKER_DAEMON_CONFIG:
+            add(f"{prefix}-daemon-config", job_id)
+        if setup_with.get("github-token") != "":
+            add(f"{prefix}-token", job_id)
+    verify = _find_step(job, DOCKER_VERIFY_STEP)
+    if verify is None:
+        add(f"{prefix}-verify-missing", job_id)
+    else:
+        if verify.get("shell") != "bash":
+            add(f"{prefix}-verify-shell", job_id)
+        if "if" in verify or "continue-on-error" in verify:
+            add(f"{prefix}-verify-skip", job_id)
+        if verify.get("run", "").strip() != DOCKER_VERIFY_RUN.strip():
+            add(f"{prefix}-verify-run", job_id)
+
+
+def _validate_publish_ci_gate(
+    job_id: str, job: dict[str, Any], add: Any
+) -> None:
+    gate = _find_step(job, PUBLISH_CI_GATE_STEP)
+    if gate is None:
+        add("publish-ci-gate-missing", job_id)
+    else:
+        if gate.get("shell") != "bash":
+            add("publish-ci-gate-shell", job_id)
+        if "if" in gate or "continue-on-error" in gate:
+            add("publish-ci-gate-skip", job_id)
+        if gate.get("env") != {
+            "GITHUB_TOKEN": "${{ github.token }}",
+            "SOURCE_SHA": "${{ github.sha }}",
+        }:
+            add("publish-ci-gate-env", job_id)
+        run = gate.get("run", "")
+        if run.strip() != PUBLISH_CI_GATE_RUN.strip():
+            add("publish-ci-gate-run", job_id)
+        for token in ("secrets.", "PERSONAL_ACCESS_TOKEN", "GH_PAT"):
+            if token in run:
+                add("publish-ci-gate-unsafe", job_id)
 
 
 def validate_publish_workflow(
@@ -1140,8 +1327,13 @@ def validate_publish_workflow(
             add("publish-prepare-runs-on")
         if prepare.get("timeout-minutes") != PUBLISH_TIMEOUT_MINUTES:
             add("publish-prepare-timeout")
-        if "permissions" in prepare:
+        if prepare.get("permissions") != {
+            "contents": "read",
+            "actions": "read",
+        }:
             add("publish-prepare-permissions")
+        if "env" in prepare:
+            add("publish-prepare-env")
         if "needs" in prepare:
             add("publish-prepare-needs")
         if "if" in prepare:
@@ -1158,7 +1350,10 @@ def validate_publish_workflow(
             "Verify manual publish preconditions",
             "Isolate release Go config and caches",
             "Check out repository",
+            PUBLISH_CI_GATE_STEP,
             "Set up Go 1.27.4",
+            DOCKER_SETUP_STEP,
+            DOCKER_VERIFY_STEP,
             "Prepare release handoff",
             "Read trusted prepare outputs",
             "Upload release bundle",
@@ -1230,6 +1425,7 @@ def validate_publish_workflow(
                 add("publish-prepare-checkout-credentials")
             if checkout_with.get("fetch-depth") != "1":
                 add("publish-prepare-checkout-depth")
+        _validate_publish_ci_gate("prepare", prepare, add)
         setup_go = _find_step(prepare, "Set up Go 1.27.4")
         if setup_go is None:
             add("publish-prepare-setup-go-missing")
@@ -1317,6 +1513,15 @@ def validate_publish_workflow(
                     "${{ runner.temp }}/payment-hub-release-prepare/bundle/"
                 ):
                     add("publish-bundle-upload-paths")
+                if "payment-hub-ci-gate" in path:
+                    add("publish-bundle-upload-paths")
+        _validate_docker_steps(
+            "prepare",
+            prepare,
+            add,
+            context=PUBLISH_DOCKER_CONTEXT,
+            prefix="publish-docker",
+        )
 
     if isinstance(upload, dict):
         if upload.get("name") != "Publish paired images (linux/amd64)":
@@ -1329,9 +1534,12 @@ def validate_publish_workflow(
             add("publish-upload-needs")
         if upload.get("permissions") != {
             "contents": "read",
+            "actions": "read",
             "packages": "write",
         }:
             add("publish-upload-permissions")
+        if "env" in upload:
+            add("publish-upload-env")
         if "if" in upload:
             add("publish-upload-condition")
         names = _step_names(upload)
@@ -1340,9 +1548,12 @@ def validate_publish_workflow(
             "Isolate release Go config and caches",
             "Check out repository",
             "Set up Go 1.27.4",
+            DOCKER_SETUP_STEP,
+            DOCKER_VERIFY_STEP,
             "Prepare handoff download directory",
             "Download release bundle",
             "Restrict handoff bundle permissions",
+            PUBLISH_CI_GATE_STEP,
             "Publish paired images",
             "Upload release summary",
         ):
@@ -1473,6 +1684,7 @@ def validate_publish_workflow(
             ):
                 if name not in run:
                     add("publish-handoff-permissions-run")
+        _validate_publish_ci_gate("upload", upload, add)
         publish_step = _find_step(upload, "Publish paired images")
         if publish_step is None:
             add("publish-command-missing")
@@ -1540,16 +1752,30 @@ def validate_publish_workflow(
             for path in paths:
                 if "*" in path or "?" in path or "[" in path:
                     add("publish-summary-upload-wildcard")
+        _validate_docker_steps(
+            "upload",
+            upload,
+            add,
+            context=PUBLISH_DOCKER_CONTEXT,
+            prefix="publish-docker",
+        )
+    allowed_token_steps = {
+        ("prepare", PUBLISH_CI_GATE_STEP),
+        ("upload", PUBLISH_CI_GATE_STEP),
+        ("upload", "Publish paired images"),
+    }
     for job_id, job in jobs.items():
         if not isinstance(job, dict):
             continue
+        if "env" in job:
+            add("publish-job-env", job_id)
         if "GITHUB_TOKEN" in job.get("env", {}):
             add("publish-token-location")
         for step in job.get("steps", []):
             if "continue-on-error" in step:
                 add("publish-continue-on-error")
             if "GITHUB_TOKEN" in step.get("env", {}):
-                if job_id != "upload" or step.get("name") != "Publish paired images":
+                if (job_id, step.get("name")) not in allowed_token_steps:
                     add("publish-token-location")
             if step.get("uses") == DOWNLOAD and job_id != "upload":
                 add("publish-download-location")
@@ -1564,7 +1790,7 @@ def validate_publish_workflow(
         "id-token",
         "attestations",
         "contents: write",
-        "actions: read",
+        "actions: write",
         "ghcr.io",
         "docker push",
         "docker login",

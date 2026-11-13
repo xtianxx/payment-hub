@@ -510,7 +510,25 @@ builder各构建一次配对镜像并验收原产物，不认证、上传或部�
 
 **失败诊断与兼容性边界**：`TestApplicationLifecycleIntegration`包含真实二进制缺迁移、启动timeout/cancel/listen失败的停止及脱敏诊断断言，历史fresh PG证据已存在，当前树仍需复验。镜像迁移命令失败后的停止/清理目前有受控runner回归，不冒称已做真实镜像故障实验。遇迁移或启动失败应停止，保存固定分类并收割本次进程，再单独核对本轮资源归属；不清演示卷、不自动重付。当前镜像核对schema版本1/2/3及源码身份，只能证明当前配对适配；没有旧版本镜像兼容实验，不能宣称旧镜像可直接使用新schema。旧构建记录与当前源码失配应拒绝，而不是放宽检查。
 
-### CI与代码防漂移（2026-11-10）
+### 工作流职责与运行时机（2026-11-13修订）
+
+本轮仍保留三个工作流，不新增手动PR检查、不将正式发布搬到PR。以下为修复分支的配置，提交、推送与真实Actions复验前，不代表远端已经生效。
+
+| 工作流 | 用途 | 运行时机 | 权限与边界 |
+|---|---|---|---|
+| `setup-check.yml` | 格式/静态、单元/race、真实数据库集成、取消清理、漏洞扫描，最后由`CI gate`汇总 | 目标分支为main的PR创建/更新；push main | `contents: read`；保持原有检查不变 |
+| `check.yml` | 同一对镜像构建一次、验收，再做真实save/load内容身份交接预检 | 同上，合并前验证，合并main后再验证 | `contents: read`；无GHCR登录、上传或部署 |
+| `publish.yml` | 检查当前main提交的必要CI成功，再受控构建、交接、上传与按摘要拉回复验 | 仅main的人工触发，仍需两项发布确认 | CI查询增加`actions: read`；仅upload job有`packages: write`；不自动部署 |
+
+仅推送功能分支而未创建目标为main的PR，不触发前两项。`pull_request.branches: main`限制的是PR目标，不是源分支。没有新增定时扫描、tag发布或merge queue触发。
+
+镜像预检与发布统一固定Docker 29.9.3/containerd环境。预检只消费本次builder已验收的配对产物，不重构建；在本次临时daemon中确认镜像无额外共享引用、无容器使用后，仅移除本次配对镜像，再确认缺席、从归档导入并核对内容身份。普通本地daemon禁止执行此移除路径；不prune、不清理无关镜像或卷。交接归档仅临时保存，CI只上传白名单安全摘要。这能验证本地归档往返，不等于跨job artifact传递、GHCR上传或真实渠道验证。
+
+正式发布检查精确源码SHA的`setup-check.yml`与`check.yml`最新push/main运行；缺失、运行中、失败、取消、API不可访问均停止，不能从历史记录挑一个成功结果。prepare提前检查，upload在真正发布入口前再次检查；门禁通过后到外部上传仍存在新运行开始的时间窗口，不声称与GitHub状态更新原子同步。
+
+**远端保护现状**：本轮只读查询发现main有active ruleset（`main-branch-protection`），但没有`required_status_checks`规则；经典branch protection接口返回“Branch not protected”不代表没有ruleset。尚未改动远端规则。管理员应在新检查实际运行后，将`CI gate`与`Paired image acceptance (linux/amd64)`同时设为必需检查并验证阻断效果；只设置前者不会约束独立的镜像工作流。发布自己的CI门禁也不能替代合并保护。
+
+### CI与代码防漂移（2026-11-10，历史记录）
 
 当前默认必需清单保留38个根，并显式绑定R1焦点子测试`TestPaymentRequestBoundary/POST_rejection_priority`，合计39项；根pass但该子组缺失、skip、fail、错包或重复都不能绿。DB仍为四包、11项。工作流摘要直接由`check-ci-contract.py --summary default|db`读取常量生成，不手抄名单；默认摘要的包数是必需绑定包数，不是整套测试包数。
 

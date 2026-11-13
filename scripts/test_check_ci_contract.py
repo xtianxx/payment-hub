@@ -52,6 +52,9 @@ CI_SPEC.loader.exec_module(CI_MOD)
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 SETUP_GO = "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e"
 UPLOAD = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+SETUP_DOCKER = (
+    "docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6"
+)
 JOB_IDS = (
     "setup-check",
     "database-foundation",
@@ -59,12 +62,24 @@ JOB_IDS = (
     "ci-gate",
 )
 CHECK_JOB_ID = "image-acceptance"
-CHECK_ACTION_COUNTS = {CHECKOUT: 1, SETUP_GO: 1, UPLOAD: 1}
+CHECK_ACTION_COUNTS = {
+    CHECKOUT: 1,
+    SETUP_GO: 1,
+    UPLOAD: 1,
+    SETUP_DOCKER: 1,
+}
+CHECK_HANDOFF_STEP = "Verify image handoff without publishing"
 DOWNLOAD = (
     "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
 )
 PUBLISH_JOB_IDS = ("prepare", "upload")
-PUBLISH_ACTION_COUNTS = {CHECKOUT: 2, SETUP_GO: 2, UPLOAD: 2, DOWNLOAD: 1}
+PUBLISH_ACTION_COUNTS = {
+    CHECKOUT: 2,
+    SETUP_GO: 2,
+    UPLOAD: 2,
+    DOWNLOAD: 1,
+    SETUP_DOCKER: 2,
+}
 GATE_RUN = (
     "set -euo pipefail\n"
     'if [[ "${SETUP_RESULT:-}" != "success" || '
@@ -75,6 +90,45 @@ GATE_RUN = (
     "fi\n"
     'echo "ci-gate: all required jobs succeeded"\n'
     "exit 0"
+)
+DOCKER_SETUP_STEP = (
+    "      - name: Set up Docker 29.9.3 with containerd image store\n"
+    "        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0\n"
+    "        with:\n"
+    "          version: v29.9.3\n"
+    "          context: payment-hub-release\n"
+    "          set-host: true\n"
+    "          runtime-basedir: ${{ runner.temp }}/payment-hub-docker\n"
+    "          daemon-config: '{\"features\":{\"containerd-snapshotter\":true}}'\n"
+    '          github-token: ""\n'
+)
+DOCKER_VERIFY_STEP = (
+    "      - name: Verify Docker image store\n"
+    "        shell: bash\n"
+    "        run: |\n"
+    + "".join(
+        "          " + line + "\n"
+        for line in MOD.PUBLISH_DOCKER_VERIFY_RUN.splitlines()
+    )
+)
+DOCKER_HOST_GUARD = (
+    '          if [[ -z "${DOCKER_HOST:-}" ]]; then\n'
+    '            echo "::error::DOCKER_HOST is not set; DOCKER_CONFIG overrides would bypass the dedicated daemon"\n'
+    "            exit 1\n"
+    "          fi\n"
+)
+PUBLISH_CI_GATE_STEP_TEXT = (
+    "      - name: Require successful main CI\n"
+    "        shell: bash\n"
+    "        env:\n"
+    "          GITHUB_TOKEN: ${{ github.token }}\n"
+    "          SOURCE_SHA: ${{ github.sha }}\n"
+    "        run: |\n"
+    + "".join(
+        "          " + line + "\n"
+        for line in MOD.PUBLISH_CI_GATE_RUN.splitlines()
+    )
+    + "\n"
 )
 
 
@@ -672,7 +726,10 @@ class CheckWorkflowContractTests(unittest.TestCase):
                 "Isolate image acceptance Go config and caches",
                 "Check out repository",
                 "Set up Go 1.27.4",
+                MOD.DOCKER_SETUP_STEP,
+                MOD.DOCKER_VERIFY_STEP,
                 "Build and accept paired images",
+                CHECK_HANDOFF_STEP,
                 "Upload safe image acceptance summaries",
             ],
         )
@@ -681,7 +738,9 @@ class CheckWorkflowContractTests(unittest.TestCase):
             for step in _steps(self.workflow, CHECK_JOB_ID)
             if "uses" in step
         ]
-        self.assertEqual(set(uses), {CHECKOUT, SETUP_GO, UPLOAD})
+        self.assertEqual(
+            set(uses), {CHECKOUT, SETUP_GO, UPLOAD, SETUP_DOCKER}
+        )
         for pin, count in CHECK_ACTION_COUNTS.items():
             self.assertEqual(uses.count(pin), count)
         for step in _steps(self.workflow, CHECK_JOB_ID):
@@ -689,6 +748,56 @@ class CheckWorkflowContractTests(unittest.TestCase):
                 self.assertEqual(step["with"]["go-version"], "1.27.4")
                 self.assertIs(step["with"]["check-latest"], False)
                 self.assertIs(step["with"]["cache"], False)
+
+    def test_docker_setup_and_store_verification_are_exact(self):
+        expected_with = {
+            "version": MOD.DOCKER_VERSION,
+            "context": MOD.CHECK_DOCKER_CONTEXT,
+            "set-host": "true",
+            "runtime-basedir": MOD.DOCKER_RUNTIME_BASEDIR,
+            "daemon-config": MOD.DOCKER_DAEMON_CONFIG,
+            "github-token": "",
+        }
+        setup = _step(self.workflow, CHECK_JOB_ID, MOD.DOCKER_SETUP_STEP)
+        self.assertEqual(setup["uses"], SETUP_DOCKER)
+        self.assertEqual(setup["with"], expected_with)
+        self.assertNotIn("if", setup)
+        self.assertNotIn("continue-on-error", setup)
+        verify = _step(self.workflow, CHECK_JOB_ID, MOD.DOCKER_VERIFY_STEP)
+        self.assertEqual(verify["shell"], "bash")
+        self.assertNotIn("if", verify)
+        self.assertNotIn("continue-on-error", verify)
+        self.assertEqual(
+            verify["run"].strip(), MOD.DOCKER_VERIFY_RUN.strip()
+        )
+
+    def test_handoff_verification_is_exact_and_does_not_rebuild(self):
+        step = _step(self.workflow, CHECK_JOB_ID, CHECK_HANDOFF_STEP)
+        self.assertEqual(step["shell"], "bash")
+        self.assertNotIn("if", step)
+        self.assertNotIn("continue-on-error", step)
+        self.assertNotIn("env", step)
+        self.assertEqual(step["run"].strip(), MOD.CHECK_HANDOFF_RUN.strip())
+        for token in (
+            "build-images.py",
+            "pair.tar",
+            "descriptor.json",
+            "build-record.json",
+            "accepted-images.json",
+            "GITHUB_TOKEN",
+            "secrets.",
+        ):
+            with self.subTest(forbidden=token):
+                self.assertNotIn(token, step["run"])
+        names = [item.get("name") for item in _steps(self.workflow, CHECK_JOB_ID)]
+        self.assertLess(
+            names.index("Build and accept paired images"),
+            names.index(CHECK_HANDOFF_STEP),
+        )
+        self.assertLess(
+            names.index(CHECK_HANDOFF_STEP),
+            names.index("Upload safe image acceptance summaries"),
+        )
 
     def test_isolation_step_is_controlled_and_has_no_raw_dump(self):
         step = _step(
@@ -765,6 +874,7 @@ class CheckWorkflowContractTests(unittest.TestCase):
             [
                 "${{ runner.temp }}/payment-hub-images/artifacts/upload/build-summary.json",
                 "${{ runner.temp }}/payment-hub-images/artifacts/upload/images-summary.json",
+                "${{ runner.temp }}/payment-hub-images/artifacts/upload/handoff-preflight.safe.json",
             ],
         )
         for path in paths:
@@ -772,6 +882,10 @@ class CheckWorkflowContractTests(unittest.TestCase):
             self.assertNotIn("*", path)
             self.assertNotIn("?", path)
             self.assertNotIn("[", path)
+            self.assertNotIn("pair.tar", path)
+            self.assertNotIn("descriptor.json", path)
+            self.assertNotIn("build-record.json", path)
+            self.assertNotIn("accepted-images.json", path)
 
     def test_forbidden_tokens_are_absent(self):
         for token in MOD.CHECK_FORBIDDEN_TOKENS:
@@ -800,6 +914,117 @@ class CheckWorkflowMutationTests(unittest.TestCase):
         except MOD.ContractError:
             return [MOD.ContractIssue("parse")]
         return MOD.validate_check_workflow(workflow, text, REPO)
+
+    def test_mutation_check_docker_setup_is_missing(self):
+        text = self.text.replace(
+            "      - name: Set up Docker 29.9.3 with containerd image store\n",
+            "      - name: Set up Docker\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "check-docker-setup-missing", {issue.kind for issue in issues}
+        )
+
+    def test_mutation_check_docker_verify_is_missing(self):
+        text = self.text.replace(
+            "      - name: Verify Docker image store\n",
+            "      - name: Verify Docker store\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "check-docker-verify-missing", {issue.kind for issue in issues}
+        )
+
+    def test_mutation_check_docker_version_is_rejected(self):
+        text = self.text.replace("version: v29.9.3", "version: v29.6.1", 1)
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("check-docker-version", {issue.kind for issue in issues})
+
+    def test_mutation_check_docker_context_is_rejected(self):
+        text = self.text.replace(
+            "context: payment-hub-check", "context: payment-hub-release", 1
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("check-docker-context", {issue.kind for issue in issues})
+
+    def test_mutation_check_docker_store_is_rejected(self):
+        text = self.text.replace(
+            "daemon-config: '{\"features\":{\"containerd-snapshotter\":true}}'",
+            "daemon-config: '{}'",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "check-docker-daemon-config", {issue.kind for issue in issues}
+        )
+
+    def test_mutation_check_docker_set_host_is_rejected(self):
+        text = self.text.replace("set-host: true", "set-host: false", 1)
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("check-docker-set-host", {issue.kind for issue in issues})
+
+    def test_mutation_check_docker_token_is_rejected(self):
+        text = self.text.replace(
+            'github-token: ""', "github-token: ${{ github.token }}", 1
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("check-docker-token", {issue.kind for issue in issues})
+
+    def test_mutation_check_handoff_is_missing(self):
+        text = self.text.replace(
+            "      - name: Verify image handoff without publishing\n",
+            "      - name: Verify image handoff\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("check-handoff-missing", {issue.kind for issue in issues})
+
+    def test_mutation_check_handoff_rebuild_is_rejected(self):
+        text = self.text.replace(
+            "scripts/check-image-handoff.py", "scripts/build-images.py", 1
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("check-handoff-run", {issue.kind for issue in issues})
+
+    def test_mutation_check_handoff_raw_upload_is_rejected(self):
+        for replacement in ("pair.tar", "descriptor.json"):
+            with self.subTest(replacement=replacement):
+                text = self.text.replace(
+                    "handoff-preflight.safe.json", replacement, 1
+                )
+                self.assertNotEqual(text, self.text)
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "check-upload-paths", {issue.kind for issue in issues}
+                )
+
+    def test_mutation_check_handoff_skip_is_rejected(self):
+        for field in ("if: false", "continue-on-error: true"):
+            with self.subTest(field=field):
+                text = self.text.replace(
+                    "      - name: Verify image handoff without publishing\n"
+                    "        shell: bash\n",
+                    "      - name: Verify image handoff without publishing\n"
+                    f"        {field}\n"
+                    "        shell: bash\n",
+                    1,
+                )
+                self.assertNotEqual(text, self.text)
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "check-handoff-skip", {issue.kind for issue in issues}
+                )
 
     def test_mutation_write_permissions_is_rejected(self):
         text = self.text.replace(
@@ -984,13 +1209,21 @@ class PublishWorkflowContractTests(unittest.TestCase):
         for job in (prepare, upload):
             self.assertEqual(job["runs-on"], "ubuntu-24.04")
             self.assertEqual(job["timeout-minutes"], 30)
-        self.assertNotIn("permissions", prepare)
+            self.assertNotIn("env", job)
+        self.assertEqual(
+            prepare["permissions"],
+            {"contents": "read", "actions": "read"},
+        )
         self.assertNotIn("needs", prepare)
         self.assertNotIn("if", prepare)
         self.assertEqual(upload["needs"], "prepare")
         self.assertEqual(
             upload["permissions"],
-            {"contents": "read", "packages": "write"},
+            {
+                "contents": "read",
+                "actions": "read",
+                "packages": "write",
+            },
         )
         self.assertNotIn("if", upload)
         self.assertEqual(self.workflow.get("permissions"), {"contents": "read"})
@@ -1186,7 +1419,56 @@ class PublishWorkflowContractTests(unittest.TestCase):
             with self.subTest(file=name):
                 self.assertIn(name, restrict)
 
-    def test_publish_token_is_only_in_publish_step(self):
+    def test_publish_ci_gates_are_exact_and_ordered(self):
+        expected_env = {
+            "GITHUB_TOKEN": "${{ github.token }}",
+            "SOURCE_SHA": "${{ github.sha }}",
+        }
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                names = [
+                    step.get("name") for step in _steps(self.workflow, job_id)
+                ]
+                gate_index = names.index(MOD.PUBLISH_CI_GATE_STEP)
+                self.assertEqual(names.count(MOD.PUBLISH_CI_GATE_STEP), 1)
+                if job_id == "prepare":
+                    self.assertLess(
+                        names.index("Check out repository"), gate_index
+                    )
+                    self.assertLess(
+                        gate_index, names.index("Set up Go 1.27.4")
+                    )
+                    self.assertLess(
+                        gate_index, names.index(MOD.DOCKER_SETUP_STEP)
+                    )
+                else:
+                    self.assertEqual(
+                        names[gate_index - 1],
+                        "Restrict handoff bundle permissions",
+                    )
+                    self.assertEqual(
+                        names[gate_index + 1], "Publish paired images"
+                    )
+                gate = _step(
+                    self.workflow, job_id, MOD.PUBLISH_CI_GATE_STEP
+                )
+                self.assertEqual(gate["shell"], "bash")
+                self.assertNotIn("if", gate)
+                self.assertNotIn("continue-on-error", gate)
+                self.assertEqual(gate["env"], expected_env)
+                self.assertEqual(
+                    gate["run"].strip(), MOD.PUBLISH_CI_GATE_RUN.strip()
+                )
+        self.assertNotIn(
+            "payment-hub-release-prepare", MOD.PUBLISH_CI_GATE_SUMMARY
+        )
+        self.assertNotIn(
+            "payment-hub-release-publish", MOD.PUBLISH_CI_GATE_SUMMARY
+        )
+        bundle = _step(self.workflow, "prepare", "Upload release bundle")
+        self.assertNotIn("payment-hub-ci-gate", bundle["with"]["path"])
+
+    def test_publish_token_is_only_in_ci_gates_and_publish_step(self):
         publish = _step(self.workflow, "upload", "Publish paired images")
         self.assertEqual(
             publish["env"],
@@ -1200,10 +1482,18 @@ class PublishWorkflowContractTests(unittest.TestCase):
         )
         token_steps = []
         for job_id, job in self.workflow.get("jobs", {}).items():
+            self.assertNotIn("env", job)
             for step in job.get("steps", []):
                 if "GITHUB_TOKEN" in step.get("env", {}):
                     token_steps.append((job_id, step.get("name")))
-        self.assertEqual(token_steps, [("upload", "Publish paired images")])
+        self.assertEqual(
+            token_steps,
+            [
+                ("prepare", MOD.PUBLISH_CI_GATE_STEP),
+                ("upload", MOD.PUBLISH_CI_GATE_STEP),
+                ("upload", "Publish paired images"),
+            ],
+        )
         self.assertNotIn("GITHUB_TOKEN", self.workflow.get("env", {}))
         self.assertNotIn("secrets.", self.text)
 
@@ -1275,7 +1565,7 @@ class PublishWorkflowContractTests(unittest.TestCase):
             if "uses" in step
         ]
         self.assertEqual(
-            set(uses), {CHECKOUT, SETUP_GO, UPLOAD, DOWNLOAD}
+            set(uses), {CHECKOUT, SETUP_GO, UPLOAD, DOWNLOAD, SETUP_DOCKER}
         )
         for pin, count in PUBLISH_ACTION_COUNTS.items():
             self.assertEqual(uses.count(pin), count)
@@ -1295,6 +1585,46 @@ class PublishWorkflowContractTests(unittest.TestCase):
                 if step.get("uses") == DOWNLOAD:
                     self.assertEqual(job_id, "upload")
 
+    def test_docker_setup_and_store_verification_are_exact(self):
+        expected_with = {
+            "version": "v29.9.3",
+            "context": "payment-hub-release",
+            "set-host": "true",
+            "runtime-basedir": "${{ runner.temp }}/payment-hub-docker",
+            "daemon-config": '{"features":{"containerd-snapshotter":true}}',
+            "github-token": "",
+        }
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                names = [step.get("name") for step in _steps(self.workflow, job_id)]
+                setup_index = names.index(MOD.PUBLISH_DOCKER_SETUP_STEP)
+                verify_index = names.index(MOD.PUBLISH_DOCKER_VERIFY_STEP)
+                self.assertLess(names.index("Set up Go 1.27.4"), setup_index)
+                self.assertLess(setup_index, verify_index)
+                self.assertEqual(
+                    names[verify_index + 1],
+                    "Prepare release handoff"
+                    if job_id == "prepare"
+                    else "Prepare handoff download directory",
+                )
+                setup = _step(
+                    self.workflow, job_id, MOD.PUBLISH_DOCKER_SETUP_STEP
+                )
+                self.assertEqual(setup["uses"], SETUP_DOCKER)
+                self.assertEqual(setup["with"], expected_with)
+                self.assertNotIn("if", setup)
+                self.assertNotIn("continue-on-error", setup)
+                verify = _step(
+                    self.workflow, job_id, MOD.PUBLISH_DOCKER_VERIFY_STEP
+                )
+                self.assertEqual(verify["shell"], "bash")
+                self.assertNotIn("if", verify)
+                self.assertNotIn("continue-on-error", verify)
+                self.assertEqual(
+                    verify["run"].strip(),
+                    MOD.PUBLISH_DOCKER_VERIFY_RUN.strip(),
+                )
+
     def test_validator_passes(self):
         self.assertEqual(
             MOD.validate_publish_workflow(self.workflow, self.text, REPO), []
@@ -1309,7 +1639,7 @@ class PublishWorkflowContractTests(unittest.TestCase):
             "id-token",
             "attestations",
             "contents: write",
-            "actions: read",
+            "actions: write",
             "ghcr.io",
             "docker push",
             "docker login",
@@ -1335,12 +1665,159 @@ class PublishWorkflowMutationTests(unittest.TestCase):
             return [MOD.ContractIssue("parse")]
         return MOD.validate_publish_workflow(workflow, text, REPO)
 
+    def _mutate_job(self, job_id, old, new):
+        if job_id == "prepare":
+            text = self.text.replace(old, new, 1)
+        else:
+            head, separator, tail = self.text.rpartition(old)
+            self.assertTrue(separator, "mutation target not found")
+            text = head + new + tail
+        self.assertNotEqual(text, self.text, "mutation did not apply")
+        return text
+
+    def test_mutation_missing_docker_setup_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(job_id, DOCKER_SETUP_STEP, "")
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-docker-setup-missing",
+                    {issue.kind for issue in issues},
+                )
+
+    def test_mutation_missing_docker_verify_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(job_id, DOCKER_VERIFY_STEP, "")
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-docker-verify-missing",
+                    {issue.kind for issue in issues},
+                )
+
+    def test_mutation_docker_action_pin_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id,
+                    SETUP_DOCKER,
+                    "docker/setup-docker-action@deadbeef",
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-docker-action",
+                    {issue.kind for issue in issues},
+                )
+
+    def test_mutation_docker_version_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id, "version: v29.9.3", "version: v29.6.1"
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-docker-version",
+                    {issue.kind for issue in issues},
+                )
+
+    def test_mutation_docker_image_store_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id,
+                    "daemon-config: '{\"features\":{\"containerd-snapshotter\":true}}'",
+                    "daemon-config: '{}'",
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-docker-daemon-config",
+                    {issue.kind for issue in issues},
+                )
+
+    def test_mutation_docker_set_host_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id, "set-host: true", "set-host: false"
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-docker-set-host",
+                    {issue.kind for issue in issues},
+                )
+
+    def test_mutation_docker_token_input_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id,
+                    'github-token: ""',
+                    "github-token: ${{ github.token }}",
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-docker-token",
+                    {issue.kind for issue in issues},
+                )
+
+    def test_mutation_docker_auth_override_protection_is_rejected(self):
+        prepare = self._mutate_job("prepare", DOCKER_HOST_GUARD, "")
+        issues = self._issues_for_mutation(prepare)
+        self.assertIn(
+            "publish-docker-verify-run", {issue.kind for issue in issues}
+        )
+        upload = self._mutate_job(
+            "upload", 'DOCKER_CONFIG="$auth_dir" docker info', "docker info"
+        )
+        issues = self._issues_for_mutation(upload)
+        self.assertIn(
+            "publish-docker-verify-run", {issue.kind for issue in issues}
+        )
+
+    def test_mutation_docker_continue_on_error_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id,
+                    "      - name: Verify Docker image store\n"
+                    "        shell: bash\n",
+                    "      - name: Verify Docker image store\n"
+                    "        continue-on-error: true\n"
+                    "        shell: bash\n",
+                )
+                issues = self._issues_for_mutation(text)
+                kinds = {issue.kind for issue in issues}
+                self.assertIn("publish-docker-verify-skip", kinds)
+                self.assertIn("publish-continue-on-error", kinds)
+
+    def test_mutation_docker_if_bypass_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id,
+                    "      - name: Verify Docker image store\n"
+                    "        shell: bash\n",
+                    "      - name: Verify Docker image store\n"
+                    "        if: false\n"
+                    "        shell: bash\n",
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-docker-verify-skip",
+                    {issue.kind for issue in issues},
+                )
+
     def test_mutation_prepare_write_permissions_is_rejected(self):
         text = self.text.replace(
-            "    runs-on: ubuntu-24.04\n",
-            "    runs-on: ubuntu-24.04\n"
             "    permissions:\n"
-            "      contents: write\n",
+            "      contents: read\n"
+            "      actions: read\n"
+            "    outputs:\n",
+            "    permissions:\n"
+            "      contents: write\n"
+            "      actions: read\n"
+            "    outputs:\n",
             1,
         )
         self.assertNotEqual(text, self.text)
@@ -1352,9 +1829,11 @@ class PublishWorkflowMutationTests(unittest.TestCase):
         text = self.text.replace(
             "    permissions:\n"
             "      contents: read\n"
+            "      actions: read\n"
             "      packages: write\n",
             "    permissions:\n"
             "      contents: read\n"
+            "      actions: read\n"
             "      packages: write\n"
             "      id-token: write\n",
             1,
@@ -1363,6 +1842,116 @@ class PublishWorkflowMutationTests(unittest.TestCase):
         issues = self._issues_for_mutation(text)
         self.assertTrue(issues)
         self.assertIn("publish-upload-permissions", {issue.kind for issue in issues})
+
+    def test_mutation_actions_write_is_rejected(self):
+        text = self.text.replace(
+            "      actions: read\n", "      actions: write\n", 1
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "publish-forbidden-token", {issue.kind for issue in issues}
+        )
+        self.assertIn(
+            "publish-prepare-permissions", {issue.kind for issue in issues}
+        )
+
+    def test_mutation_ci_gate_missing_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id,
+                    "      - name: Require successful main CI\n",
+                    "      - name: Require main CI\n",
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-ci-gate-missing",
+                    {issue.kind for issue in issues},
+                )
+
+    def test_mutation_ci_gate_skip_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id,
+                    "      - name: Require successful main CI\n"
+                    "        shell: bash\n",
+                    "      - name: Require successful main CI\n"
+                    "        if: false\n"
+                    "        shell: bash\n",
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-ci-gate-skip", {issue.kind for issue in issues}
+                )
+
+    def test_mutation_ci_gate_wrong_sha_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                mutated_gate = PUBLISH_CI_GATE_STEP_TEXT.replace(
+                    '--source-sha "$SOURCE_SHA"',
+                    '--source-sha "$PREPARED_SHA"',
+                )
+                text = self._mutate_job(
+                    job_id, PUBLISH_CI_GATE_STEP_TEXT, mutated_gate
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-ci-gate-run", {issue.kind for issue in issues}
+                )
+
+    def test_mutation_ci_gate_wrong_command_is_rejected(self):
+        for job_id in PUBLISH_JOB_IDS:
+            with self.subTest(job=job_id):
+                text = self._mutate_job(
+                    job_id,
+                    "scripts/check-main-ci.py",
+                    "scripts/other.py",
+                )
+                issues = self._issues_for_mutation(text)
+                self.assertIn(
+                    "publish-ci-gate-run", {issue.kind for issue in issues}
+                )
+
+    def test_mutation_ci_gate_after_publish_is_rejected(self):
+        text = self._mutate_job(
+            "upload", PUBLISH_CI_GATE_STEP_TEXT, ""
+        )
+        text = text.replace(
+            "      - name: Upload release summary\n",
+            PUBLISH_CI_GATE_STEP_TEXT + "      - name: Upload release summary\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-upload-steps", {issue.kind for issue in issues})
+
+    def test_mutation_ci_gate_summary_in_bundle_is_rejected(self):
+        text = self.text.replace(
+            "            ${{ runner.temp }}/payment-hub-release-prepare/bundle/"
+            "accepted-images.json\n",
+            "            ${{ runner.temp }}/payment-hub-release-prepare/bundle/"
+            "accepted-images.json\n"
+            "            ${{ runner.temp }}/payment-hub-ci-gate/ci-preflight.json\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "publish-bundle-upload-paths", {issue.kind for issue in issues}
+        )
+
+    def test_mutation_upload_token_leak_is_rejected(self):
+        text = self.text.replace(
+            "          PREPARED_SHA: ${{ needs.prepare.outputs.source_sha }}\n",
+            "          GITHUB_TOKEN: ${{ github.token }}\n"
+            "          PREPARED_SHA: ${{ needs.prepare.outputs.source_sha }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-token-location", {issue.kind for issue in issues})
 
     def test_mutation_pr_trigger_is_rejected(self):
         text = self.text.replace(
@@ -1518,9 +2107,11 @@ class PublishWorkflowMutationTests(unittest.TestCase):
         text = self.text.replace(
             "    permissions:\n"
             "      contents: read\n"
+            "      actions: read\n"
             "      packages: write\n",
             "    permissions:\n"
             "      contents: read\n"
+            "      actions: read\n"
             "      packages: write\n"
             "      id-token: write\n",
             1,

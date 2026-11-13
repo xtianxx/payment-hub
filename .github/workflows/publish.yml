@@ -34,6 +34,9 @@ jobs:
     name: Prepare release handoff (linux/amd64)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     outputs:
       artifact_id: ${{ steps.bundle.outputs.artifact-id }}
       artifact_digest: ${{ steps.bundle.outputs.artifact-digest }}
@@ -109,12 +112,56 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
+      - name: Require successful main CI
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/check-main-ci.py --source-sha "$SOURCE_SHA" --summary "$RUNNER_TEMP/payment-hub-ci-gate/ci-preflight.json"
+
       - name: Set up Go 1.27.4
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.4"
           check-latest: false
           cache: false
+
+      - name: Set up Docker 29.9.3 with containerd image store
+        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
+        with:
+          version: v29.9.3
+          context: payment-hub-release
+          set-host: true
+          runtime-basedir: ${{ runner.temp }}/payment-hub-docker
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+          github-token: ""
+
+      - name: Verify Docker image store
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DOCKER_HOST:-}" ]]; then
+            echo "::error::DOCKER_HOST is not set; DOCKER_CONFIG overrides would bypass the dedicated daemon"
+            exit 1
+          fi
+          if [[ "$(docker version --format '{{.Server.Version}}')" != "29.9.3" ]]; then
+            echo "::error::unexpected Docker server version"
+            exit 1
+          fi
+          driver_status="$(docker info --format '{{range .DriverStatus}}{{index . 0}}={{index . 1}}{{"\n"}}{{end}}')"
+          if ! grep -Fxq 'driver-type=io.containerd.snapshotter.v1' <<<"$driver_status"; then
+            echo "::error::Docker image store is not the containerd snapshotter"
+            exit 1
+          fi
+          daemon_id="$(docker info --format '{{.ID}}')"
+          auth_dir="$(mktemp -d)"
+          trap 'rm -rf "$auth_dir"' EXIT
+          if [[ "$(DOCKER_CONFIG="$auth_dir" docker info --format '{{.ID}}')" != "$daemon_id" ]]; then
+            echo "::error::empty DOCKER_CONFIG reaches a different Docker daemon"
+            exit 1
+          fi
 
       - name: Prepare release handoff
         shell: bash
@@ -173,6 +220,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
       packages: write
 
     steps:
@@ -236,6 +284,41 @@ jobs:
           check-latest: false
           cache: false
 
+      - name: Set up Docker 29.9.3 with containerd image store
+        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
+        with:
+          version: v29.9.3
+          context: payment-hub-release
+          set-host: true
+          runtime-basedir: ${{ runner.temp }}/payment-hub-docker
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+          github-token: ""
+
+      - name: Verify Docker image store
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DOCKER_HOST:-}" ]]; then
+            echo "::error::DOCKER_HOST is not set; DOCKER_CONFIG overrides would bypass the dedicated daemon"
+            exit 1
+          fi
+          if [[ "$(docker version --format '{{.Server.Version}}')" != "29.9.3" ]]; then
+            echo "::error::unexpected Docker server version"
+            exit 1
+          fi
+          driver_status="$(docker info --format '{{range .DriverStatus}}{{index . 0}}={{index . 1}}{{"\n"}}{{end}}')"
+          if ! grep -Fxq 'driver-type=io.containerd.snapshotter.v1' <<<"$driver_status"; then
+            echo "::error::Docker image store is not the containerd snapshotter"
+            exit 1
+          fi
+          daemon_id="$(docker info --format '{{.ID}}')"
+          auth_dir="$(mktemp -d)"
+          trap 'rm -rf "$auth_dir"' EXIT
+          if [[ "$(DOCKER_CONFIG="$auth_dir" docker info --format '{{.ID}}')" != "$daemon_id" ]]; then
+            echo "::error::empty DOCKER_CONFIG reaches a different Docker daemon"
+            exit 1
+          fi
+
       - name: Prepare handoff download directory
         shell: bash
         run: |
@@ -259,6 +342,15 @@ jobs:
             "$RUNNER_TEMP/payment-hub-release-handoff/descriptor.json" \
             "$RUNNER_TEMP/payment-hub-release-handoff/build-record.json" \
             "$RUNNER_TEMP/payment-hub-release-handoff/accepted-images.json"
+
+      - name: Require successful main CI
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/check-main-ci.py --source-sha "$SOURCE_SHA" --summary "$RUNNER_TEMP/payment-hub-ci-gate/ci-preflight.json"
 
       - name: Publish paired images
         shell: bash
