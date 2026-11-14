@@ -27,56 +27,6 @@ WORKFLOW_RELATIVE = Path(".github/workflows/setup-check.yml")
 CHECK_RELATIVE = Path(".github/workflows/check.yml")
 PUBLISH_RELATIVE = Path(".github/workflows/publish.yml")
 APPROVED_WORKFLOW_FILES = ("check.yml", "publish.yml", "setup-check.yml")
-# Temporary, explicitly approved read-only diagnostic.  It is accepted only
-# while its complete text is byte-for-byte equal to this fixed template; the
-# permanent approved inventory remains the three files above.
-DIAGNOSE_WORKFLOW_FILE = "diagnose-package-link.yml"
-DIAGNOSE_WORKFLOW_TEMPLATE = "\n".join(
-    (
-        "name: Diagnose package inventory Link / 包清单分页诊断",
-        "",
-        "on:",
-        "  push:",
-        "    branches:",
-        "      - fix/ghcr-inventory-link",
-        "    paths:",
-        "      - .github/workflows/diagnose-package-link.yml",
-        "      - scripts/diagnose-package-link.py",
-        "      - scripts/test_diagnose_package_link.py",
-        "",
-        "permissions:",
-        "  contents: read",
-        "",
-        "jobs:",
-        "  diagnose:",
-        "    name: Read-only inventory Link diagnostic",
-        "    if: ${{ github.repository == 'xtianxx/payment-hub' "
-        "&& github.actor == 'xtianxx' "
-        "&& github.triggering_actor == 'xtianxx' }}",
-        "    runs-on: ubuntu-24.04",
-        "    timeout-minutes: 3",
-        "    steps:",
-        "      - name: Check out repository",
-        "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
-        "        with:",
-        "          ref: ${{ github.sha }}",
-        "          persist-credentials: false",
-        "          fetch-depth: 1",
-        "",
-        "      - name: Diagnose package inventory Link",
-        "        shell: bash",
-        "        env:",
-        "          GHCR_PACKAGE_AUDIT_TOKEN: ${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}",
-        "          DIAGNOSE_REPOSITORY: ${{ github.repository }}",
-        "          DIAGNOSE_REF: ${{ github.ref }}",
-        "          DIAGNOSE_ACTOR: ${{ github.actor }}",
-        "          DIAGNOSE_TRIGGERING_ACTOR: ${{ github.triggering_actor }}",
-        "          DIAGNOSE_EVENT_NAME: ${{ github.event_name }}",
-        "        run: |",
-        "          set -euo pipefail",
-        "          python3 -B scripts/diagnose-package-link.py",
-    )
-) + "\n"
 EXPECTED_MODULE = "payment-hub"
 METADATA_TIMEOUT_SECONDS = 90
 
@@ -884,26 +834,7 @@ def check_workflow_policy(repo: Path = REPO_ROOT) -> list[ContractIssue]:
         for path in workflows_dir.iterdir()
         if path.is_file() and path.suffix in (".yml", ".yaml")
     )
-    diagnose_path = workflows_dir / DIAGNOSE_WORKFLOW_FILE
-    if tuple(actual) == APPROVED_WORKFLOW_FILES:
-        # The permanent inventory is exactly the original three files.  A
-        # directory or broken symlink with the temporary name is still a
-        # policy violation, not an absent temporary file.
-        if diagnose_path.exists() or diagnose_path.is_symlink():
-            issues.append(ContractIssue("workflow-policy"))
-        return issues
-    optional_inventory = tuple(
-        sorted((*APPROVED_WORKFLOW_FILES, DIAGNOSE_WORKFLOW_FILE))
-    )
-    if tuple(actual) != optional_inventory:
-        issues.append(ContractIssue("workflow-policy"))
-        return issues
-    try:
-        data = diagnose_path.read_bytes()
-    except OSError:
-        issues.append(ContractIssue("workflow-policy"))
-        return issues
-    if data != DIAGNOSE_WORKFLOW_TEMPLATE.encode("utf-8"):
+    if tuple(actual) != APPROVED_WORKFLOW_FILES:
         issues.append(ContractIssue("workflow-policy"))
     return issues
 
