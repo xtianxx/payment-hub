@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -80,6 +81,19 @@ PUBLISH_ACTION_COUNTS = {
     DOWNLOAD: 1,
     SETUP_DOCKER: 2,
 }
+PUBLISH_BOOTSTRAP_INPUT_BLOCK = (
+    "      bootstrap_packages:\n"
+    "        description: Third confirmation to bootstrap missing GHCR packages; "
+    "never replaces publish_authorized or packages_verified\n"
+    "        required: true\n"
+    "        default: false\n"
+    "        type: boolean\n"
+)
+PUBLISH_AUDIT_SECRET_LINE = (
+    "          GHCR_PACKAGE_AUDIT_TOKEN: "
+    "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}\n"
+)
+PUBLISH_AUDIT_STEP = ("upload", "Publish paired images")
 GATE_RUN = (
     "set -euo pipefail\n"
     'if [[ "${SETUP_RESULT:-}" != "success" || '
@@ -134,6 +148,14 @@ PUBLISH_CI_GATE_STEP_TEXT = (
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _secret_expressions(text):
+    return [
+        "${{" + expression + "}}"
+        for expression in MOD.iter_github_expressions(text)
+        if MOD.SECRETS_TOKEN_RE.search(expression)
+    ]
 
 
 def _job(workflow, job_id):
@@ -1471,7 +1493,11 @@ class PublishWorkflowContractTests(unittest.TestCase):
         dispatch = on_value["workflow_dispatch"]
         self.assertEqual(set(dispatch), {"inputs"})
         inputs = dispatch["inputs"]
-        self.assertEqual(set(inputs), set(MOD.PUBLISH_INPUT_NAMES))
+        self.assertEqual(tuple(inputs), MOD.PUBLISH_INPUT_NAMES)
+        self.assertEqual(
+            MOD.PUBLISH_INPUT_NAMES,
+            ("publish_authorized", "packages_verified", "bootstrap_packages"),
+        )
         for name in MOD.PUBLISH_INPUT_NAMES:
             body = inputs[name]
             with self.subTest(input=name):
@@ -1480,6 +1506,24 @@ class PublishWorkflowContractTests(unittest.TestCase):
                 self.assertIs(body["default"], False)
                 self.assertEqual(body["type"], "boolean")
                 self.assertTrue(body["description"].strip())
+
+    def test_packages_verified_description_covers_normal_and_bootstrap(self):
+        inputs = self.workflow["on"]["workflow_dispatch"]["inputs"]
+        normal = inputs["packages_verified"]["description"].lower()
+        for token in (
+            "normal",
+            "private",
+            "linked",
+            "bootstrap",
+            "owner",
+            "missing",
+            "risk",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, normal)
+        bootstrap = inputs["bootstrap_packages"]["description"].lower()
+        self.assertIn("bootstrap", bootstrap)
+        self.assertIn("never replaces", bootstrap)
 
     def test_prepare_gate_fails_closed(self):
         step = _step(
@@ -1501,6 +1545,7 @@ class PublishWorkflowContractTests(unittest.TestCase):
                 "PACKAGES_VERIFIED": "${{ inputs.packages_verified }}",
             },
         )
+        self.assertNotIn("BOOTSTRAP_PACKAGES", step["env"])
         run = step["run"]
         for token in (
             "set -euo pipefail",
@@ -1513,6 +1558,7 @@ class PublishWorkflowContractTests(unittest.TestCase):
         ):
             with self.subTest(token=token):
                 self.assertIn(token, run)
+        self.assertNotIn("bootstrap", run.lower())
 
     def test_prepare_command_and_outputs(self):
         prepare = _job(self.workflow, "prepare")
@@ -1541,6 +1587,9 @@ class PublishWorkflowContractTests(unittest.TestCase):
         ):
             with self.subTest(token=token):
                 self.assertIn(token, run)
+        self.assertNotIn("--bootstrap-packages", run)
+        self.assertNotIn("BOOTSTRAP_PACKAGES", run)
+        self.assertNotIn("secrets.", run)
         handoff = _step(self.workflow, "prepare", "Read trusted prepare outputs")
         self.assertEqual(handoff["id"], "handoff")
         handoff_run = handoff["run"]
@@ -1699,22 +1748,16 @@ class PublishWorkflowContractTests(unittest.TestCase):
 
     def test_publish_token_is_only_in_ci_gates_and_publish_step(self):
         publish = _step(self.workflow, "upload", "Publish paired images")
-        self.assertEqual(
-            publish["env"],
-            {
-                "SOURCE_SHA": "${{ github.sha }}",
-                "EXPECTED_DESCRIPTOR_SHA": (
-                    "${{ needs.prepare.outputs.descriptor_sha256 }}"
-                ),
-                "GITHUB_TOKEN": "${{ github.token }}",
-            },
-        )
+        self.assertEqual(publish["env"], MOD.PUBLISH_PUBLISH_ENV)
         token_steps = []
+        audit_steps = []
         for job_id, job in self.workflow.get("jobs", {}).items():
             self.assertNotIn("env", job)
             for step in job.get("steps", []):
                 if "GITHUB_TOKEN" in step.get("env", {}):
                     token_steps.append((job_id, step.get("name")))
+                if "GHCR_PACKAGE_AUDIT_TOKEN" in step.get("env", {}):
+                    audit_steps.append((job_id, step.get("name")))
         self.assertEqual(
             token_steps,
             [
@@ -1723,13 +1766,21 @@ class PublishWorkflowContractTests(unittest.TestCase):
                 ("upload", "Publish paired images"),
             ],
         )
+        self.assertEqual(audit_steps, [PUBLISH_AUDIT_STEP])
         self.assertNotIn("GITHUB_TOKEN", self.workflow.get("env", {}))
-        self.assertNotIn("secrets.", self.text)
+        self.assertEqual(
+            _secret_expressions(self.text),
+            [MOD.PUBLISH_AUDIT_SECRET_EXPRESSION],
+        )
+        self.assertEqual(self.text.count(PUBLISH_AUDIT_SECRET_LINE), 1)
 
     def test_publish_command_is_fixed(self):
         publish = _step(self.workflow, "upload", "Publish paired images")
+        self.assertEqual(set(publish), {"name", "shell", "env", "run"})
         self.assertEqual(publish["shell"], "bash")
+        self.assertEqual(publish["env"], MOD.PUBLISH_PUBLISH_ENV)
         run = publish["run"]
+        self.assertEqual(run.strip(), MOD.PUBLISH_PUBLISH_RUN.strip())
         for token in (
             "set -euo pipefail",
             "bash scripts/release.sh",
@@ -1743,11 +1794,17 @@ class PublishWorkflowContractTests(unittest.TestCase):
             "--approve-external",
             "--package-preconditions-verified",
             "--prepare-inputs",
+            "bootstrap_args=()",
+            'case "$BOOTSTRAP_PACKAGES" in',
+            "bootstrap_args+=(--bootstrap-packages)",
+            '"${bootstrap_args[@]}"',
         ):
             with self.subTest(token=token):
                 self.assertIn(token, run)
+        self.assertEqual(run.count("--bootstrap-packages"), 1)
         for token in (
             "secrets.",
+            "GHCR_PACKAGE_AUDIT_TOKEN",
             "docker push",
             "docker login",
             "docker build",
@@ -1854,6 +1911,27 @@ class PublishWorkflowContractTests(unittest.TestCase):
                     MOD.PUBLISH_DOCKER_VERIFY_RUN.strip(),
                 )
 
+    def test_audit_secret_expression_is_unique_and_exact(self):
+        self.assertEqual(
+            _secret_expressions(self.text),
+            [MOD.PUBLISH_AUDIT_SECRET_EXPRESSION],
+        )
+        expressions = MOD.iter_github_expressions(self.text)
+        allowed = [
+            expression
+            for expression in expressions
+            if "${{" + expression + "}}" == MOD.PUBLISH_AUDIT_SECRET_EXPRESSION
+        ]
+        self.assertEqual(len(allowed), 1)
+
+    def test_expression_scanner_handles_quoted_closing_braces(self):
+        self.assertEqual(
+            MOD.iter_github_expressions("${{ format('}}', secrets.X) }}"),
+            [" format('}}', secrets.X) "],
+        )
+        with self.assertRaises(MOD.ContractError):
+            MOD.iter_github_expressions("${{ github.sha")
+
     def test_validator_passes(self):
         self.assertEqual(
             MOD.validate_publish_workflow(self.workflow, self.text, REPO), []
@@ -1864,7 +1942,6 @@ class PublishWorkflowContractTests(unittest.TestCase):
             "pull_request_target",
             "workflow_run",
             "workflow_call",
-            "secrets.",
             "id-token",
             "attestations",
             "contents: write",
@@ -1880,6 +1957,14 @@ class PublishWorkflowContractTests(unittest.TestCase):
                 self.assertNotIn(token, self.text)
         self.assertNotIn("pull_request", self.text)
         self.assertNotIn("push:", self.text)
+        self.assertEqual(
+            _secret_expressions(self.text),
+            [MOD.PUBLISH_AUDIT_SECRET_EXPRESSION],
+        )
+        self.assertEqual(self.text.count(PUBLISH_AUDIT_SECRET_LINE), 1)
+        self.assertEqual(
+            self.text.count(MOD.PUBLISH_AUDIT_SECRET_NAME + ":"), 1
+        )
 
 
 class PublishWorkflowMutationTests(unittest.TestCase):
@@ -2183,29 +2268,23 @@ class PublishWorkflowMutationTests(unittest.TestCase):
         self.assertIn("publish-token-location", {issue.kind for issue in issues})
 
     def test_mutation_pr_trigger_is_rejected(self):
-        text = self.text.replace(
-            "on:\n"
-            "  workflow_dispatch:\n"
-            "    inputs:\n"
-            "      publish_authorized:\n"
-            "        description: Explicit authorization to publish the prepared pair\n"
-            "        required: true\n"
-            "        default: false\n"
-            "        type: boolean\n"
-            "      packages_verified:\n"
-            "        description: Package preconditions verified before upload\n"
-            "        required: true\n"
-            "        default: false\n"
-            "        type: boolean\n",
-            "on:\n"
-            "  pull_request:\n"
-            "    branches:\n"
-            "      - main\n",
-            1,
+        start = self.text.index("on:\n")
+        end = self.text.index("\nconcurrency:\n")
+        text = (
+            self.text[:start]
+            + "on:\n"
+            + "  pull_request:\n"
+            + "    branches:\n"
+            + "      - main\n"
+            + self.text[end:]
         )
         self.assertNotEqual(text, self.text)
         issues = self._issues_for_mutation(text)
         self.assertTrue(issues)
+        self.assertIn(
+            "publish-workflow-trigger-inputs",
+            {issue.kind for issue in issues},
+        )
 
     def test_mutation_nonmain_guard_removed_is_rejected(self):
         text = self.text.replace(
@@ -2427,6 +2506,399 @@ class PublishWorkflowMutationTests(unittest.TestCase):
         issues = self._issues_for_mutation(text)
         self.assertTrue(issues)
         self.assertIn("publish-download-action", {issue.kind for issue in issues})
+
+    def test_mutation_bootstrap_default_true_is_rejected(self):
+        text = self.text.replace(
+            PUBLISH_BOOTSTRAP_INPUT_BLOCK,
+            PUBLISH_BOOTSTRAP_INPUT_BLOCK.replace(
+                "default: false", "default: true"
+            ),
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "publish-workflow-trigger-inputs",
+            {issue.kind for issue in issues},
+        )
+
+    def test_mutation_bootstrap_non_boolean_is_rejected(self):
+        text = self.text.replace(
+            PUBLISH_BOOTSTRAP_INPUT_BLOCK,
+            PUBLISH_BOOTSTRAP_INPUT_BLOCK.replace(
+                "type: boolean", "type: string"
+            ),
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "publish-workflow-trigger-inputs",
+            {issue.kind for issue in issues},
+        )
+
+    def test_mutation_bootstrap_input_omitted_is_rejected(self):
+        text = self.text.replace(PUBLISH_BOOTSTRAP_INPUT_BLOCK, "", 1)
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "publish-workflow-trigger-inputs",
+            {issue.kind for issue in issues},
+        )
+
+    def test_mutation_publish_step_extra_key_is_rejected(self):
+        text = self.text.replace(
+            "      - name: Publish paired images\n"
+            "        shell: bash\n",
+            "      - name: Publish paired images\n"
+            "        if: false\n"
+            "        shell: bash\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-command-shape", {issue.kind for issue in issues})
+
+    def test_mutation_bootstrap_unconditional_flag_is_rejected(self):
+        text = self.text.replace(
+            "          bootstrap_args=()\n",
+            "          bootstrap_args=(--bootstrap-packages)\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-command-run", {issue.kind for issue in issues})
+
+    def test_mutation_bootstrap_case_validation_removed_is_rejected(self):
+        text = self.text.replace(
+            "            *)\n"
+            '              echo "::error::BOOTSTRAP_PACKAGES must be true or false"\n'
+            "              exit 1\n"
+            "              ;;\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-command-run", {issue.kind for issue in issues})
+
+    def test_mutation_bootstrap_always_passed_is_rejected(self):
+        text = self.text.replace(
+            '            "${bootstrap_args[@]}"\n',
+            "            --bootstrap-packages\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-command-run", {issue.kind for issue in issues})
+
+    def test_mutation_audit_secret_moved_to_prepare_is_rejected(self):
+        text = self.text.replace(PUBLISH_AUDIT_SECRET_LINE, "", 1)
+        text = text.replace(
+            "          PACKAGES_VERIFIED: ${{ inputs.packages_verified }}\n",
+            "          PACKAGES_VERIFIED: ${{ inputs.packages_verified }}\n"
+            + PUBLISH_AUDIT_SECRET_LINE,
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-token-location", kinds)
+        self.assertIn("publish-prepare-gate-env", kinds)
+
+    def test_mutation_audit_secret_name_is_rejected(self):
+        text = self.text.replace(
+            "secrets.GHCR_PACKAGE_AUDIT_TOKEN",
+            "secrets.GHCR_PACKAGE_AUDIT_TOKEN_OTHER",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-secret-policy", {issue.kind for issue in issues})
+
+    def _prepare_isolate_with_env(self, value):
+        return self.text.replace(
+            "      - name: Isolate release Go config and caches\n"
+            "        shell: bash\n",
+            "      - name: Isolate release Go config and caches\n"
+            "        shell: bash\n"
+            "        env:\n"
+            f"          EXTRA: {value}\n",
+            1,
+        )
+
+    def test_mutation_prepare_bracket_secret_is_rejected(self):
+        text = self._prepare_isolate_with_env(
+            "${{ secrets['GHCR_PACKAGE_AUDIT_TOKEN'] }}"
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-secret-policy", {issue.kind for issue in issues})
+
+    def test_mutation_prepare_whole_secrets_context_is_rejected(self):
+        text = self._prepare_isolate_with_env("${{ toJSON(secrets) }}")
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-secret-policy", {issue.kind for issue in issues})
+
+    def test_mutation_prepare_quoted_brace_secret_is_rejected(self):
+        text = self._prepare_isolate_with_env(
+            "${{ format('}}', secrets['GHCR_PACKAGE_AUDIT_TOKEN']) }}"
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-secret-policy", {issue.kind for issue in issues})
+
+    def test_mutation_job_env_bracket_secret_is_rejected(self):
+        text = self.text.replace(
+            "    outputs:\n",
+            "    env:\n"
+            "      EXTRA: ${{ secrets['GHCR_PACKAGE_AUDIT_TOKEN'] }}\n"
+            "    outputs:\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-secret-policy", kinds)
+        self.assertIn("publish-job-env", kinds)
+
+    def test_mutation_job_env_whole_secrets_is_rejected(self):
+        text = self.text.replace(
+            "    outputs:\n",
+            "    env:\n"
+            "      EXTRA: ${{ toJSON(secrets) }}\n"
+            "    outputs:\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-secret-policy", kinds)
+        self.assertIn("publish-job-env", kinds)
+
+    def test_mutation_global_env_bracket_secret_is_rejected(self):
+        text = self.text.replace(
+            '  PYTHONDONTWRITEBYTECODE: "1"\n',
+            '  PYTHONDONTWRITEBYTECODE: "1"\n'
+            "  EXTRA: ${{ secrets['GHCR_PACKAGE_AUDIT_TOKEN'] }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-secret-policy", kinds)
+        self.assertIn("publish-workflow-env", kinds)
+
+    def test_mutation_global_env_whole_secrets_is_rejected(self):
+        text = self.text.replace(
+            '  PYTHONDONTWRITEBYTECODE: "1"\n',
+            '  PYTHONDONTWRITEBYTECODE: "1"\n'
+            "  EXTRA: ${{ toJSON(secrets) }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-secret-policy", kinds)
+        self.assertIn("publish-workflow-env", kinds)
+
+    def test_mutation_allowed_env_bracket_secret_is_rejected(self):
+        text = self.text.replace(
+            PUBLISH_AUDIT_SECRET_LINE,
+            "          GHCR_PACKAGE_AUDIT_TOKEN: "
+            "${{ secrets['GHCR_PACKAGE_AUDIT_TOKEN'] }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-secret-policy", kinds)
+        self.assertIn("publish-command-env", kinds)
+
+    def test_mutation_second_allowed_secret_expression_is_rejected(self):
+        text = self._prepare_isolate_with_env(
+            "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}"
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-secret-policy", {issue.kind for issue in issues})
+
+    def test_mutation_audit_secret_expression_is_rejected(self):
+        text = self.text.replace(
+            "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}",
+            "${{ secrets['GHCR_PACKAGE_AUDIT_TOKEN'] }}",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-secret-policy", {issue.kind for issue in issues})
+
+    def test_mutation_extra_audit_secret_call_is_rejected(self):
+        text = self.text.replace(
+            "          BOOTSTRAP_PACKAGES: ${{ inputs.bootstrap_packages }}\n",
+            "          BOOTSTRAP_PACKAGES: ${{ inputs.bootstrap_packages }}\n"
+            "          EXTRA_AUDIT: ${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-secret-policy", kinds)
+        self.assertIn("publish-token-location", kinds)
+
+    def test_mutation_writer_token_uses_audit_secret_is_rejected(self):
+        text = self.text.replace(
+            "          GITHUB_TOKEN: ${{ github.token }}\n"
+            "          GHCR_PACKAGE_AUDIT_TOKEN: "
+            "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}\n",
+            "          GITHUB_TOKEN: ${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-command-env", kinds)
+        self.assertIn("publish-token-location", kinds)
+
+    def test_mutation_upload_extra_permission_is_rejected(self):
+        text = self.text.replace(
+            "      actions: read\n      packages: write\n",
+            "      actions: read\n"
+            "      packages: write\n"
+            "      statuses: write\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-upload-permissions", {issue.kind for issue in issues})
+
+    def test_mutation_duplicate_packages_read_is_rejected(self):
+        text = self.text.replace(
+            "      packages: write\n",
+            "      packages: write\n      packages: read\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertTrue(issues)
+
+    def test_mutation_prepare_accepts_bootstrap_flag_is_rejected(self):
+        text = self.text.replace(
+            "          bash scripts/release.sh --stage prepare \\\n",
+            "          bash scripts/release.sh --stage prepare \\\n"
+            "            --bootstrap-packages \\\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-prepare-bootstrap", kinds)
+        self.assertIn("publish-prepare-command-unsafe", kinds)
+
+    def test_mutation_dual_confirmation_removed_is_rejected(self):
+        text = self.text.replace(
+            '          if [[ "$PUBLISH_AUTHORIZED" != "true" || '
+            '"$PACKAGES_VERIFIED" != "true" ]]; then\n',
+            '          if [[ "$PUBLISH_AUTHORIZED" != "true" ]]; then\n',
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-prepare-gate-run", {issue.kind for issue in issues})
+
+    def test_mutation_bootstrap_replaces_packages_verified_is_rejected(self):
+        text = self.text.replace(
+            'if [[ "$PUBLISH_AUTHORIZED" != "true" || '
+            '"$PACKAGES_VERIFIED" != "true" ]]',
+            'if [[ "$PUBLISH_AUTHORIZED" != "true" || '
+            '"$BOOTSTRAP_PACKAGES" != "true" ]]',
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        kinds = {issue.kind for issue in issues}
+        self.assertIn("publish-prepare-gate-run", kinds)
+        self.assertIn("publish-prepare-bootstrap", kinds)
+
+
+class PublishBootstrapCommandExecutionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow, _ = MOD.load_workflow(PUBLISH_WORKFLOW)
+
+    def _execute(self, bootstrap_value):
+        step = _step(self.workflow, "upload", "Publish paired images")
+        run = step["run"]
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        with tempfile.TemporaryDirectory(prefix="publish-bootstrap-") as temp:
+            root = Path(temp)
+            fake_go = root / "go"
+            fake_go.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            fake_go.chmod(0o755)
+            args_file = root / "args.txt"
+            fake_release = root / "fake-release.sh"
+            fake_release.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'printf "%s\\n" "$@" > "$FAKE_ARGS_FILE"\n',
+                encoding="utf-8",
+            )
+            fake_release.chmod(0o755)
+            script = run.replace(
+                "bash scripts/release.sh",
+                f"bash {shlex.quote(str(fake_release))}",
+                1,
+            )
+            self.assertNotEqual(script, run)
+            env = {
+                "PATH": f"{root}:/usr/bin:/bin",
+                "BOOTSTRAP_PACKAGES": bootstrap_value,
+                "SOURCE_SHA": "a" * 40,
+                "EXPECTED_DESCRIPTOR_SHA": "b" * 64,
+                "RUNNER_TEMP": str(root / "runner"),
+                "FAKE_ARGS_FILE": str(args_file),
+            }
+            result = subprocess.run(
+                [bash, "--noprofile", "--norc", "-c", script],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            args = (
+                args_file.read_text(encoding="utf-8").splitlines()
+                if args_file.exists()
+                else None
+            )
+            return result, args
+
+    def test_false_does_not_pass_bootstrap_flag(self):
+        result, args = self._execute("false")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNotNone(args)
+        self.assertNotIn("--bootstrap-packages", args)
+        self.assertEqual(args[:2], ["--stage", "publish"])
+        self.assertIn("--package-preconditions-verified", args)
+
+    def test_true_passes_bootstrap_flag_exactly_once(self):
+        result, args = self._execute("true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNotNone(args)
+        self.assertEqual(args.count("--bootstrap-packages"), 1)
+        self.assertEqual(args[-1], "--bootstrap-packages")
+
+    def test_invalid_value_fails_closed_before_release(self):
+        for value in ("", "yes", "TRUE", "1"):
+            with self.subTest(value=value):
+                result, args = self._execute(value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    "BOOTSTRAP_PACKAGES must be true or false",
+                    result.stdout + result.stderr,
+                )
+                self.assertIsNone(args)
 
 
 class ManifestContractTests(unittest.TestCase):

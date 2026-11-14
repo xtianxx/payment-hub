@@ -9,7 +9,12 @@ on:
         default: false
         type: boolean
       packages_verified:
-        description: Package preconditions verified before upload
+        description: Package preconditions verified for normal runs (existing private and linked packages) and bootstrap runs (owner inventory, missing creation scope, risk)
+        required: true
+        default: false
+        type: boolean
+      bootstrap_packages:
+        description: Third confirmation to bootstrap missing GHCR packages; never replaces publish_authorized or packages_verified
         required: true
         default: false
         type: boolean
@@ -358,8 +363,22 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
           EXPECTED_DESCRIPTOR_SHA: ${{ needs.prepare.outputs.descriptor_sha256 }}
           GITHUB_TOKEN: ${{ github.token }}
+          GHCR_PACKAGE_AUDIT_TOKEN: ${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}
+          BOOTSTRAP_PACKAGES: ${{ inputs.bootstrap_packages }}
         run: |
           set -euo pipefail
+          bootstrap_args=()
+          case "$BOOTSTRAP_PACKAGES" in
+            true)
+              bootstrap_args+=(--bootstrap-packages)
+              ;;
+            false)
+              ;;
+            *)
+              echo "::error::BOOTSTRAP_PACKAGES must be true or false"
+              exit 1
+              ;;
+          esac
           bash scripts/release.sh --stage publish \
             --source-sha "$SOURCE_SHA" \
             --go "$(command -v go)" \
@@ -369,7 +388,8 @@ jobs:
             --expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA" \
             --approve-external \
             --package-preconditions-verified \
-            --prepare-inputs
+            --prepare-inputs \
+            "${bootstrap_args[@]}"
 
       - name: Upload release summary
         if: always()

@@ -1,6 +1,61 @@
 # 本地镜像与受控发布
 
-## 发布环境修复（2026-11-13）
+## GHCR首次初始化修复（2026-11-14）
+
+本节描述`fix/ghcr-bootstrap`分支中的修复；合并main后才会进入正式工作流，尚未在真实发布中验证。后文历史状态保留原始证据，不作为当前操作步骤。
+
+真实运行`43544040888`（源码`e12ebbd8a30fb3a764402c9db52d3bcf7207be90`）的prepare及交接已通过，upload在`Publish paired images`报`package/app-not-found`，未进入login/push。旧流程在首次push前强制要求两个包已存在，且用`/users/xtianxx/packages/container/<name>`查询私有包；该接口文档限定public包，404既不能证明私有包不存在，也不能授予创建资格。
+
+### 两种模式与共同门禁
+
+- **正常发布**：默认`bootstrap_packages=false`；两个目标包必须已存在、为private、属于`xtianxx`并关联`xtianxx/payment-hub`。任一缺失、不可见、元数据不符均失败。
+- **显式初始化**：仅在负责人另行批准创建缺失目标包后，设置`bootstrap_packages=true`，对应publish阶段的`--bootstrap-packages`。这只是第三项附加授权，原`publish_authorized=true`、`packages_verified=true`及两个CLI确认参数仍必须满足。
+- 初始化支持两个包全缺失、仅一个缺失、两个已存在；不为public、未关联仓库、owner或名称不符的现存包提供豁免。
+- **包与源码仓库的可见性独立**：必须为private的是GHCR包，不是关联的源码仓库。私有包关联公开的`xtianxx/payment-hub`属于允许状态；`repository.private=false`不构成拒绝理由，仓库身份仍必须精确匹配。
+- prepare不读取包审计Secret、不查询包，也不接收初始化CLI参数。PR和定时检查不获得包凭据或写权限。
+- main/SHA/clean checkout、同提交CI成功、原产物交接、load/tag身份、registry manifest、按digest拉回及重新验收保持原有严格要求，不重构建或改用另一对镜像绕过。
+
+### 凭据准备：只读审计与上传分离
+
+正常发布和初始化都需要独立的仓库Secret `GHCR_PACKAGE_AUDIT_TOKEN`，不再用仓库级`GITHUB_TOKEN`推断owner命名空间是否缺少某个包。
+
+由账号所有者在GitHub网页完成以下操作，**不要把token发到对话、命令参数、Git或日志中**：
+
+1. 在账号设置的Developer settings → Personal access tokens → Tokens (classic)创建有到期时间的token；所有者必须是`xtianxx`，仅勾选`read:packages`。
+2. 不增加`repo`、`read:user`、`write:packages`、`delete:packages`或管理权限；按实际需要设置较短有效期并定期轮换、及时撤销。
+3. 在仓库Settings → Secrets and variables → Actions中新增repository secret，名称精确为`GHCR_PACKAGE_AUDIT_TOKEN`，值在网页中填写。
+4. Secret只注入upload job的`Publish paired images`步骤；不要把它设置成公开变量或注入prepare、PR、全局/job环境。
+
+审计凭据虽只在代码中用于元数据GET，但`read:packages`权限本身允许读取、下载owner的其他私有包，并非只读两个包的元数据。代码限定请求端点、移除子进程继承并避免归档凭据；凭据实际授权范围仍由创建者负责。scope响应头仅作额外检查，缺失不证明只读。
+
+写入和registry验证继续使用工作流`GITHUB_TOKEN`，仅upload job给`packages: write`。该权限包含read，不应重复增加同名`packages: read`配置。审计token绝不用于Docker login/push或registry认证。
+
+### 缺失判断与首次push后的验证
+
+1. 用审计token查询`GET /user`核对owner，再完整分页读取`GET /user/packages?package_type=container&per_page=100`，不按visibility过滤。
+2. 对清单内目标，使用authenticated-user接口`GET /user/packages/container/<name>`严格校验private、仓库关联、owner、name、type和package ID。不得退回public-only接口。
+3. 只有身份正确、完整清单成功且目标确实缺失，才能在显式初始化模式中获得该role的首次push资格。403、404、超时、分页不完整、畸形响应及任何未知状态均失败。
+4. 每个role push前刷新清单；已存在包消失、ID改变或缺失名称被外部占用，都停止，不自动把更新切换为创建。自身已成功推送并验证的role按新记录核对。
+5. 每次push后立即复查private及仓库关联等元数据；失败即停止，不继续第二个包。最终再次核对两包，并保留原digest/拉回/验收链路，全部通过才记为发布成功。
+
+### 必须接受的剩余风险与失败处置
+
+GHCR没有“仅当名称不存在才创建”的原子前提。完整分页、push前重查和push后验证都不是原子快照；首次private和自动仓库关联依赖GitHub契约、现有source label及工作流token。外部写者仍可能在检查与push之间占用名称或改变visibility。负责人已批准实现该受控路径，但实际使用仍须另行批准，并安排没有其他发布者操作的窗口。
+
+push后检查只能检测问题，不能保证阻止首次暴露；包一旦public不能直接改回private。排他操作窗口仅降低风险，不提供零风险保证。
+
+摘要区分“已尝试push”“远端效果未知”和“验证成功”，不以`pushed_roles`为空宣称没有副作用。即使失败、取消或摘要未能生成，也可能已创建包或上传部分内容。出现部分成功或未知状态时停止并人工核对，不自动重试、删除、改public、恢复包或回滚。不得声称原子创建成功或自动恢复到发布前状态。
+
+这次源码变化会使旧候选清单失配，后续真实发布必须构建修复后SHA的新候选；不能复用诊断运行的旧bundle。
+
+### 官方依据
+
+- [Authenticated-user包清单与包元数据接口](https://docs.github.com/en/rest/packages/packages)
+- [认证用户身份](https://docs.github.com/en/rest/users/users#get-the-authenticated-user)
+- [GHCR首次private、source label与工作流关联](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
+- [包可见性、仓库访问继承与public不可逆](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
+
+## 发布环境修复（2026-11-13，历史记录）
 
 真实Actions运行`43371460609`的prepare job在`Prepare release handoff`失败，日志为`image/descriptor-missing`，后续上传job跳过。失败发生在构建后的镜像身份检查，不是GHCR认证失败；没有产生成功发布结论。下方2026-11-12记录保留为历史证据，不再代表Actions从未运行。
 
@@ -57,7 +112,7 @@ PG-only基础文件为`deploy/compose.yaml`与`deploy/compose.test.yaml`。应�
 
 预算：原120秒integration包、570秒Go批次及业务期限不变。独立镜像Go阶段180秒，到期即失败；另批最多15秒仅收割测试进程，不继续业务或重试。PG准备、迁移及Docker归属清理使用各自既有有界预算。
 
-## 包关联、可见性与权限：尚未核实
+## 历史包关联、可见性与权限记录（2026-11-12）
 
 现有gh凭据的scope不含`read:packages`。只读查询`user/packages?package_type=container`返回403，因此不能确认包是否存在、是否关联仓库、可见性或读写授权。猜测包名返回404也不能证明私有包不存在；REST没有仓库级package列表端点，不使用错误路由的404作不存在证据。
 

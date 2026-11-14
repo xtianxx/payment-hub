@@ -16,13 +16,17 @@ Fixed stages:
     builds, pulls, or uses the network.
 
 ``--stage publish``
-    Explicitly authorised only.  Re-verifies the handoff, checks the two fixed
-    GHCR packages through read-only GitHub REST metadata, loads and verifies
-    the saved pair, pushes the already verified IDs, obtains the formal remote
+    Explicitly authorised only.  Re-verifies the handoff, reads the owner's
+    complete container package inventory with a separate read-only audit
+    credential, verifies the two fixed GHCR package metadata records, loads
+    and verifies the saved pair, pushes the already verified IDs, checks the
+    target metadata again with the audit credential, obtains the formal remote
     digest from a fixed GHCR manifest GET, pulls by that digest, inspects the
     pulled images, and re-runs the existing image acceptance launcher against
     the original artifact.  A temporary private Docker config is always
-    removed.  No deployment is performed.
+    removed.  No deployment is performed.  ``--bootstrap-packages`` is only a
+    third explicit confirmation for creating packages proven absent by the
+    complete inventory; it never replaces the two existing confirmations.
 
 The script reads only a small, fixed subset of the builder and acceptance
 reports.  Raw command output, tokens, DSNs, request bodies, and environment
@@ -87,6 +91,8 @@ ATTESTATION_TYPE = "vnd.docker.reference.type"
 ATTESTATION_DIGEST = "vnd.docker.reference.digest"
 
 REPOSITORY = "xtianxx/payment-hub"
+OWNER_LOGIN = "xtianxx"
+AUDIT_TOKEN_ENV = "GHCR_PACKAGE_AUDIT_TOKEN"
 GITHUB_API = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
 GHCR = "ghcr.io"
@@ -102,6 +108,7 @@ PACKAGE_NAMES = {
     "migrate": "payment-hub-migrate",
 }
 ROLES = ("app", "migrate")
+ROLE_BY_PACKAGE = {PACKAGE_NAMES[role]: role for role in ROLES}
 TAG_PREFIX = "sha-"
 DEFAULT_BUNDLE = "bundle"
 HANDOFF_FILE = "handoff.json"
@@ -126,6 +133,16 @@ REGISTRY_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
 TOKEN_MAX_BYTES = 64 * 1024
 MAX_TAR_MEMBERS = 20000
 MAX_ATTESTATIONS = 8
+
+# Complete owner inventory budgets.  The API is read page by page; the page
+# count, accumulated body bytes, and wall-clock budget are all fixed and never
+# extended or retried.
+INVENTORY_PER_PAGE = 100
+INVENTORY_MAX_PAGES = 100
+INVENTORY_MAX_BYTES = 4 * 1024 * 1024
+INVENTORY_TIMEOUT_SECONDS = 60.0
+LINK_REL_TYPES = frozenset(("next", "last", "prev", "first"))
+_LINK_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
 # Fixed tool-class budgets.  The builder and check-images launcher own their
 # internal build/test/PG budgets; these outer values only bound the process
@@ -218,6 +235,175 @@ def _image_id(value: Any, stage: str, kind: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
         raise ReleaseError(stage, kind)
     return value
+
+
+def _positive_package_id(value: Any, stage: str, kind: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ReleaseError(stage, kind)
+    return value
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    for key, value in headers.items():
+        if key.lower() == name:
+            return value
+    return None
+
+
+def _parse_link_header(value: Any) -> list[tuple[str, str]]:
+    """Strictly consume one GitHub inventory Link header.
+
+    Every comma-separated link-value and every ``;`` parameter must parse.
+    Each link must carry exactly one known relation type, relation types may
+    not repeat across the header, and the URI is kept only for fixed
+    same-origin inventory navigation.  No URI from this header is followed
+    directly.
+    """
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        raise ReleaseError("package", "inventory-link")
+    links: list[tuple[str, str]] = []
+    seen_rels: set[str] = set()
+    length = len(value)
+
+    def skip_ows(index: int) -> int:
+        while index < length and value[index] in " \t":
+            index += 1
+        return index
+
+    pos = skip_ows(0)
+    if pos >= length:
+        raise ReleaseError("package", "inventory-link")
+    while True:
+        if pos >= length or value[pos] != "<":
+            raise ReleaseError("package", "inventory-link")
+        end = value.find(">", pos + 1)
+        if end < 0:
+            raise ReleaseError("package", "inventory-link")
+        uri = value[pos + 1 : end]
+        if not uri or any(
+            ord(char) <= 0x20 or ord(char) == 0x7F or char in '<">'
+            for char in uri
+        ):
+            raise ReleaseError("package", "inventory-link")
+        pos = end + 1
+        params: dict[str, str | None] = {}
+        while True:
+            pos = skip_ows(pos)
+            if pos >= length or value[pos] != ";":
+                break
+            pos = skip_ows(pos + 1)
+            match = _LINK_TOKEN.match(value, pos)
+            if match is None:
+                raise ReleaseError("package", "inventory-link")
+            name = match.group(0).lower()
+            pos = match.end()
+            pos = skip_ows(pos)
+            if pos < length and value[pos] == "=":
+                pos = skip_ows(pos + 1)
+                if pos < length and value[pos] == '"':
+                    pos += 1
+                    chars: list[str] = []
+                    closed = False
+                    while pos < length:
+                        char = value[pos]
+                        if char == "\\":
+                            if pos + 1 >= length:
+                                raise ReleaseError("package", "inventory-link")
+                            escaped = value[pos + 1]
+                            if (
+                                escaped in "\r\n"
+                                or ord(escaped) == 0x7F
+                                or (ord(escaped) < 0x20 and escaped != "\t")
+                            ):
+                                raise ReleaseError(
+                                    "package", "inventory-link"
+                                )
+                            chars.append(escaped)
+                            pos += 2
+                            continue
+                        if char == '"':
+                            pos += 1
+                            closed = True
+                            break
+                        if (
+                            char in "\r\n"
+                            or ord(char) == 0x7F
+                            or (ord(char) < 0x20 and char != "\t")
+                        ):
+                            raise ReleaseError("package", "inventory-link")
+                        chars.append(char)
+                        pos += 1
+                    if not closed:
+                        raise ReleaseError("package", "inventory-link")
+                    param_value: str | None = "".join(chars)
+                else:
+                    match = _LINK_TOKEN.match(value, pos)
+                    if match is None:
+                        raise ReleaseError("package", "inventory-link")
+                    param_value = match.group(0)
+                    pos = match.end()
+            else:
+                param_value = None
+            if name in params:
+                raise ReleaseError("package", "inventory-link")
+            params[name] = param_value
+        if "rel" not in params or params["rel"] is None:
+            raise ReleaseError("package", "inventory-link")
+        if params["rel"].strip() != params["rel"]:
+            raise ReleaseError("package", "inventory-link")
+        rel_values = params["rel"].split()
+        if len(rel_values) != 1:
+            raise ReleaseError("package", "inventory-link")
+        rel = rel_values[0].lower()
+        if rel not in LINK_REL_TYPES or rel in seen_rels:
+            raise ReleaseError("package", "inventory-link")
+        seen_rels.add(rel)
+        links.append((uri, rel))
+        pos = skip_ows(pos)
+        if pos >= length:
+            break
+        if value[pos] != ",":
+            raise ReleaseError("package", "inventory-link")
+        pos = skip_ows(pos + 1)
+        if pos >= length:
+            raise ReleaseError("package", "inventory-link")
+    if not links:
+        raise ReleaseError("package", "inventory-link")
+    return links
+
+
+def _validate_package_metadata(
+    value: Any, role: str, stage: str = "package"
+) -> dict[str, Any]:
+    """Return a small safe projection only after every fixed field matches.
+
+    Package ``visibility`` must be private; repository identity is the fixed
+    ``REPOSITORY`` full name.  ``repository.private`` describes the linked
+    repository, not the package, and is intentionally ignored so a private
+    package may be linked to a public repository.
+    """
+    if not isinstance(value, dict):
+        raise ReleaseError(stage, role + "-metadata")
+    name = PACKAGE_NAMES[role]
+    if value.get("name") != name:
+        raise ReleaseError(stage, role + "-name")
+    if value.get("package_type") != "container":
+        raise ReleaseError(stage, role + "-type")
+    if value.get("visibility") != "private":
+        raise ReleaseError(stage, role + "-visibility")
+    owner = value.get("owner")
+    if not isinstance(owner, dict) or owner.get("login") != OWNER_LOGIN:
+        raise ReleaseError(stage, role + "-owner")
+    repository = value.get("repository")
+    if not isinstance(repository, dict) or repository.get("full_name") != REPOSITORY:
+        raise ReleaseError(stage, role + "-repository")
+    package_id = _positive_package_id(value.get("id"), stage, role + "-id")
+    return {
+        "name": name,
+        "visibility": "private",
+        "repository": REPOSITORY,
+        "id": package_id,
+    }
 
 
 def _positive_size(value: Any, stage: str, kind: str, maximum: int) -> int:
@@ -1927,6 +2113,8 @@ class Release:
     # ------------------------------------------------------------------
 
     def prepare(self, args: argparse.Namespace) -> int:
+        if getattr(args, "bootstrap_packages", False):
+            raise ReleaseError("cli", "bootstrap-stage")
         self._cancel_signal = None
         self._cancel_cleanup_failed = False
         self._in_cleanup = False
@@ -1940,9 +2128,10 @@ class Release:
         if not root.is_absolute():
             raise ReleaseError("cli", "artifact-root")
         _fresh_root(root)
-        # prepare never needs the publish credential and must not pass it to
-        # builder or check subprocesses.
+        # prepare never needs the publish credentials and must not pass either
+        # token to builder or check subprocesses.
         self.env.pop("GITHUB_TOKEN", None)
+        self.env.pop(AUDIT_TOKEN_ENV, None)
 
         trusted = self.trusted_context(args.source_sha)
         gates = self._run_local_gates(args, root)
@@ -2116,6 +2305,8 @@ class Release:
     # ------------------------------------------------------------------
 
     def verify_handoff(self, args: argparse.Namespace) -> int:
+        if getattr(args, "bootstrap_packages", False):
+            raise ReleaseError("cli", "bootstrap-stage")
         bundle = Path(args.bundle_dir).expanduser()
         descriptor, _ = _verify_handoff(
             bundle,
@@ -2148,9 +2339,266 @@ class Release:
             "User-Agent": "payment-hub-release",
         }
 
+    def _audit_identity(self, token: str) -> dict[str, str]:
+        response = self.http(
+            "GET",
+            GITHUB_API + "/user",
+            headers=self._github_headers(token),
+            timeout=HTTP_TIMEOUT_SECONDS,
+            max_bytes=HTTP_MAX_BYTES,
+        )
+        if response.status != 200:
+            raise ReleaseError("audit", "identity")
+        try:
+            value = json.loads(response.body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReleaseError("audit", "identity") from exc
+        if not isinstance(value, dict) or value.get("login") != OWNER_LOGIN:
+            raise ReleaseError("audit", "owner")
+        scope = "unknown"
+        header = _header_value(response.headers, "x-oauth-scopes")
+        if header is not None:
+            if not isinstance(header, str) or len(header) > 4096:
+                raise ReleaseError("audit", "scope")
+            scopes = {part.strip() for part in header.split(",") if part.strip()}
+            if scopes:
+                if scopes - {"read:packages"}:
+                    raise ReleaseError("audit", "scope")
+                if scopes == {"read:packages"}:
+                    scope = "read:packages"
+        # A missing or empty header is not proof of read-only scope.  It is
+        # recorded as unknown and the code still limits every audit request to
+        # the fixed identity and package-metadata endpoints.
+        return {"login": OWNER_LOGIN, "scope": scope}
+
+    def _inventory_nav_page(self, uri: str, expected_page: int | None) -> int:
+        """Parse one exact same-origin GitHub inventory navigation URL."""
+        try:
+            parsed = urllib.parse.urlsplit(uri)
+            port = parsed.port
+        except ValueError as exc:
+            raise ReleaseError("package", "inventory-link") from exc
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "api.github.com"
+            or port is not None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != "/user/packages"
+            or parsed.fragment
+        ):
+            raise ReleaseError("package", "inventory-link")
+        try:
+            query = urllib.parse.parse_qs(
+                parsed.query, keep_blank_values=True, strict_parsing=True
+            )
+        except ValueError as exc:
+            raise ReleaseError("package", "inventory-link") from exc
+        if set(query) != {"package_type", "per_page", "page"}:
+            raise ReleaseError("package", "inventory-link")
+        if (
+            query["package_type"] != ["container"]
+            or query["per_page"] != [str(INVENTORY_PER_PAGE)]
+        ):
+            raise ReleaseError("package", "inventory-link")
+        page_values = query["page"]
+        if (
+            len(page_values) != 1
+            or not re.fullmatch(r"[1-9][0-9]{0,8}", page_values[0])
+        ):
+            raise ReleaseError("package", "inventory-link")
+        page = int(page_values[0])
+        if expected_page is not None and page != expected_page:
+            raise ReleaseError("package", "inventory-link")
+        return page
+
+    def _inventory_link_navigation(
+        self, link_header: Any, current_page: int
+    ) -> tuple[int | None, int | None]:
+        """Validate the whole Link header and return (next, last) pages."""
+        if link_header is None:
+            return None, None
+        links = _parse_link_header(link_header)
+        next_links = [uri for uri, rel in links if rel == "next"]
+        last_links = [uri for uri, rel in links if rel == "last"]
+        if len(next_links) > 1 or len(last_links) > 1:
+            raise ReleaseError("package", "inventory-link")
+        next_page = None
+        if next_links:
+            next_page = self._inventory_nav_page(
+                next_links[0], current_page + 1
+            )
+        last_page = None
+        if last_links:
+            last_page = self._inventory_nav_page(last_links[0], None)
+        if last_page is not None:
+            if last_page < current_page:
+                raise ReleaseError("package", "inventory-link")
+            if next_page is not None:
+                if last_page < next_page:
+                    raise ReleaseError("package", "inventory-link")
+            elif last_page > current_page:
+                raise ReleaseError("package", "inventory-link")
+        return next_page, last_page
+
+    def _inventory_next_page(
+        self, link_header: Any, current_page: int
+    ) -> int | None:
+        """Validate the whole Link header and return only the next page."""
+        next_page, _ = self._inventory_link_navigation(
+            link_header, current_page
+        )
+        return next_page
+
+    def _list_owner_packages(self, token: str) -> dict[str, dict[str, Any]]:
+        """Read the complete owner container inventory with fixed budgets.
+
+        Only the two target package entries are retained.  Every page is
+        checked for shape, duplicate names/IDs, and strict navigation-link
+        consistency.  A partial, oversized, malformed, or internally
+        inconsistent inventory is never treated as absence evidence.
+        """
+        targets: dict[str, dict[str, Any]] = {}
+        seen_ids: set[int] = set()
+        seen_names: set[str] = set()
+        total_bytes = 0
+        page = 1
+        expected_last: int | None = None
+        deadline = time.monotonic() + INVENTORY_TIMEOUT_SECONDS
+        while True:
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                raise ReleaseError("package", "inventory-deadline")
+            if page > INVENTORY_MAX_PAGES:
+                raise ReleaseError("package", "inventory-pages")
+            remaining = INVENTORY_MAX_BYTES - total_bytes
+            if remaining <= 0:
+                raise ReleaseError("package", "inventory-bytes")
+            url = (
+                f"{GITHUB_API}/user/packages?package_type=container"
+                f"&per_page={INVENTORY_PER_PAGE}&page={page}"
+            )
+            try:
+                response = self.http(
+                    "GET",
+                    url,
+                    headers=self._github_headers(token),
+                    timeout=min(HTTP_TIMEOUT_SECONDS, remaining_time),
+                    max_bytes=min(HTTP_MAX_BYTES, remaining),
+                )
+            except ReleaseError as exc:
+                if exc.stage == "tool" and exc.kind == "http-body":
+                    raise ReleaseError("package", "inventory-bytes") from exc
+                raise
+            if response.status == 403:
+                raise ReleaseError("package", "inventory-forbidden")
+            if response.status != 200:
+                raise ReleaseError("package", "inventory-http")
+            total_bytes += len(response.body)
+            if total_bytes > INVENTORY_MAX_BYTES:
+                raise ReleaseError("package", "inventory-bytes")
+            try:
+                items = json.loads(response.body)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ReleaseError("package", "inventory-json") from exc
+            if not isinstance(items, list) or len(items) > INVENTORY_PER_PAGE:
+                raise ReleaseError("package", "inventory-json")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ReleaseError("package", "inventory-json")
+                name = item.get("name")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or len(name) > 256
+                    or any(ord(char) <= 32 or ord(char) == 0x7F for char in name)
+                ):
+                    raise ReleaseError("package", "inventory-json")
+                role = ROLE_BY_PACKAGE.get(name)
+                if role is not None:
+                    _validate_package_metadata(item, role)
+                else:
+                    if item.get("package_type") != "container":
+                        raise ReleaseError("package", "inventory-json")
+                    _positive_package_id(
+                        item.get("id"), "package", "inventory-id"
+                    )
+                package_id = _positive_package_id(
+                    item.get("id"), "package", "inventory-id"
+                )
+                if package_id in seen_ids or name in seen_names:
+                    raise ReleaseError("package", "inventory-duplicate")
+                seen_ids.add(package_id)
+                seen_names.add(name)
+                if role is not None:
+                    targets[name] = item
+            next_page, last_page = self._inventory_link_navigation(
+                _header_value(response.headers, "link"), page
+            )
+            if last_page is not None:
+                if expected_last is None:
+                    expected_last = last_page
+                elif last_page != expected_last:
+                    raise ReleaseError("package", "inventory-link")
+            if next_page is None:
+                if expected_last is not None and expected_last != page:
+                    raise ReleaseError("package", "inventory-link")
+                break
+            if expected_last is not None and next_page > expected_last:
+                raise ReleaseError("package", "inventory-link")
+            if len(items) != INVENTORY_PER_PAGE:
+                raise ReleaseError("package", "inventory-incomplete")
+            page = next_page
+        return targets
+
+    def _inventory_packages(
+        self, token: str
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Freeze target states from one complete inventory plus strict GETs."""
+        listed = self._list_owner_packages(token)
+        states: dict[str, dict[str, Any]] = {}
+        metadata: dict[str, dict[str, Any]] = {}
+        for role in ROLES:
+            item = listed.get(PACKAGE_NAMES[role])
+            if item is None:
+                states[role] = {"status": "ABSENT_CONFIRMED", "id": None}
+                continue
+            listed_projection = _validate_package_metadata(item, role)
+            checked = self._check_package(role, token)
+            if checked != listed_projection:
+                raise ReleaseError("package", role + "-metadata")
+            states[role] = {"status": "EXISTING_VALID", "id": checked["id"]}
+            metadata[role] = checked
+        return states, metadata
+
+    def _refresh_package_expectations(
+        self,
+        token: str,
+        expected: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Refresh the complete inventory before a push and fail closed.
+
+        An initially existing package must still exist with the same ID.  An
+        initially absent package must remain absent unless this run already
+        pushed and verified it (in which case its expected state was updated
+        to the verified ID).  Any other transition stops the run.
+        """
+        states, metadata = self._inventory_packages(token)
+        for role in ROLES:
+            current = states[role]
+            frozen = expected[role]
+            if frozen["status"] == "EXISTING_VALID":
+                if current["status"] != "EXISTING_VALID":
+                    raise ReleaseError("package", role + "-missing")
+                if current["id"] != frozen["id"]:
+                    raise ReleaseError("package", role + "-changed")
+            elif current["status"] != "ABSENT_CONFIRMED":
+                raise ReleaseError("package", role + "-appeared")
+        return states, metadata
+
     def _check_package(self, role: str, token: str) -> dict[str, Any]:
         name = PACKAGE_NAMES[role]
-        url = f"{GITHUB_API}/users/xtianxx/packages/container/{name}"
+        url = f"{GITHUB_API}/user/packages/container/{name}"
         response = self.http(
             "GET",
             url,
@@ -2170,34 +2618,7 @@ class Release:
             value = json.loads(response.body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ReleaseError("package", role + "-json") from exc
-        if not isinstance(value, dict):
-            raise ReleaseError("package", role + "-json")
-        if value.get("visibility") != "private":
-            raise ReleaseError("package", role + "-visibility")
-        repository = value.get("repository")
-        if (
-            not isinstance(repository, dict)
-            or repository.get("full_name") != REPOSITORY
-        ):
-            raise ReleaseError("package", role + "-repository")
-        if value.get("package_type") not in (None, "container"):
-            raise ReleaseError("package", role + "-type")
-        if value.get("name") not in (None, name):
-            raise ReleaseError("package", role + "-name")
-        owner = value.get("owner")
-        if isinstance(owner, dict) and owner.get("login") not in (
-            None,
-            "xtianxx",
-        ):
-            raise ReleaseError("package", role + "-owner")
-        return {
-            "name": name,
-            "visibility": "private",
-            "repository": REPOSITORY,
-        }
-
-    def _check_packages(self, token: str) -> dict[str, dict[str, Any]]:
-        return {role: self._check_package(role, token) for role in ROLES}
+        return _validate_package_metadata(value, role)
 
     def _registry_manifest(
         self,
@@ -2491,8 +2912,16 @@ class Release:
             "source_sha": source_sha,
             "platform": PLATFORM,
             "descriptor_sha256": descriptor_sha256,
+            "bootstrap_requested": bool(state.get("bootstrap_requested", False)),
+            "audit_scope": state.get("audit_scope"),
             "pushed_roles": list(state.get("pushed_roles", [])),
+            "push_attempted_roles": list(
+                state.get("push_attempted_roles", [])
+            ),
+            "push_side_effects": state.get("push_side_effects", {}),
             "packages": state.get("packages", {}),
+            "packages_initial": state.get("packages_initial", {}),
+            "packages_postcheck": state.get("packages_postcheck", {}),
             "push": state.get("push", {}),
             "remote": state.get("remote", {}),
             "pull": state.get("pull", {}),
@@ -2504,10 +2933,13 @@ class Release:
             ),
             "failure": state.get("failure"),
             "limits": [
-                "package-existence-check-not-atomic-no-create",
+                "package-inventory-not-atomic",
+                "initial-default-private-contract-not-atomic",
+                "postcheck-detects-not-prevents-first-exposure",
                 "package-deletion-race-not-excluded",
                 "pre-push-tag-identity-check-not-atomic",
                 "remote-blob-availability-not-proven-beyond-cache-hit-pull",
+                "audit-scope-header-missing-not-proof-of-read-only",
             ],
             "http_deadline_policy": (
                 "SIGALRM absolute wall deadline around headers and bounded body; "
@@ -2546,9 +2978,17 @@ class Release:
                 else:
                     state = {
                         "published": False,
+                        "bootstrap_requested": bool(
+                            getattr(args, "bootstrap_packages", False)
+                        ),
+                        "audit_scope": None,
                         "pushed_roles": [],
+                        "push_attempted_roles": [],
+                        "push_side_effects": {},
                         "credentials_removed": False,
                         "packages": {},
+                        "packages_initial": {},
+                        "packages_postcheck": {},
                         "push": {},
                         "remote": {},
                         "pull": {},
@@ -2577,9 +3017,17 @@ class Release:
         source_sha = _source_sha(args.source_sha, "cli", "source-sha")
         state: dict[str, Any] = {
             "published": False,
+            "bootstrap_requested": bool(
+                getattr(args, "bootstrap_packages", False)
+            ),
+            "audit_scope": None,
             "pushed_roles": [],
+            "push_attempted_roles": [],
+            "push_side_effects": {},
             "credentials_removed": False,
             "packages": {},
+            "packages_initial": {},
+            "packages_postcheck": {},
             "push": {},
             "remote": {},
             "pull": {},
@@ -2594,12 +3042,17 @@ class Release:
             if not args.package_preconditions_verified:
                 raise ReleaseError("approval", "package-preconditions")
             token = self.env.get("GITHUB_TOKEN", "")
+            audit_token = self.env.get(AUDIT_TOKEN_ENV, "")
             if not token:
                 raise ReleaseError("auth", "token-missing")
-            # The token is kept only in memory and passed to docker login via
-            # stdin.  Do not inherit it into Git/check/Docker subprocess
-            # environments.
+            if not audit_token:
+                raise ReleaseError("auth", "audit-token-missing")
+            # Both credentials stay only in memory.  Remove them before any
+            # Git/check/Docker child starts; docker login receives only the
+            # writer token, through stdin, and the audit token is never used
+            # for registry authentication.
             self.env.pop("GITHUB_TOKEN", None)
+            self.env.pop(AUDIT_TOKEN_ENV, None)
             trusted = self.trusted_context(source_sha)
             actor = self.env.get("GITHUB_ACTOR", "")
             if not actor or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", actor):
@@ -2613,8 +3066,27 @@ class Release:
                 args.expected_descriptor_sha256,
                 expected_source_sha=trusted.source_sha,
             )
+            identity = self._audit_identity(audit_token)
+            state["audit_scope"] = identity["scope"]
+            initial_states, initial_metadata = self._inventory_packages(
+                audit_token
+            )
+            state["packages_initial"] = {
+                role: {
+                    "status": initial_states[role]["status"],
+                    "id": initial_states[role]["id"],
+                }
+                for role in ROLES
+            }
+            state["packages"] = dict(initial_metadata)
+            expected_states = {
+                role: dict(initial_states[role]) for role in ROLES
+            }
+            if not getattr(args, "bootstrap_packages", False):
+                for role in ROLES:
+                    if initial_states[role]["status"] != "EXISTING_VALID":
+                        raise ReleaseError("package", role + "-absent")
             state["prepare_inputs"] = self._prepare_publish_inputs(args, root)
-            state["packages"] = self._check_packages(token)
             load_result = self._docker(["load", "--input", str(bundle / PAIR_FILE)])
             if load_result.timed_out or load_result.exit_code != 0:
                 raise ReleaseError("load", "docker-load")
@@ -2640,9 +3112,14 @@ class Release:
                 if login.timed_out or login.exit_code != 0:
                     raise ReleaseError("auth", "login")
                 for role in ROLES:
-                    # Metadata and the target SHA tag are rechecked immediately
-                    # before each push.  A replacement tag must not be pushed.
-                    state["packages"][role] = self._check_package(role, token)
+                    # The complete inventory and every target metadata record
+                    # are refreshed immediately before each push.  An existing
+                    # package may not disappear; an absent package may not be
+                    # occupied externally.  A package this run already pushed
+                    # is checked against its verified ID instead.
+                    self._refresh_package_expectations(
+                        audit_token, expected_states
+                    )
                     local_id = descriptor["images"][role]["local_id"]
                     target_ref = TARGETS[role] + ":" + descriptor["tag"]
                     tag = self._docker(["tag", local_id, target_ref], env=auth_env)
@@ -2650,9 +3127,27 @@ class Release:
                         raise ReleaseError("push", role + "-tag")
                     tagged = self._inspect_image(target_ref)
                     self._verify_image_identity(role, tagged, descriptor, "push")
+                    # The attempt is recorded before the process starts: a
+                    # cancellation, non-zero exit, or digest mismatch does not
+                    # prove the remote side had no effect.
+                    state["push_attempted_roles"].append(role)
+                    state["push_side_effects"][role] = "unknown"
                     push = self._docker(["push", target_ref], env=auth_env)
                     if push.timed_out or push.exit_code != 0:
                         raise ReleaseError("push", role + "-failed")
+                    # Immediately check the target metadata with the audit
+                    # credential.  Missing or bad metadata stops the run before
+                    # the second package is pushed.
+                    metadata = self._check_package(role, audit_token)
+                    if expected_states[role]["status"] == "EXISTING_VALID":
+                        if metadata["id"] != expected_states[role]["id"]:
+                            raise ReleaseError("package", role + "-changed")
+                    else:
+                        expected_states[role] = {
+                            "status": "EXISTING_VALID",
+                            "id": metadata["id"],
+                        }
+                    state["packages"][role] = metadata
                     candidate = _push_candidate_digest(push)
                     expected = descriptor["images"][role]["root_descriptor"][
                         "digest"
@@ -2685,6 +3180,12 @@ class Release:
                         token,
                         actor,
                     )
+                    state["push_side_effects"][role] = "verified"
+                _final_states, final_metadata = self._refresh_package_expectations(
+                    audit_token, expected_states
+                )
+                state["packages_postcheck"] = dict(final_metadata)
+                state["packages"] = dict(final_metadata)
                 for role in ROLES:
                     remote_ref = (
                         TARGETS[role] + "@" + state["remote"][role]["digest"]
@@ -2907,6 +3408,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prepare-inputs", action="store_true")
     parser.add_argument("--approve-external", action="store_true")
     parser.add_argument("--package-preconditions-verified", action="store_true")
+    parser.add_argument("--bootstrap-packages", action="store_true")
     parser.add_argument("--repo", default=str(REPO_ROOT))
     parser.add_argument("--git")
     parser.add_argument("--docker")
@@ -2915,6 +3417,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _validate_cli(args: argparse.Namespace) -> None:
     _source_sha(args.source_sha, "cli", "source-sha")
+    if getattr(args, "bootstrap_packages", False) and args.stage != "publish":
+        raise ReleaseError("cli", "bootstrap-stage")
     if args.stage in ("prepare", "publish"):
         if not args.go or not args.cache_dir or not args.artifact_root:
             raise ReleaseError("cli", "required")
