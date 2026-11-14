@@ -20,6 +20,7 @@ bounded counts, whitelisted relation names, and bounded page integers.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -79,6 +80,15 @@ _PAGE_SHAPE_RE = re.compile(r"[0-9]{1,9}")
 
 def _bounded_count(value: int) -> int:
     return min(value, MAX_BOUNDED_COUNT)
+
+
+def _body_is_empty_list(body: bytes) -> bool:
+    """Return only whether the body is a JSON empty list; never its content."""
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(value, list) and not value
 
 
 def _bool(value: bool) -> str:
@@ -507,6 +517,28 @@ def _format_relation_totals(shape: Mapping[str, Any]) -> str:
     )
 
 
+def _emit_inventory_empty(
+    out: TextIO, page_shapes: list[tuple[int, dict[str, Any]]]
+) -> None:
+    if page_shapes:
+        _emit(
+            out,
+            "inventory_empty",
+            _bool(page_shapes[0][1].get("empty", False)),
+        )
+
+
+def _emit_page_empty(
+    out: TextIO, page_shapes: list[tuple[int, dict[str, Any]]]
+) -> None:
+    for page, shape in page_shapes:
+        _emit(
+            out,
+            f"link_shape_page_{page}_empty",
+            _bool(shape.get("empty", False)),
+        )
+
+
 def _emit_shape(
     out: TextIO, page_shapes: list[tuple[int, dict[str, Any]]]
 ) -> None:
@@ -521,6 +553,11 @@ def _emit_shape(
                 f"oversized:{_bool(shape['oversized'])},"
                 f"syntax_ok:{_bool(shape['syntax_ok'])}"
             ),
+        )
+        _emit(
+            out,
+            prefix + "empty",
+            _bool(shape.get("empty", False)),
         )
         _emit(out, prefix + "link_count", shape["link_count"])
         _emit(out, prefix + "relations", _format_relation_totals(shape))
@@ -578,9 +615,9 @@ class DiagnosticHTTP:
         )
         if inventory:
             link = release._header_value(response.headers, "link")
-            self.page_shapes.append(
-                (self.inventory_calls, _shape_from_link_header(link))
-            )
+            shape = _shape_from_link_header(link)
+            shape["empty"] = _body_is_empty_list(response.body)
+            self.page_shapes.append((self.inventory_calls, shape))
         return response
 
 
@@ -612,16 +649,21 @@ def main(
         instance._list_owner_packages(token)
         _emit(output, "inventory_result", "accepted")
         _emit(output, "inventory_pages", wrapper.inventory_calls)
+        _emit_inventory_empty(output, page_shapes)
+        _emit_shape(output, page_shapes)
         return 0
     except release.ReleaseError as exc:
         _emit(output, "inventory_result", "rejected")
         _emit(output, "failure_stage", exc.stage)
         _emit(output, "failure_kind", exc.kind)
+        _emit_inventory_empty(output, page_shapes)
         if exc.stage == "package" and (
             exc.kind == "inventory-link"
             or exc.kind.startswith("inventory-link-")
         ):
             _emit_shape(output, page_shapes)
+        else:
+            _emit_page_empty(output, page_shapes)
         return 1
     except Exception:
         _emit(output, "inventory_result", "internal-error")

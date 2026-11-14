@@ -35,6 +35,10 @@ INVENTORY_BASE = (
 )
 
 
+def empty_terminal_link() -> str:
+    return f'<{INVENTORY_BASE}&page=0>; rel="last"'
+
+
 def package_metadata(
     role: str,
     *,
@@ -191,6 +195,11 @@ def shape_text(header: object) -> str:
 
 
 class ShapeTests(unittest.TestCase):
+    def test_body_empty_flag_is_boolean_only(self):
+        self.assertTrue(diagnose._body_is_empty_list(b"[]"))
+        self.assertFalse(diagnose._body_is_empty_list(b"[{}]"))
+        self.assertFalse(diagnose._body_is_empty_list(b"not-json"))
+
     def test_path_kind_enum_and_no_raw_path(self):
         base = "https://api.github.com"
         query = "?package_type=container&per_page=100&page=2"
@@ -404,6 +413,8 @@ class MainTests(unittest.TestCase):
         self.assertIn("identity_scope=read:packages", out)
         self.assertIn("inventory_result=accepted", out)
         self.assertIn("inventory_pages=1", out)
+        self.assertIn("inventory_empty=false", out)
+        self.assertIn("link_shape_page_1_empty=false", out)
         self.assertEqual(fake.identity_calls, 1)
         self.assertEqual(fake.inventory_calls, 1)
         for call in fake.calls:
@@ -421,6 +432,45 @@ class MainTests(unittest.TestCase):
             self.assertNotIn(TOKEN, value)
             self.assertNotIn("payment-hub-app", value)
             self.assertNotIn("payment-hub-migrate", value)
+
+    def test_accepted_empty_first_page_last_zero(self):
+        fake = FakeHTTP(
+            pages={1: []},
+            links={1: empty_terminal_link()},
+        )
+        code, out, err = run_main(http=fake)
+        self.assertEqual(code, 0)
+        self.assertIn("inventory_result=accepted", out)
+        self.assertIn("inventory_pages=1", out)
+        self.assertIn("inventory_empty=true", out)
+        self.assertIn("link_shape_page_1_empty=true", out)
+        self.assertEqual(fake.identity_calls, 1)
+        self.assertEqual(fake.inventory_calls, 1)
+        for value in (out, err):
+            self.assertNotIn(TOKEN, value)
+            self.assertNotIn("payment-hub-app", value)
+            self.assertNotIn("payment-hub-migrate", value)
+
+    def test_empty_first_page_last_zero_failure_reports_empty(self):
+        fake = FakeHTTP(
+            pages={1: []},
+            links={
+                1: (
+                    f'<{INVENTORY_BASE}&page=0&{SENTINEL}=1>; '
+                    'rel="last"'
+                )
+            },
+        )
+        code, out, err = run_main(http=fake)
+        self.assertEqual(code, 1)
+        self.assertIn("failure_kind=inventory-link-query", out)
+        self.assertIn("inventory_empty=true", out)
+        self.assertIn("link_shape_page_1_empty=true", out)
+        self.assertIn("last_page:0", out)
+        for value in (out, err):
+            self.assertNotIn(SENTINEL, value)
+            self.assertNotIn(TOKEN, value)
+            self.assertNotIn(INVENTORY_BASE, value)
 
     def test_accepted_multi_page(self):
         page_one = [
@@ -447,6 +497,9 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("inventory_result=accepted", out)
         self.assertIn("inventory_pages=2", out)
+        self.assertIn("inventory_empty=false", out)
+        self.assertIn("link_shape_page_1_empty=false", out)
+        self.assertIn("link_shape_page_2_empty=false", out)
         self.assertEqual(fake.identity_calls, 1)
         self.assertEqual(fake.inventory_calls, 2)
         for value in (out, err):
@@ -520,7 +573,10 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("failure_stage=package", out)
         self.assertIn("failure_kind=inventory-forbidden", out)
-        self.assertNotIn("link_shape", out)
+        self.assertIn("inventory_empty=false", out)
+        self.assertIn("link_shape_page_1_empty=false", out)
+        self.assertNotIn("link_shape_page_count", out)
+        self.assertNotIn("link_shape_page_1_link", out)
         for value in (out, err):
             self.assertNotIn(TOKEN, value)
             self.assertNotIn("payment-hub-app", value)

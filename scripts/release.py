@@ -2411,8 +2411,19 @@ class Release:
         # the fixed identity and package-metadata endpoints.
         return {"login": OWNER_LOGIN, "scope": scope}
 
-    def _inventory_nav_page(self, uri: str, expected_page: int | None) -> int:
-        """Parse one exact same-origin GitHub inventory navigation URL."""
+    def _inventory_nav_page(
+        self,
+        uri: str,
+        expected_page: int | None,
+        *,
+        allow_zero_page: bool = False,
+    ) -> int:
+        """Parse one exact same-origin GitHub inventory navigation URL.
+
+        ``allow_zero_page`` exists only for the single empty first-page
+        terminal Link; it permits the exact string ``"0"`` and nothing else.
+        All other callers keep the positive-page-only contract.
+        """
         try:
             parsed = urllib.parse.urlsplit(uri)
             port = parsed.port
@@ -2444,10 +2455,11 @@ class Release:
         ):
             raise ReleaseError("package", INVENTORY_LINK_KIND_QUERY)
         page_values = query["page"]
-        if (
-            len(page_values) != 1
-            or not re.fullmatch(r"[1-9][0-9]{0,8}", page_values[0])
-        ):
+        page_valid = len(page_values) == 1 and (
+            re.fullmatch(r"[1-9][0-9]{0,8}", page_values[0]) is not None
+            or (allow_zero_page and page_values[0] == "0")
+        )
+        if not page_valid:
             raise ReleaseError("package", INVENTORY_LINK_KIND_PAGE)
         page = int(page_values[0])
         if expected_page is not None and page != expected_page:
@@ -2455,9 +2467,19 @@ class Release:
         return page
 
     def _inventory_link_navigation(
-        self, link_header: Any, current_page: int
+        self,
+        link_header: Any,
+        current_page: int,
+        *,
+        empty_first_page: bool = False,
     ) -> tuple[int | None, int | None]:
-        """Validate the whole Link header and return (next, last) pages."""
+        """Validate the whole Link header and return (next, last) pages.
+
+        ``empty_first_page`` is supplied only when page 1 returned no items.
+        It permits one narrow terminal shape: a single ``last`` relation whose
+        otherwise fully validated URL has the exact page value ``"0"``.  No
+        other zero-page, relation combination, or later page is accepted.
+        """
         if link_header is None:
             return None, None
         links = _parse_link_header(
@@ -2469,6 +2491,12 @@ class Release:
         last_links = [uri for uri, rel in links if rel == "last"]
         if len(next_links) > 1 or len(last_links) > 1:
             raise ReleaseError("package", INVENTORY_LINK_KIND_RELATION)
+        empty_terminal_candidate = (
+            empty_first_page
+            and current_page == 1
+            and len(links) == 1
+            and links[0][1] == "last"
+        )
         next_page = None
         if next_links:
             next_page = self._inventory_nav_page(
@@ -2476,7 +2504,13 @@ class Release:
             )
         last_page = None
         if last_links:
-            last_page = self._inventory_nav_page(last_links[0], None)
+            last_page = self._inventory_nav_page(
+                last_links[0],
+                None,
+                allow_zero_page=empty_terminal_candidate,
+            )
+            if empty_terminal_candidate and last_page == 0:
+                return None, None
         if last_page is not None:
             if last_page < current_page:
                 raise ReleaseError("package", INVENTORY_LINK_KIND_NAVIGATION)
@@ -2581,7 +2615,9 @@ class Release:
                 if role is not None:
                     targets[name] = item
             next_page, last_page = self._inventory_link_navigation(
-                _header_value(response.headers, "link"), page
+                _header_value(response.headers, "link"),
+                page,
+                empty_first_page=(page == 1 and not items),
             )
             if last_page is not None:
                 if expected_last is None:
@@ -3394,6 +3430,28 @@ class _HttpDeadline:
         return False
 
 
+def _normalize_http_headers(headers: Any) -> dict[str, str]:
+    """Lower-case header names while preserving every Link value.
+
+    ``email.message.Message`` can expose multiple ``Link`` fields.  Collapsing
+    them with a plain dict would silently keep only the last one, so join all
+    Link values with commas; all other headers keep the previous last-wins
+    behavior.  The existing 8192-byte Link limit still rejects an oversized
+    combined value when the inventory parser consumes it.
+    """
+    normalized: dict[str, str] = {}
+    link_values: list[str] = []
+    for key, value in headers.items():
+        name = key.lower()
+        if name == "link":
+            link_values.append(str(value))
+        else:
+            normalized[name] = value
+    if link_values:
+        normalized["link"] = ",".join(link_values)
+    return normalized
+
+
 def _default_http(
     method: str,
     url: str,
@@ -3419,7 +3477,7 @@ def _default_http(
                 raise ReleaseError("tool", "http-body") from exc
             return HttpResult(
                 exc.code,
-                {key.lower(): value for key, value in exc.headers.items()},
+                _normalize_http_headers(exc.headers),
                 body,
             )
         except (urllib.error.URLError, OSError) as exc:
@@ -3433,7 +3491,7 @@ def _default_http(
                 raise ReleaseError("tool", "http-body")
             return HttpResult(
                 response.status,
-                {key.lower(): value for key, value in response.headers.items()},
+                _normalize_http_headers(response.headers),
                 body,
             )
 
