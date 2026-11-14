@@ -2075,6 +2075,166 @@ class PublishTests(ReleaseTestBase):
         self.assertEqual(summary["failure"], {"stage": "handoff", "kind": "descriptor-sha"})
 
 
+class PackageAuditBoundaryTests(unittest.TestCase):
+    """Exercise audit boundaries without preparing images or publishing."""
+
+    def setUp(self):
+        self.http = mock.Mock()
+        self.instance = release.Release(http=self.http, env={})
+
+    def assert_error(self, kind, operation, stage="package"):
+        with self.assertRaises(release.ReleaseError) as caught:
+            operation()
+        self.assertEqual((caught.exception.stage, caught.exception.kind),
+                         (stage, kind))
+
+    def test_identity_rejects_unsuccessful_and_malformed_responses(self):
+        cases = [
+            (401, b'{}', "identity"),
+            (403, b'{}', "identity"),
+            (500, b'{}', "identity"),
+            (200, b'\xff', "identity"),
+            (200, b'{', "identity"),
+            (200, b'[]', "owner"),
+            (200, b'null', "owner"),
+            (200, b'{}', "owner"),
+        ]
+        for status, body, kind in cases:
+            with self.subTest(status=status, body=body):
+                self.http.return_value = release.HttpResult(status, {}, body)
+                self.assert_error(kind,
+                                  lambda: self.instance._audit_identity(AUDIT_TOKEN),
+                                  stage="audit")
+
+    def test_scope_header_normalization_and_unknown_scope(self):
+        cases = [
+            (None, "unknown"),
+            ("", "unknown"),
+            (" ,  , ", "unknown"),
+            (" read:packages , read:packages ", "read:packages"),
+        ]
+        for header, expected in cases:
+            with self.subTest(header=header):
+                headers = {} if header is None else {"X-OAuth-Scopes": header}
+                self.http.return_value = release.HttpResult(
+                    200, headers, b'{"login":"xtianxx"}')
+                self.assertEqual(self.instance._audit_identity(AUDIT_TOKEN),
+                                 {"login": "xtianxx", "scope": expected})
+        args, kwargs = self.http.call_args
+        self.assertEqual(args, ("GET", release.GITHUB_API + "/user"))
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer " + AUDIT_TOKEN)
+
+    def test_scope_header_rejects_wrong_types_oversize_and_extra_permissions(self):
+        for header in (False, 1, [], " " * 4097, "repo", "write:packages",
+                       "read:packages,delete:packages", "READ:PACKAGES"):
+            with self.subTest(header=header):
+                self.http.return_value = release.HttpResult(
+                    200, {"X-OAuth-Scopes": header}, b'{"login":"xtianxx"}')
+                self.assert_error("scope",
+                                  lambda: self.instance._audit_identity(AUDIT_TOKEN),
+                                  stage="audit")
+
+    def test_package_ids_reject_bool_and_non_integer_values_for_both_roles(self):
+        for role in release.ROLES:
+            for package_id in (None, True, False, 0, -1, 1.5, "101", [], {}):
+                with self.subTest(role=role, package_id=package_id):
+                    metadata = package_metadata(role)
+                    metadata["id"] = package_id
+                    self.assert_error(role + "-id",
+                                      lambda: release._validate_package_metadata(metadata, role))
+
+    def test_metadata_projection_ignores_unrelated_api_fields(self):
+        for role in release.ROLES:
+            with self.subTest(role=role):
+                metadata = package_metadata(role, package_id=1, repository_private=False)
+                metadata["description"] = "unrelated API metadata"
+                original = json.dumps(metadata, sort_keys=True)
+                self.assertEqual(release._validate_package_metadata(metadata, role), {
+                    "name": release.PACKAGE_NAMES[role], "id": 1,
+                    "repository": release.REPOSITORY, "visibility": "private",
+                })
+                self.assertEqual(json.dumps(metadata, sort_keys=True), original)
+
+    def test_inventory_rejects_malformed_unrelated_entries(self):
+        cases = [None, [], {}, foreign_package(0) | {"package_type": "npm"}]
+        for name in ("", "a" * 257, "has space", "tab\tname", "line\nname", "del\x7f"):
+            cases.append(foreign_package(0) | {"name": name})
+        for entry in cases:
+            with self.subTest(entry=entry):
+                self.http.return_value = release.HttpResult(
+                    200, {}, json.dumps([entry]).encode())
+                self.assert_error("inventory-json",
+                                  lambda: self.instance._list_owner_packages(AUDIT_TOKEN))
+
+    def test_inventory_rejects_duplicate_unrelated_ids_or_names_across_pages(self):
+        first = [foreign_package(i) for i in range(release.INVENTORY_PER_PAGE)]
+        next_link = (release.GITHUB_API + "/user/packages?"
+                     "package_type=container&per_page=100&page=2")
+        for duplicate in (foreign_package(100) | {"id": first[0]["id"]},
+                          foreign_package(100) | {"name": first[0]["name"]}):
+            with self.subTest(duplicate=duplicate):
+                self.http.reset_mock()
+                self.http.side_effect = [
+                    release.HttpResult(200, {"Link": '<' + next_link + '>; rel="next"'},
+                                       json.dumps(first).encode()),
+                    release.HttpResult(200, {}, json.dumps([duplicate]).encode()),
+                ]
+                self.assert_error("inventory-duplicate",
+                                  lambda: self.instance._list_owner_packages(AUDIT_TOKEN))
+                self.assertEqual(self.http.call_count, 2)
+
+    def test_inventory_byte_budget_accepts_exact_boundary_and_rejects_overflow(self):
+        for body, maximum, kind in ((b'[]', 2, None), (b'[] ', 2, "inventory-bytes")):
+            with self.subTest(body=body):
+                self.http.return_value = release.HttpResult(200, {}, body)
+                with mock.patch.object(release, "INVENTORY_MAX_BYTES", maximum):
+                    if kind:
+                        self.assert_error(kind,
+                                          lambda: self.instance._list_owner_packages(AUDIT_TOKEN))
+                    else:
+                        self.assertEqual(self.instance._list_owner_packages(AUDIT_TOKEN), {})
+                self.assertEqual(self.http.call_args.kwargs["max_bytes"], maximum)
+
+    def test_inventory_body_limit_error_is_reported_as_inventory_bytes(self):
+        self.http.side_effect = release.ReleaseError("tool", "http-body")
+        self.assert_error("inventory-bytes",
+                          lambda: self.instance._list_owner_packages(AUDIT_TOKEN))
+        self.http.assert_called_once()
+
+    def test_inventory_transport_errors_keep_original_classification(self):
+        error = release.ReleaseError("tool", "http-timeout")
+        self.http.side_effect = error
+        with self.assertRaises(release.ReleaseError) as caught:
+            self.instance._list_owner_packages(AUDIT_TOKEN)
+        self.assertIs(caught.exception, error)
+        self.http.assert_called_once()
+
+    def test_inventory_caps_request_timeout_to_remaining_deadline(self):
+        self.http.return_value = release.HttpResult(200, {}, b'[]')
+        with mock.patch.object(release.time, "monotonic", side_effect=[100.0, 109.75]), \
+                mock.patch.object(release, "INVENTORY_TIMEOUT_SECONDS", 10):
+            self.assertEqual(self.instance._list_owner_packages(AUDIT_TOKEN), {})
+        self.assertEqual(self.http.call_args.kwargs["timeout"], 0.25)
+
+    def test_refresh_preserves_frozen_expectations_for_both_roles(self):
+        expected = {role: {"status": "EXISTING_VALID", "id": index + 101}
+                    for index, role in enumerate(release.ROLES)}
+        for role in release.ROLES:
+            cases = [({"status": "ABSENT_CONFIRMED", "id": None}, "-missing"),
+                     ({"status": "EXISTING_VALID", "id": 999}, "-changed")]
+            for changed, suffix in cases:
+                with self.subTest(role=role, suffix=suffix):
+                    frozen = json.dumps(expected, sort_keys=True)
+                    current = {key: dict(value) for key, value in expected.items()}
+                    current[role] = changed
+                    with mock.patch.object(self.instance, "_inventory_packages",
+                                           return_value=(current, {})) as inventory:
+                        self.assert_error(role + suffix, lambda:
+                                          self.instance._refresh_package_expectations(AUDIT_TOKEN, expected))
+                    inventory.assert_called_once_with(AUDIT_TOKEN)
+                    self.assertEqual(json.dumps(expected, sort_keys=True), frozen)
+
+
 class PackageInventoryTests(ReleaseTestBase):
     def setUp(self):
         super().setUp()
