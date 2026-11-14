@@ -15,6 +15,14 @@
 - prepare不读取包审计Secret、不查询包，也不接收初始化CLI参数。PR和定时检查不获得包凭据或写权限。
 - main/SHA/clean checkout、同提交CI成功、原产物交接、load/tag身份、registry manifest、按digest拉回及重新验收保持原有严格要求，不重构建或改用另一对镜像绕过。
 
+### 调用者限制：仅账号所有者
+
+正常发布和首次初始化都只允许`xtianxx`发起，并且重跑发起者也必须是`xtianxx`。`github.actor`与`github.triggering_actor`缺失或任一不符时拒绝，不回退为“原调用者曾获批准即可重跑”。
+
+prepare首个前置检查明确失败；upload在job条件中复核两项身份，非owner不启动带`packages: write`的作业。脚本在受信上下文检查中再次验证，不能只靠workflow传入三个true值。原有两项主确认和初始化附加确认仍然必须满足。
+
+这是owner单人操作授权，不是多人独立审批。本次不配置GitHub Environment或改变仓库权限；受信工作流内的allowlist不能替代平台级Secret隔离，也不授权通过修改其他分支的工作流绕过策略。以后增加发布者或独立审批须另行确认。
+
 ### 凭据准备：只读审计与上传分离
 
 正常发布和初始化都需要独立的仓库Secret `GHCR_PACKAGE_AUDIT_TOKEN`，不再用仓库级`GITHUB_TOKEN`推断owner命名空间是否缺少某个包。
@@ -38,6 +46,8 @@
 4. 每个role push前刷新清单；已存在包消失、ID改变或缺失名称被外部占用，都停止，不自动把更新切换为创建。自身已成功推送并验证的role按新记录核对。
 5. 每次push后立即复查private及仓库关联等元数据；失败即停止，不继续第二个包。最终再次核对两包，并保留原digest/拉回/验收链路，全部通过才记为发布成功。
 
+分页结束遵循GitHub的`Link`契约：无后续链接可表示终页，恰好100条的终页也合法，不能仅凭返回数量认定缺页。已声明未来last却缺少续链、畸形链接或跨页last不一致会失败；这不保证检测到服务端违反契约或所有并发位移。
+
 ### 必须接受的剩余风险与失败处置
 
 GHCR没有“仅当名称不存在才创建”的原子前提。完整分页、push前重查和push后验证都不是原子快照；首次private和自动仓库关联依赖GitHub契约、现有source label及工作流token。外部写者仍可能在检查与push之间占用名称或改变visibility。负责人已批准实现该受控路径，但实际使用仍须另行批准，并安排没有其他发布者操作的窗口。
@@ -48,9 +58,16 @@ push后检查只能检测问题，不能保证阻止首次暴露；包一旦publ
 
 这次源码变化会使旧候选清单失配，后续真实发布必须构建修复后SHA的新候选；不能复用诊断运行的旧bundle。
 
+### 发布摘要v1的兼容规则
+
+`payment-hub.release-summary.v1`的对象字段允许向后兼容地追加；消费者应读取其需要的已知字段，并忽略未知字段，不把旧字段集合当作封闭schema。本次新增审计、初始包状态、push尝试及副作用字段，不删除或改变原有字段的类型与含义；不能只检查旧`pushed_roles`就推断没有远端副作用。
+
+后续若需删除既有字段、改变其类型或含义，应评估并升级schema版本及迁移方式。历史v1摘要不重写；仅新增字段不自动升级为v2。仓内当前消费者按字段读取，未发现release-summary封闭字段集消费者；此检索不保证仓外不存在自行实现的严格消费者。
+
 ### 官方依据
 
 - [Authenticated-user包清单与包元数据接口](https://docs.github.com/en/rest/packages/packages)
+- [GitHub REST分页与Link结束信号](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api)
 - [认证用户身份](https://docs.github.com/en/rest/users/users#get-the-authenticated-user)
 - [GHCR首次private、source label与工作流关联](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
 - [包可见性、仓库访问继承与public不可逆](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)

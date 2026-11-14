@@ -56,10 +56,16 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref }}
           REPOSITORY: ${{ github.repository }}
+          RELEASE_ACTOR: ${{ github.actor }}
+          RELEASE_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           PUBLISH_AUTHORIZED: ${{ inputs.publish_authorized }}
           PACKAGES_VERIFIED: ${{ inputs.packages_verified }}
         run: |
           set -euo pipefail
+          if [[ "$RELEASE_ACTOR" != "xtianxx" || "$RELEASE_TRIGGERING_ACTOR" != "xtianxx" ]]; then
+            echo "::error::owner-only publish requires actor and triggering actor xtianxx"
+            exit 1
+          fi
           if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
             echo "::error::publish requires workflow_dispatch"
             exit 1
@@ -221,6 +227,7 @@ jobs:
   upload:
     name: Publish paired images (linux/amd64)
     needs: prepare
+    if: ${{ github.actor == 'xtianxx' && github.triggering_actor == 'xtianxx' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:

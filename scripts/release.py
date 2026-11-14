@@ -1648,6 +1648,10 @@ class Release:
         requested = _source_sha(source_sha, "context", "source-sha")
         if github_sha != requested:
             raise ReleaseError("context", "sha")
+        if self.env.get("GITHUB_ACTOR") != OWNER_LOGIN:
+            raise ReleaseError("context", "actor-owner")
+        if self.env.get("GITHUB_TRIGGERING_ACTOR") != OWNER_LOGIN:
+            raise ReleaseError("context", "triggering-actor-owner")
         head = self._git(["rev-parse", "HEAD"])
         if head.timed_out or head.exit_code != 0 or head.stdout.strip() != github_sha:
             raise ReleaseError("context", "git-head")

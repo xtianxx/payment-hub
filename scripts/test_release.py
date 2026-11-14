@@ -9,6 +9,7 @@ slow response body.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import http.server
 import importlib.util
@@ -832,6 +833,30 @@ class FakeHTTP:
         self.block_inventory_session: int | None = None
         self.block_inventory_page: int | None = None
         self.block_inventory_marker: Path | None = None
+        self.ghcr_manifest_calls: dict[str, int] = {
+            "app": 0,
+            "migrate": 0,
+        }
+        self.ghcr_token_calls: dict[str, int] = {"app": 0, "migrate": 0}
+
+    @staticmethod
+    def _authorization(headers: dict[str, str]) -> str | None:
+        for key, value in headers.items():
+            if key.lower() == "authorization":
+                return value
+        return None
+
+    @staticmethod
+    def _ghcr_has_audit_material(url: str, headers: dict[str, str]) -> bool:
+        encoded = base64.b64encode(AUDIT_TOKEN.encode("utf-8")).decode("ascii")
+        basic = base64.b64encode(
+            (release.OWNER_LOGIN + ":" + AUDIT_TOKEN).encode("utf-8")
+        ).decode("ascii")
+        values = [url, *headers.values()]
+        return any(
+            AUDIT_TOKEN in value or encoded in value or basic in value
+            for value in values
+        )
 
     def _current_package(self, role: str) -> dict[str, Any] | None:
         if self.is_pushed is not None and self.is_pushed(role):
@@ -936,13 +961,51 @@ class FakeHTTP:
                 return release.HttpResult(404, {}, b"{}")
             return release.HttpResult(200, {}, json_bytes(current))
         if url.startswith(release.TOKEN_REALM):
+            if self._ghcr_has_audit_material(url, headers):
+                return release.HttpResult(403, {}, b"{}")
+            parsed = urllib.parse.urlsplit(url)
+            query = urllib.parse.parse_qs(parsed.query)
+            scope = query.get("scope", [""])[0]
+            role = "app" if "payment-hub-app" in scope else "migrate"
+            expected_scope = f"repository:xtianxx/payment-hub-{role}:pull"
+            expected_basic = "Basic " + base64.b64encode(
+                (release.OWNER_LOGIN + ":" + GITHUB_TOKEN).encode("utf-8")
+            ).decode("ascii")
+            if (
+                parsed.scheme != "https"
+                or parsed.netloc != release.GHCR
+                or parsed.path != "/token"
+                or query != {
+                    "service": [release.TOKEN_SERVICE],
+                    "scope": [expected_scope],
+                }
+                or self._authorization(headers) != expected_basic
+            ):
+                return release.HttpResult(403, {}, b"{}")
+            self.ghcr_token_calls[role] += 1
             return release.HttpResult(
                 200, {}, json_bytes({"token": SCOPED_TOKEN})
             )
         if "/v2/" in url and "/manifests/" in url:
+            if self._ghcr_has_audit_material(url, headers):
+                return release.HttpResult(403, {}, b"{}")
             role = "app" if "payment-hub-app" in url else "migrate"
-            digest = url.rsplit("/", 1)[-1]
-            if "Authorization" not in headers:
+            parsed = urllib.parse.urlsplit(url)
+            expected_prefix = (
+                f"/v2/xtianxx/payment-hub-{role}/manifests/"
+            )
+            if (
+                parsed.scheme != "https"
+                or parsed.netloc != release.GHCR
+                or not parsed.path.startswith(expected_prefix)
+            ):
+                return release.HttpResult(403, {}, b"{}")
+            authorization = self._authorization(headers)
+            call_index = self.ghcr_manifest_calls[role]
+            self.ghcr_manifest_calls[role] += 1
+            if call_index % 2 == 0:
+                if authorization is not None:
+                    return release.HttpResult(403, {}, b"{}")
                 scope = f"repository:xtianxx/payment-hub-{role}:pull"
                 return release.HttpResult(
                     401,
@@ -955,6 +1018,9 @@ class FakeHTTP:
                     },
                     b"",
                 )
+            if authorization != "Bearer " + SCOPED_TOKEN:
+                return release.HttpResult(403, {}, b"{}")
+            digest = url.rsplit("/", 1)[-1]
             body = self.manifest_body_override.get(
                 role, self.pair.root_bytes.get(digest, b"")
             )
@@ -985,6 +1051,7 @@ class ReleaseTestBase(unittest.TestCase):
             "GITHUB_SHA": SOURCE_SHA,
             "GITHUB_REPOSITORY": release.REPOSITORY,
             "GITHUB_ACTOR": "xtianxx",
+            "GITHUB_TRIGGERING_ACTOR": "xtianxx",
             "GITHUB_TOKEN": GITHUB_TOKEN,
             "GHCR_PACKAGE_AUDIT_TOKEN": AUDIT_TOKEN,
             "PATH": os.environ.get("PATH", ""),
@@ -1072,7 +1139,61 @@ class ReleaseTestBase(unittest.TestCase):
             ]
         )
 
-    def run_prepare(self, *, prepare_inputs: bool = False, fake: FakeRunner | None = None):
+    def assert_ghcr_auth_contract(self, http: FakeHTTP) -> None:
+        expected_basic = "Basic " + base64.b64encode(
+            (release.OWNER_LOGIN + ":" + GITHUB_TOKEN).encode("utf-8")
+        ).decode("ascii")
+        encoded_audit = base64.b64encode(
+            AUDIT_TOKEN.encode("utf-8")
+        ).decode("ascii")
+        basic_audit = base64.b64encode(
+            (release.OWNER_LOGIN + ":" + AUDIT_TOKEN).encode("utf-8")
+        ).decode("ascii")
+        token_auth: dict[str, list[str | None]] = {
+            "app": [],
+            "migrate": [],
+        }
+        manifest_auth: dict[str, list[str | None]] = {
+            "app": [],
+            "migrate": [],
+        }
+        for call in http.calls:
+            url = call["url"]
+            authorization = FakeHTTP._authorization(call["headers"])
+            if url.startswith(release.TOKEN_REALM):
+                role = "app" if "payment-hub-app" in url else "migrate"
+                token_auth[role].append(authorization)
+            elif "/v2/" in url and "/manifests/" in url:
+                role = "app" if "payment-hub-app" in url else "migrate"
+                manifest_auth[role].append(authorization)
+            else:
+                continue
+            self.assertNotIn(AUDIT_TOKEN, url)
+            for value in call["headers"].values():
+                self.assertNotIn(AUDIT_TOKEN, value)
+                self.assertNotIn(encoded_audit, value)
+                self.assertNotIn(basic_audit, value)
+        for role in release.ROLES:
+            self.assertEqual(token_auth[role], [expected_basic])
+            self.assertEqual(len(manifest_auth[role]), 2)
+            self.assertIsNone(manifest_auth[role][0])
+            self.assertEqual(
+                manifest_auth[role][1], "Bearer " + SCOPED_TOKEN
+            )
+            for value in [*token_auth[role], *manifest_auth[role]]:
+                if value is None:
+                    continue
+                self.assertNotIn(AUDIT_TOKEN, value)
+                self.assertNotIn(encoded_audit, value)
+                self.assertNotIn(basic_audit, value)
+
+    def run_prepare(
+        self,
+        *,
+        prepare_inputs: bool = False,
+        fake: FakeRunner | None = None,
+        env: dict[str, str] | None = None,
+    ):
         root = self.base / "prepare-root"
         fake = fake or FakeRunner(self.pair)
         fake.tar_source = self.base / "source-pair.tar"
@@ -1080,7 +1201,7 @@ class ReleaseTestBase(unittest.TestCase):
             repo=self.repo,
             runner=fake,
             delegated_runner=fake,
-            env=self.env,
+            env=env if env is not None else self.env,
             git_path="/fake/git",
             docker_path="/fake/docker",
         )
@@ -1094,6 +1215,8 @@ class ReleaseTestBase(unittest.TestCase):
         descriptor_sha: str,
         fake: FakeRunner,
         http: FakeHTTP,
+        *,
+        env: dict[str, str] | None = None,
         **kwargs: Any,
     ):
         fake.tar_source = self.base / "source-pair.tar"
@@ -1102,7 +1225,7 @@ class ReleaseTestBase(unittest.TestCase):
             runner=fake,
             delegated_runner=fake,
             http=http,
-            env=self.env,
+            env=env if env is not None else self.env,
             git_path="/fake/git",
             docker_path="/fake/docker",
         )
@@ -1314,6 +1437,60 @@ class PrepareTests(ReleaseTestBase):
         self.assertFalse(tool_dir.startswith(str(root)))
         self.assertNotIn("--prepare-tool", calls[0]["argv"])
 
+    def test_owner_actor_and_triggering_actor_required_before_any_child(self):
+        cases = [
+            (
+                "non-owner-actor",
+                {"GITHUB_ACTOR": "other-user"},
+                "actor-owner",
+            ),
+            (
+                "non-owner-trigger",
+                {"GITHUB_TRIGGERING_ACTOR": "other-user"},
+                "triggering-actor-owner",
+            ),
+            ("missing-actor", {"GITHUB_ACTOR": None}, "actor-owner"),
+            (
+                "missing-trigger",
+                {"GITHUB_TRIGGERING_ACTOR": None},
+                "triggering-actor-owner",
+            ),
+            (
+                "both-non-owner",
+                {
+                    "GITHUB_ACTOR": "other-user",
+                    "GITHUB_TRIGGERING_ACTOR": "rerun-user",
+                },
+                "actor-owner",
+            ),
+            (
+                "both-missing",
+                {
+                    "GITHUB_ACTOR": None,
+                    "GITHUB_TRIGGERING_ACTOR": None,
+                },
+                "actor-owner",
+            ),
+        ]
+        for label, overrides, kind in cases:
+            with self.subTest(label=label):
+                env = dict(self.env)
+                for name, value in overrides.items():
+                    if value is None:
+                        env.pop(name, None)
+                    else:
+                        env[name] = value
+                fake = FakeRunner(self.pair)
+                with self.assertRaises(release.ReleaseError) as caught:
+                    self.run_prepare(fake=fake, env=env)
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("context", kind),
+                )
+                self.assertEqual(fake.calls, [])
+                self.assertEqual(fake.builder_calls, 0)
+                self.assertEqual(fake.save_calls, 0)
+
     def test_builder_record_cross_adapter(self):
         temp = self.base / "builder-seam"
         temp.mkdir()
@@ -1348,6 +1525,17 @@ class VerifyHandoffTests(ReleaseTestBase):
         expected = sha256((bundle / release.DESCRIPTOR_FILE).read_bytes())
         instance = release.Release(repo=self.repo, env=self.env)
         self.assertEqual(instance.verify_handoff(self.verify_args(bundle, expected)), 0)
+
+    def test_valid_offline_bundle_passes_without_owner_identity(self):
+        bundle, descriptor = make_bundle(self.base / "bundle")
+        expected = sha256((bundle / release.DESCRIPTOR_FILE).read_bytes())
+        env = dict(self.env)
+        env.pop("GITHUB_ACTOR", None)
+        env.pop("GITHUB_TRIGGERING_ACTOR", None)
+        instance = release.Release(repo=self.repo, env=env)
+        self.assertEqual(
+            instance.verify_handoff(self.verify_args(bundle, expected)), 0
+        )
 
     def test_expected_descriptor_authority_not_archive_self_report(self):
         bundle, _ = make_bundle(self.base / "bundle")
@@ -1465,6 +1653,70 @@ class PublishTests(ReleaseTestBase):
         )
         self.fake = FakeRunner(self.pair)
         self.http = FakeHTTP(self.pair)
+
+    def test_owner_actor_and_triggering_actor_required_before_git_or_network(self):
+        cases = [
+            (
+                "non-owner-actor",
+                {"GITHUB_ACTOR": "other-user"},
+                "actor-owner",
+            ),
+            (
+                "non-owner-trigger",
+                {"GITHUB_TRIGGERING_ACTOR": "other-user"},
+                "triggering-actor-owner",
+            ),
+            ("missing-actor", {"GITHUB_ACTOR": None}, "actor-owner"),
+            (
+                "missing-trigger",
+                {"GITHUB_TRIGGERING_ACTOR": None},
+                "triggering-actor-owner",
+            ),
+            (
+                "both-non-owner",
+                {
+                    "GITHUB_ACTOR": "other-user",
+                    "GITHUB_TRIGGERING_ACTOR": "rerun-user",
+                },
+                "actor-owner",
+            ),
+            (
+                "both-missing",
+                {
+                    "GITHUB_ACTOR": None,
+                    "GITHUB_TRIGGERING_ACTOR": None,
+                },
+                "actor-owner",
+            ),
+        ]
+        for label, overrides, kind in cases:
+            with self.subTest(label=label):
+                env = dict(self.env)
+                for name, value in overrides.items():
+                    if value is None:
+                        env.pop(name, None)
+                    else:
+                        env[name] = value
+                fake = FakeRunner(self.pair)
+                http = FakeHTTP(self.pair)
+                root = self.base / ("publish-root-" + label)
+                with self.assertRaises(release.ReleaseError) as caught:
+                    self.run_publish(
+                        root,
+                        self.bundle,
+                        self.descriptor_sha,
+                        fake,
+                        http,
+                        env=env,
+                    )
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("context", kind),
+                )
+                self.assertEqual(fake.calls, [])
+                self.assertEqual(fake.login_calls, 0)
+                self.assertEqual(fake.push_calls, [])
+                self.assertEqual(http.calls, [])
 
     def test_no_approval_fails_before_auth_or_network(self):
         root = self.base / "publish-root"
@@ -1785,6 +2037,7 @@ class PublishTests(ReleaseTestBase):
         self.assertEqual(summary["remote"]["app"]["digest"], self.pair.app_id)
         self.assertEqual(summary["pull"]["app"]["id"], self.pair.app_id)
         self.assertEqual(summary["revalidation"]["result"], "pass")
+        self.assert_ghcr_auth_contract(self.http)
         self.assertNotIn(GITHUB_TOKEN, json.dumps(summary))
         self.assertNotIn(SCOPED_TOKEN, json.dumps(summary))
         self.assertEqual(self.fake.login_input, GITHUB_TOKEN)
@@ -1879,6 +2132,7 @@ class PackageInventoryTests(ReleaseTestBase):
                     call["headers"].get("Authorization"),
                     "Bearer " + AUDIT_TOKEN,
                 )
+        self.assert_ghcr_auth_contract(self.http)
 
     def _rewire(self, *, repository_private: Any = None) -> None:
         self.fake = FakeRunner(self.pair)
@@ -1948,6 +2202,7 @@ class PackageInventoryTests(ReleaseTestBase):
                     call["headers"].get("Authorization"),
                     "Bearer " + AUDIT_TOKEN,
                 )
+        self.assert_ghcr_auth_contract(self.http)
         self.assertEqual(self.fake.login_input, GITHUB_TOKEN)
         self.assertNotEqual(self.fake.login_input, AUDIT_TOKEN)
         self.assertNotIn(AUDIT_TOKEN, json.dumps(summary))
@@ -1996,6 +2251,42 @@ class PackageInventoryTests(ReleaseTestBase):
                 self.assertEqual(
                     projection["repository"], release.REPOSITORY
                 )
+
+    def test_registry_token_audit_injection_is_rejected(self):
+        original = release.Release._registry_manifest
+
+        def injected(
+            instance: release.Release,
+            role: str,
+            candidate_digest: str,
+            expected_root: Any,
+            token: str,
+            actor: str,
+        ) -> dict[str, Any]:
+            return original(
+                instance,
+                role,
+                candidate_digest,
+                expected_root,
+                AUDIT_TOKEN,
+                actor,
+            )
+
+        with mock.patch.object(release.Release, "_registry_manifest", injected):
+            with self.assertRaises(release.ReleaseError) as caught:
+                self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("registry", "app-token"),
+        )
+        self.assertEqual(len(self.fake.push_calls), 1)
+        summary = self._summary(self.base / "publish-root")
+        self.assertEqual(summary["push_attempted_roles"], ["app"])
+        self.assertEqual(summary["push_side_effects"], {"app": "unknown"})
+        self.assertEqual(summary["pushed_roles"], ["app"])
+        self.assertEqual(summary["pull"], {})
+        self.assertIsNone(summary["revalidation"])
+        self.assertNotIn(AUDIT_TOKEN, json.dumps(summary))
 
     def test_normal_missing_package_rejected_before_login_or_push(self):
         self.http.packages["app"] = None

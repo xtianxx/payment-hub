@@ -94,6 +94,21 @@ PUBLISH_AUDIT_SECRET_LINE = (
     "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}\n"
 )
 PUBLISH_AUDIT_STEP = ("upload", "Publish paired images")
+PUBLISH_OWNER_CHECK_BLOCK = (
+    '          if [[ "$RELEASE_ACTOR" != "xtianxx" || '
+    '"$RELEASE_TRIGGERING_ACTOR" != "xtianxx" ]]; then\n'
+    '            echo "::error::owner-only publish requires actor and '
+    'triggering actor xtianxx"\n'
+    "            exit 1\n"
+    "          fi\n"
+)
+PUBLISH_DUAL_CONFIRMATION_BLOCK = (
+    '          if [[ "$PUBLISH_AUTHORIZED" != "true" || '
+    '"$PACKAGES_VERIFIED" != "true" ]]; then\n'
+    '            echo "::error::publish requires both manual authorizations"\n'
+    "            exit 1\n"
+    "          fi\n"
+)
 GATE_RUN = (
     "set -euo pipefail\n"
     'if [[ "${SETUP_RESULT:-}" != "success" || '
@@ -1476,7 +1491,7 @@ class PublishWorkflowContractTests(unittest.TestCase):
                 "packages": "write",
             },
         )
-        self.assertNotIn("if", upload)
+        self.assertEqual(upload["if"], MOD.PUBLISH_OWNER_GUARD)
         self.assertEqual(self.workflow.get("permissions"), {"contents": "read"})
         self.assertEqual(
             self.workflow.get("concurrency"),
@@ -1534,30 +1549,25 @@ class PublishWorkflowContractTests(unittest.TestCase):
         self.assertEqual(step["shell"], "bash")
         self.assertNotIn("if", step)
         self.assertNotIn("continue-on-error", step)
-        self.assertEqual(
-            step["env"],
-            {
-                "SOURCE_SHA": "${{ github.sha }}",
-                "EVENT_NAME": "${{ github.event_name }}",
-                "REF_NAME": "${{ github.ref }}",
-                "REPOSITORY": "${{ github.repository }}",
-                "PUBLISH_AUTHORIZED": "${{ inputs.publish_authorized }}",
-                "PACKAGES_VERIFIED": "${{ inputs.packages_verified }}",
-            },
-        )
+        self.assertEqual(step["env"], MOD.PUBLISH_PREPARE_GATE_ENV)
         self.assertNotIn("BOOTSTRAP_PACKAGES", step["env"])
         run = step["run"]
-        for token in (
-            "set -euo pipefail",
-            'if [[ "$EVENT_NAME" != "workflow_dispatch" ]]',
-            'if [[ "$REF_NAME" != "refs/heads/main" ]]',
-            'if [[ "$REPOSITORY" != "xtianxx/payment-hub" ]]',
-            'if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]',
-            'if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]',
-            "exit 1",
-        ):
-            with self.subTest(token=token):
-                self.assertIn(token, run)
+        self.assertEqual(run.strip(), MOD.PUBLISH_PREPARE_GATE_RUN.strip())
+        self.assertIn(
+            'if [[ "$RELEASE_ACTOR" != "xtianxx" || '
+            '"$RELEASE_TRIGGERING_ACTOR" != "xtianxx" ]]',
+            run,
+        )
+        self.assertIn("::error::owner-only", run)
+        self.assertLess(run.index("RELEASE_ACTOR"), run.index("EVENT_NAME"))
+        self.assertLess(
+            run.index("RELEASE_ACTOR"), run.index("PUBLISH_AUTHORIZED")
+        )
+        self.assertIn(
+            'if [[ "$PUBLISH_AUTHORIZED" != "true" || '
+            '"$PACKAGES_VERIFIED" != "true" ]]',
+            run,
+        )
         self.assertNotIn("bootstrap", run.lower())
 
     def test_prepare_command_and_outputs(self):
@@ -2300,6 +2310,143 @@ class PublishWorkflowMutationTests(unittest.TestCase):
         self.assertTrue(issues)
         self.assertIn("publish-prepare-gate-run", {issue.kind for issue in issues})
 
+    def test_mutation_owner_check_removed_is_rejected(self):
+        text = self.text.replace(PUBLISH_OWNER_CHECK_BLOCK, "", 1)
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-prepare-gate-run", {issue.kind for issue in issues})
+
+    def test_mutation_owner_check_wrong_owner_is_rejected(self):
+        text = self.text.replace(
+            PUBLISH_OWNER_CHECK_BLOCK,
+            PUBLISH_OWNER_CHECK_BLOCK.replace("xtianxx", "attacker"),
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-prepare-gate-run", {issue.kind for issue in issues})
+
+    def test_mutation_owner_check_only_actor_is_rejected(self):
+        text = self.text.replace(
+            PUBLISH_OWNER_CHECK_BLOCK,
+            '          if [[ "$RELEASE_ACTOR" != "xtianxx" ]]; then\n'
+            '            echo "::error::owner-only publish requires actor and '
+            'triggering actor xtianxx"\n'
+            "            exit 1\n"
+            "          fi\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-prepare-gate-run", {issue.kind for issue in issues})
+
+    def test_mutation_owner_check_only_triggering_actor_is_rejected(self):
+        text = self.text.replace(
+            PUBLISH_OWNER_CHECK_BLOCK,
+            '          if [[ "$RELEASE_TRIGGERING_ACTOR" != "xtianxx" ]]; then\n'
+            '            echo "::error::owner-only publish requires actor and '
+            'triggering actor xtianxx"\n'
+            "            exit 1\n"
+            "          fi\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-prepare-gate-run", {issue.kind for issue in issues})
+
+    def test_mutation_owner_check_false_guard_is_rejected(self):
+        text = self.text.replace(
+            PUBLISH_OWNER_CHECK_BLOCK,
+            "          if false; then\n"
+            '            echo "::error::owner-only publish requires actor and '
+            'triggering actor xtianxx"\n'
+            "            exit 1\n"
+            "          fi\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-prepare-gate-run", {issue.kind for issue in issues})
+
+    def test_mutation_owner_check_after_authorization_is_rejected(self):
+        text = self.text.replace(PUBLISH_OWNER_CHECK_BLOCK, "", 1)
+        text = text.replace(
+            PUBLISH_DUAL_CONFIRMATION_BLOCK,
+            PUBLISH_DUAL_CONFIRMATION_BLOCK + PUBLISH_OWNER_CHECK_BLOCK,
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-prepare-gate-run", {issue.kind for issue in issues})
+
+    def test_mutation_upload_owner_guard_removed_is_rejected(self):
+        text = self.text.replace(
+            "    if: ${{ github.actor == 'xtianxx' && "
+            "github.triggering_actor == 'xtianxx' }}\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-upload-condition", {issue.kind for issue in issues})
+
+    def test_mutation_upload_owner_guard_wrong_actor_is_rejected(self):
+        text = self.text.replace(
+            "github.actor == 'xtianxx'",
+            "github.actor == 'attacker'",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-upload-condition", {issue.kind for issue in issues})
+
+    def test_mutation_upload_owner_guard_wrong_trigger_is_rejected(self):
+        text = self.text.replace(
+            "github.triggering_actor == 'xtianxx'",
+            "github.triggering_actor == 'attacker'",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-upload-condition", {issue.kind for issue in issues})
+
+    def test_mutation_upload_owner_guard_extra_condition_is_rejected(self):
+        text = self.text.replace(
+            "if: ${{ github.actor == 'xtianxx' && "
+            "github.triggering_actor == 'xtianxx' }}",
+            "if: ${{ github.actor == 'xtianxx' && "
+            "github.triggering_actor == 'xtianxx' && "
+            "github.ref == 'refs/heads/main' }}",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-upload-condition", {issue.kind for issue in issues})
+
+    def test_mutation_upload_owner_guard_false_is_rejected(self):
+        text = self.text.replace(
+            "if: ${{ github.actor == 'xtianxx' && "
+            "github.triggering_actor == 'xtianxx' }}",
+            "if: false",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-upload-condition", {issue.kind for issue in issues})
+
+    def test_mutation_prepare_job_condition_is_rejected(self):
+        text = self.text.replace(
+            "  prepare:\n"
+            "    name: Prepare release handoff (linux/amd64)\n",
+            "  prepare:\n"
+            "    name: Prepare release handoff (linux/amd64)\n"
+            "    if: ${{ github.actor == 'xtianxx' }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn("publish-prepare-condition", {issue.kind for issue in issues})
+
     def test_mutation_source_sha_from_inputs_is_rejected(self):
         text = self.text.replace(
             '        env:\n'
@@ -2899,6 +3046,76 @@ class PublishBootstrapCommandExecutionTests(unittest.TestCase):
                     result.stdout + result.stderr,
                 )
                 self.assertIsNone(args)
+
+
+class PublishOwnerGateExecutionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow, _ = MOD.load_workflow(PUBLISH_WORKFLOW)
+
+    def _run_gate(self, **overrides):
+        step = _step(
+            self.workflow, "prepare", "Verify manual publish preconditions"
+        )
+        run = step["run"]
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        env = {
+            "RELEASE_ACTOR": "xtianxx",
+            "RELEASE_TRIGGERING_ACTOR": "xtianxx",
+            "SOURCE_SHA": "a" * 40,
+            "EVENT_NAME": "workflow_dispatch",
+            "REF_NAME": "refs/heads/main",
+            "REPOSITORY": "xtianxx/payment-hub",
+            "PUBLISH_AUTHORIZED": "true",
+            "PACKAGES_VERIFIED": "true",
+        }
+        env.update(overrides)
+        return subprocess.run(
+            [bash, "--noprofile", "--norc", "-c", run],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_owner_actor_and_triggering_actor_pass(self):
+        result = self._run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_non_owner_actor_fails_before_later_checks(self):
+        result = self._run_gate(RELEASE_ACTOR="attacker", EVENT_NAME="push")
+        self.assertEqual(result.returncode, 1)
+        output = result.stdout + result.stderr
+        self.assertIn("::error::owner-only", output)
+        self.assertNotIn("workflow_dispatch", output)
+
+    def test_non_owner_triggering_actor_fails_before_later_checks(self):
+        result = self._run_gate(
+            RELEASE_TRIGGERING_ACTOR="attacker", EVENT_NAME="push"
+        )
+        self.assertEqual(result.returncode, 1)
+        output = result.stdout + result.stderr
+        self.assertIn("::error::owner-only", output)
+        self.assertNotIn("workflow_dispatch", output)
+
+    def test_missing_owner_actor_or_triggering_actor_fails_closed(self):
+        for key in ("RELEASE_ACTOR", "RELEASE_TRIGGERING_ACTOR"):
+            with self.subTest(key=key):
+                result = self._run_gate(**{key: "", "EVENT_NAME": "push"})
+                self.assertEqual(result.returncode, 1)
+                output = result.stdout + result.stderr
+                self.assertIn("::error::owner-only", output)
+                self.assertNotIn("workflow_dispatch", output)
+
+    def test_owner_does_not_replace_dual_authorization(self):
+        for key in ("PUBLISH_AUTHORIZED", "PACKAGES_VERIFIED"):
+            with self.subTest(key=key):
+                result = self._run_gate(**{key: "false"})
+                self.assertEqual(result.returncode, 1)
+                output = result.stdout + result.stderr
+                self.assertIn("both manual authorizations", output)
+                self.assertNotIn("owner-only", output)
 
 
 class ManifestContractTests(unittest.TestCase):

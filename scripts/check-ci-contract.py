@@ -206,6 +206,46 @@ PUBLISH_INPUT_NAMES = (
     "packages_verified",
     "bootstrap_packages",
 )
+PUBLISH_OWNER_GUARD = (
+    "${{ github.actor == 'xtianxx' && "
+    "github.triggering_actor == 'xtianxx' }}"
+)
+PUBLISH_PREPARE_GATE_ENV = {
+    "SOURCE_SHA": "${{ github.sha }}",
+    "EVENT_NAME": "${{ github.event_name }}",
+    "REF_NAME": "${{ github.ref }}",
+    "REPOSITORY": "${{ github.repository }}",
+    "RELEASE_ACTOR": "${{ github.actor }}",
+    "RELEASE_TRIGGERING_ACTOR": "${{ github.triggering_actor }}",
+    "PUBLISH_AUTHORIZED": "${{ inputs.publish_authorized }}",
+    "PACKAGES_VERIFIED": "${{ inputs.packages_verified }}",
+}
+PUBLISH_PREPARE_GATE_RUN = """set -euo pipefail
+if [[ "$RELEASE_ACTOR" != "xtianxx" || "$RELEASE_TRIGGERING_ACTOR" != "xtianxx" ]]; then
+  echo "::error::owner-only publish requires actor and triggering actor xtianxx"
+  exit 1
+fi
+if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+  echo "::error::publish requires workflow_dispatch"
+  exit 1
+fi
+if [[ "$REF_NAME" != "refs/heads/main" ]]; then
+  echo "::error::publish requires refs/heads/main"
+  exit 1
+fi
+if [[ "$REPOSITORY" != "xtianxx/payment-hub" ]]; then
+  echo "::error::publish requires the trusted repository"
+  exit 1
+fi
+if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "::error::publish requires a 40-hex source SHA"
+  exit 1
+fi
+if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]; then
+  echo "::error::publish requires both manual authorizations"
+  exit 1
+fi
+"""
 PUBLISH_AUDIT_SECRET_NAME = "GHCR_PACKAGE_AUDIT_TOKEN"
 PUBLISH_AUDIT_SECRET_EXPRESSION = "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}"
 PUBLISH_PUBLISH_ENV = {
@@ -1493,27 +1533,11 @@ def validate_publish_workflow(
                 add("publish-prepare-gate-shell")
             if "if" in gate or "continue-on-error" in gate:
                 add("publish-prepare-gate-skip")
-            if gate.get("env") != {
-                "SOURCE_SHA": "${{ github.sha }}",
-                "EVENT_NAME": "${{ github.event_name }}",
-                "REF_NAME": "${{ github.ref }}",
-                "REPOSITORY": "${{ github.repository }}",
-                "PUBLISH_AUTHORIZED": "${{ inputs.publish_authorized }}",
-                "PACKAGES_VERIFIED": "${{ inputs.packages_verified }}",
-            }:
+            if gate.get("env") != PUBLISH_PREPARE_GATE_ENV:
                 add("publish-prepare-gate-env")
             run = gate.get("run", "")
-            for token in (
-                "set -euo pipefail",
-                'if [[ "$EVENT_NAME" != "workflow_dispatch" ]]',
-                'if [[ "$REF_NAME" != "refs/heads/main" ]]',
-                'if [[ "$REPOSITORY" != "xtianxx/payment-hub" ]]',
-                'if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]',
-                'if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]',
-                "exit 1",
-            ):
-                if token not in run:
-                    add("publish-prepare-gate-run")
+            if run.strip() != PUBLISH_PREPARE_GATE_RUN.strip():
+                add("publish-prepare-gate-run")
         isolation = _find_step(prepare, "Isolate release Go config and caches")
         if isolation is None:
             add("publish-prepare-isolation-missing")
@@ -1675,7 +1699,7 @@ def validate_publish_workflow(
             add("publish-upload-permissions")
         if "env" in upload:
             add("publish-upload-env")
-        if "if" in upload:
+        if upload.get("if") != PUBLISH_OWNER_GUARD:
             add("publish-upload-condition")
         names = _step_names(upload)
         if tuple(names) != (
