@@ -9,6 +9,7 @@ slow response body.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import http.server
 import importlib.util
@@ -24,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -47,7 +49,51 @@ MANIFEST_DIGEST = "b" * 64
 APP_REF = "payment-hub-app:phase6-test"
 MIGRATE_REF = "payment-hub-migrate:phase6-test"
 GITHUB_TOKEN = "FAKE-github-token-canary-not-real"
+AUDIT_TOKEN = "FAKE-audit-token-canary-not-real"
 SCOPED_TOKEN = "FAKE-scoped-token-canary-not-real"
+APP_PACKAGE_ID = 101
+MIGRATE_PACKAGE_ID = 102
+
+
+def package_metadata(
+    role: str,
+    *,
+    package_id: int | None = None,
+    visibility: str = "private",
+    repository: Any = None,
+    owner: Any = None,
+    name: str | None = None,
+    package_type: str = "container",
+    repository_private: Any = None,
+) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "id": package_id
+        if package_id is not None
+        else (APP_PACKAGE_ID if role == "app" else MIGRATE_PACKAGE_ID),
+        "name": release.PACKAGE_NAMES[role] if name is None else name,
+        "package_type": package_type,
+        "visibility": visibility,
+        "owner": {"login": "xtianxx"} if owner is None else owner,
+        "repository": (
+            {"full_name": release.REPOSITORY}
+            if repository is None
+            else repository
+        ),
+    }
+    if repository_private is not None:
+        value["repository"]["private"] = repository_private
+    return value
+
+
+def foreign_package(index: int) -> dict[str, Any]:
+    return {
+        "id": 100000 + index,
+        "name": f"unrelated-package-{index}",
+        "package_type": "container",
+        "visibility": "private",
+        "owner": {"login": "xtianxx"},
+        "repository": {"full_name": release.REPOSITORY},
+    }
 
 
 def sha256(data: bytes) -> str:
@@ -733,7 +779,15 @@ class FakeRunner:
 
 
 class FakeHTTP:
-    def __init__(self, pair: Pair, *, package_failures: dict[str, list[Any]] | None = None):
+    """Fake GitHub audit API, GHCR registry, and per-package metadata."""
+
+    def __init__(
+        self,
+        pair: Pair,
+        *,
+        package_failures: dict[str, list[Any]] | None = None,
+        repository_private: Any = None,
+    ):
         self.pair = pair
         self.calls: list[dict[str, Any]] = []
         self.package_failures = package_failures or {}
@@ -744,6 +798,82 @@ class FakeHTTP:
         self.block_package_role: str | None = None
         self.block_package_count: int | None = None
         self.block_marker: Path | None = None
+        # Package model.  Tests mutate ``packages`` between inventory sessions
+        # to model external disappearance, appearance, or ID replacement.
+        self.packages: dict[str, dict[str, Any] | None] = {
+            role: package_metadata(
+                role, repository_private=repository_private
+            )
+            for role in release.ROLES
+        }
+        self.created_packages = {
+            "app": package_metadata(
+                "app", package_id=201, repository_private=repository_private
+            ),
+            "migrate": package_metadata(
+                "migrate",
+                package_id=202,
+                repository_private=repository_private,
+            ),
+        }
+        self.is_pushed = None
+        self.package_metadata_after_push: dict[str, Any] = {}
+        # Audit identity controls.
+        self.identity_status = 200
+        self.identity_login = "xtianxx"
+        self.identity_scopes: str | None = "read:packages"
+        # Inventory controls.
+        self.inventory_session = 0
+        self.inventory_calls: list[dict[str, Any]] = []
+        self.inventory_page_overrides: dict[int, Any] = {}
+        self.inventory_body_overrides: dict[int, bytes] = {}
+        self.inventory_status_overrides: dict[int, int] = {}
+        self.inventory_link_overrides: dict[int, str | None] = {}
+        self.inventory_page_callback: Any = None
+        self.block_inventory_session: int | None = None
+        self.block_inventory_page: int | None = None
+        self.block_inventory_marker: Path | None = None
+        self.ghcr_manifest_calls: dict[str, int] = {
+            "app": 0,
+            "migrate": 0,
+        }
+        self.ghcr_token_calls: dict[str, int] = {"app": 0, "migrate": 0}
+
+    @staticmethod
+    def _authorization(headers: dict[str, str]) -> str | None:
+        for key, value in headers.items():
+            if key.lower() == "authorization":
+                return value
+        return None
+
+    @staticmethod
+    def _ghcr_has_audit_material(url: str, headers: dict[str, str]) -> bool:
+        encoded = base64.b64encode(AUDIT_TOKEN.encode("utf-8")).decode("ascii")
+        basic = base64.b64encode(
+            (release.OWNER_LOGIN + ":" + AUDIT_TOKEN).encode("utf-8")
+        ).decode("ascii")
+        values = [url, *headers.values()]
+        return any(
+            AUDIT_TOKEN in value or encoded in value or basic in value
+            for value in values
+        )
+
+    def _current_package(self, role: str) -> dict[str, Any] | None:
+        if self.is_pushed is not None and self.is_pushed(role):
+            if role in self.package_metadata_after_push:
+                return self.package_metadata_after_push[role]
+            return self.packages[role] or self.created_packages[role]
+        return self.packages[role]
+
+    def _inventory_items(self, page: int) -> list[dict[str, Any]]:
+        if page in self.inventory_page_overrides:
+            return self.inventory_page_overrides[page]
+        items: list[dict[str, Any]] = []
+        for role in release.ROLES:
+            value = self._current_package(role)
+            if value is not None:
+                items.append(value)
+        return items
 
     def __call__(
         self,
@@ -762,7 +892,53 @@ class FakeHTTP:
                 "timeout": timeout,
             }
         )
-        if "api.github.com/users/xtianxx/packages/container/" in url:
+        if url == release.GITHUB_API + "/user":
+            if self.identity_status != 200:
+                return release.HttpResult(self.identity_status, {}, b"{}")
+            response_headers: dict[str, str] = {}
+            if self.identity_scopes is not None:
+                response_headers["x-oauth-scopes"] = self.identity_scopes
+            return release.HttpResult(
+                200,
+                response_headers,
+                json_bytes({"login": self.identity_login}),
+            )
+        if url.startswith(release.GITHUB_API + "/user/packages?"):
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(url).query
+            )
+            page = int(query.get("page", ["1"])[0])
+            if page == 1:
+                self.inventory_session += 1
+            session = self.inventory_session
+            self.inventory_calls.append(
+                {"session": session, "page": page, "url": url}
+            )
+            if self.inventory_page_callback is not None:
+                self.inventory_page_callback(session, page)
+            if (
+                self.block_inventory_session == session
+                and self.block_inventory_page == page
+            ):
+                if self.block_inventory_marker is not None:
+                    self.block_inventory_marker.write_text(
+                        "blocked", encoding="utf-8"
+                    )
+                time.sleep(30)
+            if page in self.inventory_status_overrides:
+                return release.HttpResult(
+                    self.inventory_status_overrides[page], {}, b"{}"
+                )
+            if page in self.inventory_body_overrides:
+                body = self.inventory_body_overrides[page]
+            else:
+                body = json_bytes(self._inventory_items(page))
+            response_headers = {}
+            link = self.inventory_link_overrides.get(page)
+            if link is not None:
+                response_headers["link"] = link
+            return release.HttpResult(200, response_headers, body)
+        if url.startswith(release.GITHUB_API + "/user/packages/container/"):
             role = "app" if "payment-hub-app" in url else "migrate"
             self.package_counts[role] += 1
             if (
@@ -776,33 +952,60 @@ class FakeHTTP:
             index = self.package_counts[role] - 1
             if index < len(failures):
                 failure = failures[index]
-                if failure is None:
-                    pass
-                elif isinstance(failure, int):
+                if isinstance(failure, int):
                     return release.HttpResult(failure, {}, b"{}")
-                else:
+                if isinstance(failure, dict):
                     return release.HttpResult(200, {}, json_bytes(failure))
-            return release.HttpResult(
-                200,
-                {},
-                json_bytes(
-                    {
-                        "name": release.PACKAGE_NAMES[role],
-                        "package_type": "container",
-                        "visibility": "private",
-                        "owner": {"login": "xtianxx"},
-                        "repository": {"full_name": release.REPOSITORY},
-                    }
-                ),
-            )
+            current = self._current_package(role)
+            if current is None:
+                return release.HttpResult(404, {}, b"{}")
+            return release.HttpResult(200, {}, json_bytes(current))
         if url.startswith(release.TOKEN_REALM):
+            if self._ghcr_has_audit_material(url, headers):
+                return release.HttpResult(403, {}, b"{}")
+            parsed = urllib.parse.urlsplit(url)
+            query = urllib.parse.parse_qs(parsed.query)
+            scope = query.get("scope", [""])[0]
+            role = "app" if "payment-hub-app" in scope else "migrate"
+            expected_scope = f"repository:xtianxx/payment-hub-{role}:pull"
+            expected_basic = "Basic " + base64.b64encode(
+                (release.OWNER_LOGIN + ":" + GITHUB_TOKEN).encode("utf-8")
+            ).decode("ascii")
+            if (
+                parsed.scheme != "https"
+                or parsed.netloc != release.GHCR
+                or parsed.path != "/token"
+                or query != {
+                    "service": [release.TOKEN_SERVICE],
+                    "scope": [expected_scope],
+                }
+                or self._authorization(headers) != expected_basic
+            ):
+                return release.HttpResult(403, {}, b"{}")
+            self.ghcr_token_calls[role] += 1
             return release.HttpResult(
                 200, {}, json_bytes({"token": SCOPED_TOKEN})
             )
         if "/v2/" in url and "/manifests/" in url:
+            if self._ghcr_has_audit_material(url, headers):
+                return release.HttpResult(403, {}, b"{}")
             role = "app" if "payment-hub-app" in url else "migrate"
-            digest = url.rsplit("/", 1)[-1]
-            if "Authorization" not in headers:
+            parsed = urllib.parse.urlsplit(url)
+            expected_prefix = (
+                f"/v2/xtianxx/payment-hub-{role}/manifests/"
+            )
+            if (
+                parsed.scheme != "https"
+                or parsed.netloc != release.GHCR
+                or not parsed.path.startswith(expected_prefix)
+            ):
+                return release.HttpResult(403, {}, b"{}")
+            authorization = self._authorization(headers)
+            call_index = self.ghcr_manifest_calls[role]
+            self.ghcr_manifest_calls[role] += 1
+            if call_index % 2 == 0:
+                if authorization is not None:
+                    return release.HttpResult(403, {}, b"{}")
                 scope = f"repository:xtianxx/payment-hub-{role}:pull"
                 return release.HttpResult(
                     401,
@@ -815,6 +1018,9 @@ class FakeHTTP:
                     },
                     b"",
                 )
+            if authorization != "Bearer " + SCOPED_TOKEN:
+                return release.HttpResult(403, {}, b"{}")
+            digest = url.rsplit("/", 1)[-1]
             body = self.manifest_body_override.get(
                 role, self.pair.root_bytes.get(digest, b"")
             )
@@ -845,7 +1051,9 @@ class ReleaseTestBase(unittest.TestCase):
             "GITHUB_SHA": SOURCE_SHA,
             "GITHUB_REPOSITORY": release.REPOSITORY,
             "GITHUB_ACTOR": "xtianxx",
+            "GITHUB_TRIGGERING_ACTOR": "xtianxx",
             "GITHUB_TOKEN": GITHUB_TOKEN,
+            "GHCR_PACKAGE_AUDIT_TOKEN": AUDIT_TOKEN,
             "PATH": os.environ.get("PATH", ""),
         }
 
@@ -881,6 +1089,7 @@ class ReleaseTestBase(unittest.TestCase):
         approve: bool = True,
         packages: bool = True,
         prepare_inputs: bool = False,
+        bootstrap_packages: bool = False,
         git_path: str = "/fake/git",
         docker_path: str = "/fake/docker",
     ):
@@ -912,6 +1121,8 @@ class ReleaseTestBase(unittest.TestCase):
             values.append("--package-preconditions-verified")
         if prepare_inputs:
             values.append("--prepare-inputs")
+        if bootstrap_packages:
+            values.append("--bootstrap-packages")
         return release._build_parser().parse_args(values)
 
     def verify_args(self, bundle: Path, expected: str):
@@ -928,7 +1139,61 @@ class ReleaseTestBase(unittest.TestCase):
             ]
         )
 
-    def run_prepare(self, *, prepare_inputs: bool = False, fake: FakeRunner | None = None):
+    def assert_ghcr_auth_contract(self, http: FakeHTTP) -> None:
+        expected_basic = "Basic " + base64.b64encode(
+            (release.OWNER_LOGIN + ":" + GITHUB_TOKEN).encode("utf-8")
+        ).decode("ascii")
+        encoded_audit = base64.b64encode(
+            AUDIT_TOKEN.encode("utf-8")
+        ).decode("ascii")
+        basic_audit = base64.b64encode(
+            (release.OWNER_LOGIN + ":" + AUDIT_TOKEN).encode("utf-8")
+        ).decode("ascii")
+        token_auth: dict[str, list[str | None]] = {
+            "app": [],
+            "migrate": [],
+        }
+        manifest_auth: dict[str, list[str | None]] = {
+            "app": [],
+            "migrate": [],
+        }
+        for call in http.calls:
+            url = call["url"]
+            authorization = FakeHTTP._authorization(call["headers"])
+            if url.startswith(release.TOKEN_REALM):
+                role = "app" if "payment-hub-app" in url else "migrate"
+                token_auth[role].append(authorization)
+            elif "/v2/" in url and "/manifests/" in url:
+                role = "app" if "payment-hub-app" in url else "migrate"
+                manifest_auth[role].append(authorization)
+            else:
+                continue
+            self.assertNotIn(AUDIT_TOKEN, url)
+            for value in call["headers"].values():
+                self.assertNotIn(AUDIT_TOKEN, value)
+                self.assertNotIn(encoded_audit, value)
+                self.assertNotIn(basic_audit, value)
+        for role in release.ROLES:
+            self.assertEqual(token_auth[role], [expected_basic])
+            self.assertEqual(len(manifest_auth[role]), 2)
+            self.assertIsNone(manifest_auth[role][0])
+            self.assertEqual(
+                manifest_auth[role][1], "Bearer " + SCOPED_TOKEN
+            )
+            for value in [*token_auth[role], *manifest_auth[role]]:
+                if value is None:
+                    continue
+                self.assertNotIn(AUDIT_TOKEN, value)
+                self.assertNotIn(encoded_audit, value)
+                self.assertNotIn(basic_audit, value)
+
+    def run_prepare(
+        self,
+        *,
+        prepare_inputs: bool = False,
+        fake: FakeRunner | None = None,
+        env: dict[str, str] | None = None,
+    ):
         root = self.base / "prepare-root"
         fake = fake or FakeRunner(self.pair)
         fake.tar_source = self.base / "source-pair.tar"
@@ -936,7 +1201,7 @@ class ReleaseTestBase(unittest.TestCase):
             repo=self.repo,
             runner=fake,
             delegated_runner=fake,
-            env=self.env,
+            env=env if env is not None else self.env,
             git_path="/fake/git",
             docker_path="/fake/docker",
         )
@@ -950,6 +1215,8 @@ class ReleaseTestBase(unittest.TestCase):
         descriptor_sha: str,
         fake: FakeRunner,
         http: FakeHTTP,
+        *,
+        env: dict[str, str] | None = None,
         **kwargs: Any,
     ):
         fake.tar_source = self.base / "source-pair.tar"
@@ -958,7 +1225,7 @@ class ReleaseTestBase(unittest.TestCase):
             runner=fake,
             delegated_runner=fake,
             http=http,
-            env=self.env,
+            env=env if env is not None else self.env,
             git_path="/fake/git",
             docker_path="/fake/docker",
         )
@@ -1170,6 +1437,60 @@ class PrepareTests(ReleaseTestBase):
         self.assertFalse(tool_dir.startswith(str(root)))
         self.assertNotIn("--prepare-tool", calls[0]["argv"])
 
+    def test_owner_actor_and_triggering_actor_required_before_any_child(self):
+        cases = [
+            (
+                "non-owner-actor",
+                {"GITHUB_ACTOR": "other-user"},
+                "actor-owner",
+            ),
+            (
+                "non-owner-trigger",
+                {"GITHUB_TRIGGERING_ACTOR": "other-user"},
+                "triggering-actor-owner",
+            ),
+            ("missing-actor", {"GITHUB_ACTOR": None}, "actor-owner"),
+            (
+                "missing-trigger",
+                {"GITHUB_TRIGGERING_ACTOR": None},
+                "triggering-actor-owner",
+            ),
+            (
+                "both-non-owner",
+                {
+                    "GITHUB_ACTOR": "other-user",
+                    "GITHUB_TRIGGERING_ACTOR": "rerun-user",
+                },
+                "actor-owner",
+            ),
+            (
+                "both-missing",
+                {
+                    "GITHUB_ACTOR": None,
+                    "GITHUB_TRIGGERING_ACTOR": None,
+                },
+                "actor-owner",
+            ),
+        ]
+        for label, overrides, kind in cases:
+            with self.subTest(label=label):
+                env = dict(self.env)
+                for name, value in overrides.items():
+                    if value is None:
+                        env.pop(name, None)
+                    else:
+                        env[name] = value
+                fake = FakeRunner(self.pair)
+                with self.assertRaises(release.ReleaseError) as caught:
+                    self.run_prepare(fake=fake, env=env)
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("context", kind),
+                )
+                self.assertEqual(fake.calls, [])
+                self.assertEqual(fake.builder_calls, 0)
+                self.assertEqual(fake.save_calls, 0)
+
     def test_builder_record_cross_adapter(self):
         temp = self.base / "builder-seam"
         temp.mkdir()
@@ -1204,6 +1525,17 @@ class VerifyHandoffTests(ReleaseTestBase):
         expected = sha256((bundle / release.DESCRIPTOR_FILE).read_bytes())
         instance = release.Release(repo=self.repo, env=self.env)
         self.assertEqual(instance.verify_handoff(self.verify_args(bundle, expected)), 0)
+
+    def test_valid_offline_bundle_passes_without_owner_identity(self):
+        bundle, descriptor = make_bundle(self.base / "bundle")
+        expected = sha256((bundle / release.DESCRIPTOR_FILE).read_bytes())
+        env = dict(self.env)
+        env.pop("GITHUB_ACTOR", None)
+        env.pop("GITHUB_TRIGGERING_ACTOR", None)
+        instance = release.Release(repo=self.repo, env=env)
+        self.assertEqual(
+            instance.verify_handoff(self.verify_args(bundle, expected)), 0
+        )
 
     def test_expected_descriptor_authority_not_archive_self_report(self):
         bundle, _ = make_bundle(self.base / "bundle")
@@ -1322,6 +1654,70 @@ class PublishTests(ReleaseTestBase):
         self.fake = FakeRunner(self.pair)
         self.http = FakeHTTP(self.pair)
 
+    def test_owner_actor_and_triggering_actor_required_before_git_or_network(self):
+        cases = [
+            (
+                "non-owner-actor",
+                {"GITHUB_ACTOR": "other-user"},
+                "actor-owner",
+            ),
+            (
+                "non-owner-trigger",
+                {"GITHUB_TRIGGERING_ACTOR": "other-user"},
+                "triggering-actor-owner",
+            ),
+            ("missing-actor", {"GITHUB_ACTOR": None}, "actor-owner"),
+            (
+                "missing-trigger",
+                {"GITHUB_TRIGGERING_ACTOR": None},
+                "triggering-actor-owner",
+            ),
+            (
+                "both-non-owner",
+                {
+                    "GITHUB_ACTOR": "other-user",
+                    "GITHUB_TRIGGERING_ACTOR": "rerun-user",
+                },
+                "actor-owner",
+            ),
+            (
+                "both-missing",
+                {
+                    "GITHUB_ACTOR": None,
+                    "GITHUB_TRIGGERING_ACTOR": None,
+                },
+                "actor-owner",
+            ),
+        ]
+        for label, overrides, kind in cases:
+            with self.subTest(label=label):
+                env = dict(self.env)
+                for name, value in overrides.items():
+                    if value is None:
+                        env.pop(name, None)
+                    else:
+                        env[name] = value
+                fake = FakeRunner(self.pair)
+                http = FakeHTTP(self.pair)
+                root = self.base / ("publish-root-" + label)
+                with self.assertRaises(release.ReleaseError) as caught:
+                    self.run_publish(
+                        root,
+                        self.bundle,
+                        self.descriptor_sha,
+                        fake,
+                        http,
+                        env=env,
+                    )
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("context", kind),
+                )
+                self.assertEqual(fake.calls, [])
+                self.assertEqual(fake.login_calls, 0)
+                self.assertEqual(fake.push_calls, [])
+                self.assertEqual(http.calls, [])
+
     def test_no_approval_fails_before_auth_or_network(self):
         root = self.base / "publish-root"
         with self.assertRaises(release.ReleaseError) as caught:
@@ -1375,12 +1771,7 @@ class PublishTests(ReleaseTestBase):
 
     def test_public_package_fails_before_push(self):
         self.http.package_failures = {
-            "app": [
-                {
-                    "visibility": "public",
-                    "repository": {"full_name": release.REPOSITORY},
-                }
-            ]
+            "app": [package_metadata("app", visibility="public")]
         }
         root = self.base / "publish-root"
         with self.assertRaises(release.ReleaseError) as caught:
@@ -1390,7 +1781,7 @@ class PublishTests(ReleaseTestBase):
 
     def test_unlinked_package_fails_before_push(self):
         self.http.package_failures = {
-            "app": [{"visibility": "private", "repository": None}]
+            "app": [package_metadata("app", repository={})]
         }
         root = self.base / "publish-root"
         with self.assertRaises(release.ReleaseError) as caught:
@@ -1415,6 +1806,13 @@ class PublishTests(ReleaseTestBase):
         summary = json.loads((root / release.SUMMARY_FILE).read_text())
         self.assertFalse(summary["published"])
         self.assertEqual(summary["pushed_roles"], ["app"])
+        self.assertEqual(
+            summary["push_attempted_roles"], ["app", "migrate"]
+        )
+        self.assertEqual(
+            summary["push_side_effects"],
+            {"app": "verified", "migrate": "unknown"},
+        )
         self.assertEqual(summary["pull"], {})
         self.assertIsNone(summary["revalidation"])
 
@@ -1426,6 +1824,9 @@ class PublishTests(ReleaseTestBase):
         self.assertEqual((caught.exception.stage, caught.exception.kind), ("registry", "app-header-digest"))
         summary = json.loads((root / release.SUMMARY_FILE).read_text())
         self.assertFalse(summary["published"])
+        self.assertEqual(summary["pushed_roles"], ["app"])
+        self.assertEqual(summary["push_attempted_roles"], ["app"])
+        self.assertEqual(summary["push_side_effects"], {"app": "unknown"})
 
     def test_remote_body_hash_mismatch_rejected(self):
         self.http.manifest_body_override = {"app": b"not-the-manifest"}
@@ -1636,6 +2037,7 @@ class PublishTests(ReleaseTestBase):
         self.assertEqual(summary["remote"]["app"]["digest"], self.pair.app_id)
         self.assertEqual(summary["pull"]["app"]["id"], self.pair.app_id)
         self.assertEqual(summary["revalidation"]["result"], "pass")
+        self.assert_ghcr_auth_contract(self.http)
         self.assertNotIn(GITHUB_TOKEN, json.dumps(summary))
         self.assertNotIn(SCOPED_TOKEN, json.dumps(summary))
         self.assertEqual(self.fake.login_input, GITHUB_TOKEN)
@@ -1671,6 +2073,1225 @@ class PublishTests(ReleaseTestBase):
         summary = json.loads((root / release.SUMMARY_FILE).read_text())
         self.assertFalse(summary["published"])
         self.assertEqual(summary["failure"], {"stage": "handoff", "kind": "descriptor-sha"})
+
+
+class PackageAuditBoundaryTests(unittest.TestCase):
+    """Exercise audit boundaries without preparing images or publishing."""
+
+    def setUp(self):
+        self.http = mock.Mock()
+        self.instance = release.Release(http=self.http, env={})
+
+    def assert_error(self, kind, operation, stage="package"):
+        with self.assertRaises(release.ReleaseError) as caught:
+            operation()
+        self.assertEqual((caught.exception.stage, caught.exception.kind),
+                         (stage, kind))
+
+    def test_identity_rejects_unsuccessful_and_malformed_responses(self):
+        cases = [
+            (401, b'{}', "identity"),
+            (403, b'{}', "identity"),
+            (500, b'{}', "identity"),
+            (200, b'\xff', "identity"),
+            (200, b'{', "identity"),
+            (200, b'[]', "owner"),
+            (200, b'null', "owner"),
+            (200, b'{}', "owner"),
+        ]
+        for status, body, kind in cases:
+            with self.subTest(status=status, body=body):
+                self.http.return_value = release.HttpResult(status, {}, body)
+                self.assert_error(kind,
+                                  lambda: self.instance._audit_identity(AUDIT_TOKEN),
+                                  stage="audit")
+
+    def test_scope_header_normalization_and_unknown_scope(self):
+        cases = [
+            (None, "unknown"),
+            ("", "unknown"),
+            (" ,  , ", "unknown"),
+            (" read:packages , read:packages ", "read:packages"),
+        ]
+        for header, expected in cases:
+            with self.subTest(header=header):
+                headers = {} if header is None else {"X-OAuth-Scopes": header}
+                self.http.return_value = release.HttpResult(
+                    200, headers, b'{"login":"xtianxx"}')
+                self.assertEqual(self.instance._audit_identity(AUDIT_TOKEN),
+                                 {"login": "xtianxx", "scope": expected})
+        args, kwargs = self.http.call_args
+        self.assertEqual(args, ("GET", release.GITHUB_API + "/user"))
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer " + AUDIT_TOKEN)
+
+    def test_scope_header_rejects_wrong_types_oversize_and_extra_permissions(self):
+        for header in (False, 1, [], " " * 4097, "repo", "write:packages",
+                       "read:packages,delete:packages", "READ:PACKAGES"):
+            with self.subTest(header=header):
+                self.http.return_value = release.HttpResult(
+                    200, {"X-OAuth-Scopes": header}, b'{"login":"xtianxx"}')
+                self.assert_error("scope",
+                                  lambda: self.instance._audit_identity(AUDIT_TOKEN),
+                                  stage="audit")
+
+    def test_package_ids_reject_bool_and_non_integer_values_for_both_roles(self):
+        for role in release.ROLES:
+            for package_id in (None, True, False, 0, -1, 1.5, "101", [], {}):
+                with self.subTest(role=role, package_id=package_id):
+                    metadata = package_metadata(role)
+                    metadata["id"] = package_id
+                    self.assert_error(role + "-id",
+                                      lambda: release._validate_package_metadata(metadata, role))
+
+    def test_metadata_projection_ignores_unrelated_api_fields(self):
+        for role in release.ROLES:
+            with self.subTest(role=role):
+                metadata = package_metadata(role, package_id=1, repository_private=False)
+                metadata["description"] = "unrelated API metadata"
+                original = json.dumps(metadata, sort_keys=True)
+                self.assertEqual(release._validate_package_metadata(metadata, role), {
+                    "name": release.PACKAGE_NAMES[role], "id": 1,
+                    "repository": release.REPOSITORY, "visibility": "private",
+                })
+                self.assertEqual(json.dumps(metadata, sort_keys=True), original)
+
+    def test_inventory_rejects_malformed_unrelated_entries(self):
+        cases = [None, [], {}, foreign_package(0) | {"package_type": "npm"}]
+        for name in ("", "a" * 257, "has space", "tab\tname", "line\nname", "del\x7f"):
+            cases.append(foreign_package(0) | {"name": name})
+        for entry in cases:
+            with self.subTest(entry=entry):
+                self.http.return_value = release.HttpResult(
+                    200, {}, json.dumps([entry]).encode())
+                self.assert_error("inventory-json",
+                                  lambda: self.instance._list_owner_packages(AUDIT_TOKEN))
+
+    def test_inventory_rejects_duplicate_unrelated_ids_or_names_across_pages(self):
+        first = [foreign_package(i) for i in range(release.INVENTORY_PER_PAGE)]
+        next_link = (release.GITHUB_API + "/user/packages?"
+                     "package_type=container&per_page=100&page=2")
+        for duplicate in (foreign_package(100) | {"id": first[0]["id"]},
+                          foreign_package(100) | {"name": first[0]["name"]}):
+            with self.subTest(duplicate=duplicate):
+                self.http.reset_mock()
+                self.http.side_effect = [
+                    release.HttpResult(200, {"Link": '<' + next_link + '>; rel="next"'},
+                                       json.dumps(first).encode()),
+                    release.HttpResult(200, {}, json.dumps([duplicate]).encode()),
+                ]
+                self.assert_error("inventory-duplicate",
+                                  lambda: self.instance._list_owner_packages(AUDIT_TOKEN))
+                self.assertEqual(self.http.call_count, 2)
+
+    def test_inventory_byte_budget_accepts_exact_boundary_and_rejects_overflow(self):
+        for body, maximum, kind in ((b'[]', 2, None), (b'[] ', 2, "inventory-bytes")):
+            with self.subTest(body=body):
+                self.http.return_value = release.HttpResult(200, {}, body)
+                with mock.patch.object(release, "INVENTORY_MAX_BYTES", maximum):
+                    if kind:
+                        self.assert_error(kind,
+                                          lambda: self.instance._list_owner_packages(AUDIT_TOKEN))
+                    else:
+                        self.assertEqual(self.instance._list_owner_packages(AUDIT_TOKEN), {})
+                self.assertEqual(self.http.call_args.kwargs["max_bytes"], maximum)
+
+    def test_inventory_body_limit_error_is_reported_as_inventory_bytes(self):
+        self.http.side_effect = release.ReleaseError("tool", "http-body")
+        self.assert_error("inventory-bytes",
+                          lambda: self.instance._list_owner_packages(AUDIT_TOKEN))
+        self.http.assert_called_once()
+
+    def test_inventory_transport_errors_keep_original_classification(self):
+        error = release.ReleaseError("tool", "http-timeout")
+        self.http.side_effect = error
+        with self.assertRaises(release.ReleaseError) as caught:
+            self.instance._list_owner_packages(AUDIT_TOKEN)
+        self.assertIs(caught.exception, error)
+        self.http.assert_called_once()
+
+    def test_inventory_caps_request_timeout_to_remaining_deadline(self):
+        self.http.return_value = release.HttpResult(200, {}, b'[]')
+        with mock.patch.object(release.time, "monotonic", side_effect=[100.0, 109.75]), \
+                mock.patch.object(release, "INVENTORY_TIMEOUT_SECONDS", 10):
+            self.assertEqual(self.instance._list_owner_packages(AUDIT_TOKEN), {})
+        self.assertEqual(self.http.call_args.kwargs["timeout"], 0.25)
+
+    def test_refresh_preserves_frozen_expectations_for_both_roles(self):
+        expected = {role: {"status": "EXISTING_VALID", "id": index + 101}
+                    for index, role in enumerate(release.ROLES)}
+        for role in release.ROLES:
+            cases = [({"status": "ABSENT_CONFIRMED", "id": None}, "-missing"),
+                     ({"status": "EXISTING_VALID", "id": 999}, "-changed")]
+            for changed, suffix in cases:
+                with self.subTest(role=role, suffix=suffix):
+                    frozen = json.dumps(expected, sort_keys=True)
+                    current = {key: dict(value) for key, value in expected.items()}
+                    current[role] = changed
+                    with mock.patch.object(self.instance, "_inventory_packages",
+                                           return_value=(current, {})) as inventory:
+                        self.assert_error(role + suffix, lambda:
+                                          self.instance._refresh_package_expectations(AUDIT_TOKEN, expected))
+                    inventory.assert_called_once_with(AUDIT_TOKEN)
+                    self.assertEqual(json.dumps(expected, sort_keys=True), frozen)
+
+
+class PackageInventoryTests(ReleaseTestBase):
+    def setUp(self):
+        super().setUp()
+        self.bundle, self.descriptor = make_bundle(self.base / "bundle")
+        self.descriptor_sha = sha256(
+            (self.bundle / release.DESCRIPTOR_FILE).read_bytes()
+        )
+        self.fake = FakeRunner(self.pair)
+        self.http = FakeHTTP(self.pair)
+        self.http.is_pushed = lambda role: any(
+            "payment-hub-" + role in reference
+            for reference in self.fake.push_calls
+        )
+
+    def _publish(self, *, bootstrap: bool = False, name: str = "publish-root"):
+        root = self.base / name
+        code = self.run_publish(
+            root,
+            self.bundle,
+            self.descriptor_sha,
+            self.fake,
+            self.http,
+            bootstrap_packages=bootstrap,
+        )
+        return code, root
+
+    def _summary(self, root: Path) -> dict[str, Any]:
+        return json.loads((root / release.SUMMARY_FILE).read_text())
+
+    def _assert_successful_pair_publish(self, summary: dict[str, Any]) -> None:
+        self.assertTrue(summary["published"])
+        self.assertEqual(len(self.fake.push_calls), 2)
+        for role in release.ROLES:
+            expected = (
+                self.pair.app_id if role == "app" else self.pair.migrate_id
+            )
+            self.assertEqual(
+                summary["push"][role]["candidate_digest"], expected
+            )
+            self.assertEqual(summary["remote"][role]["digest"], expected)
+            self.assertEqual(summary["pull"][role]["id"], expected)
+        self.assertEqual(summary["revalidation"]["result"], "pass")
+        self.assertEqual(self.fake.login_input, GITHUB_TOKEN)
+        self.assertNotEqual(self.fake.login_input, AUDIT_TOKEN)
+        self.assertNotIn(AUDIT_TOKEN, json.dumps(summary))
+        self.assertNotIn(GITHUB_TOKEN, json.dumps(summary))
+        for call in self.fake.calls:
+            self.assertNotIn(AUDIT_TOKEN, " ".join(call["argv"]))
+            self.assertNotIn(GITHUB_TOKEN, " ".join(call["argv"]))
+            self.assertNotIn(AUDIT_TOKEN, call["env"].values())
+            self.assertNotIn(GITHUB_TOKEN, call["env"].values())
+        for call in self.http.calls:
+            if call["url"].startswith(release.GITHUB_API):
+                self.assertEqual(
+                    call["headers"].get("Authorization"),
+                    "Bearer " + AUDIT_TOKEN,
+                )
+        self.assert_ghcr_auth_contract(self.http)
+
+    def _rewire(self, *, repository_private: Any = None) -> None:
+        self.fake = FakeRunner(self.pair)
+        self.http = FakeHTTP(
+            self.pair, repository_private=repository_private
+        )
+        self.http.is_pushed = lambda role: any(
+            "payment-hub-" + role in reference
+            for reference in self.fake.push_calls
+        )
+
+    def test_normal_existing_packages_success_with_separate_audit_token(self):
+        code, root = self._publish()
+        self.assertEqual(code, 0)
+        summary = self._summary(root)
+        self.assertTrue(summary["published"])
+        self.assertFalse(summary["bootstrap_requested"])
+        self.assertEqual(
+            summary["packages_initial"],
+            {
+                "app": {"status": "EXISTING_VALID", "id": APP_PACKAGE_ID},
+                "migrate": {
+                    "status": "EXISTING_VALID",
+                    "id": MIGRATE_PACKAGE_ID,
+                },
+            },
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["app"]["id"], APP_PACKAGE_ID
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["migrate"]["id"],
+            MIGRATE_PACKAGE_ID,
+        )
+        self.assertEqual(
+            summary["push_attempted_roles"], ["app", "migrate"]
+        )
+        self.assertEqual(
+            summary["push_side_effects"],
+            {"app": "verified", "migrate": "verified"},
+        )
+        self.assertEqual(summary["audit_scope"], "read:packages")
+        # The audit token is used only for the fixed identity/inventory
+        # endpoints, never for docker login or registry authentication.
+        audit_urls = [call["url"] for call in self.http.calls]
+        self.assertIn(release.GITHUB_API + "/user", audit_urls)
+        self.assertTrue(
+            any(
+                url.startswith(
+                    release.GITHUB_API + "/user/packages?package_type=container"
+                )
+                for url in audit_urls
+            )
+        )
+        self.assertTrue(
+            any(
+                url.startswith(
+                    release.GITHUB_API + "/user/packages/container/"
+                )
+                for url in audit_urls
+            )
+        )
+        self.assertFalse(any("/users/" in url for url in audit_urls))
+        for call in self.http.calls:
+            if call["url"].startswith(release.GITHUB_API):
+                self.assertEqual(
+                    call["headers"].get("Authorization"),
+                    "Bearer " + AUDIT_TOKEN,
+                )
+        self.assert_ghcr_auth_contract(self.http)
+        self.assertEqual(self.fake.login_input, GITHUB_TOKEN)
+        self.assertNotEqual(self.fake.login_input, AUDIT_TOKEN)
+        self.assertNotIn(AUDIT_TOKEN, json.dumps(summary))
+        self.assertNotIn(GITHUB_TOKEN, json.dumps(summary))
+        self.assertNotIn(SCOPED_TOKEN, json.dumps(summary))
+        for call in self.fake.calls:
+            self.assertNotIn(AUDIT_TOKEN, " ".join(call["argv"]))
+            self.assertNotIn(GITHUB_TOKEN, " ".join(call["argv"]))
+            self.assertNotIn(AUDIT_TOKEN, call["env"].values())
+            self.assertNotIn(GITHUB_TOKEN, call["env"].values())
+        for path in root.rglob("*"):
+            if path.is_file():
+                data = path.read_bytes()
+                self.assertNotIn(AUDIT_TOKEN.encode(), data)
+                self.assertNotIn(GITHUB_TOKEN.encode(), data)
+
+    def test_normal_private_packages_with_public_repository_succeed(self):
+        self._rewire(repository_private=False)
+        code, root = self._publish()
+        self.assertEqual(code, 0)
+        summary = self._summary(root)
+        self._assert_successful_pair_publish(summary)
+        self.assertEqual(
+            summary["packages_initial"]["app"]["status"], "EXISTING_VALID"
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["migrate"]["id"],
+            MIGRATE_PACKAGE_ID,
+        )
+
+    def test_repository_private_is_not_a_package_visibility_gate(self):
+        for label, value in (("false", False), ("true", True), ("missing", None)):
+            with self.subTest(label=label):
+                metadata = (
+                    package_metadata("app")
+                    if value is None
+                    else package_metadata(
+                        "app", repository_private=value
+                    )
+                )
+                projection = release._validate_package_metadata(
+                    metadata, "app"
+                )
+                self.assertEqual(projection["id"], APP_PACKAGE_ID)
+                self.assertEqual(projection["visibility"], "private")
+                self.assertEqual(
+                    projection["repository"], release.REPOSITORY
+                )
+
+    def test_registry_token_audit_injection_is_rejected(self):
+        original = release.Release._registry_manifest
+
+        def injected(
+            instance: release.Release,
+            role: str,
+            candidate_digest: str,
+            expected_root: Any,
+            token: str,
+            actor: str,
+        ) -> dict[str, Any]:
+            return original(
+                instance,
+                role,
+                candidate_digest,
+                expected_root,
+                AUDIT_TOKEN,
+                actor,
+            )
+
+        with mock.patch.object(release.Release, "_registry_manifest", injected):
+            with self.assertRaises(release.ReleaseError) as caught:
+                self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("registry", "app-token"),
+        )
+        self.assertEqual(len(self.fake.push_calls), 1)
+        summary = self._summary(self.base / "publish-root")
+        self.assertEqual(summary["push_attempted_roles"], ["app"])
+        self.assertEqual(summary["push_side_effects"], {"app": "unknown"})
+        self.assertEqual(summary["pushed_roles"], ["app"])
+        self.assertEqual(summary["pull"], {})
+        self.assertIsNone(summary["revalidation"])
+        self.assertNotIn(AUDIT_TOKEN, json.dumps(summary))
+
+    def test_normal_missing_package_rejected_before_login_or_push(self):
+        self.http.packages["app"] = None
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-absent"),
+        )
+        self.assertEqual(self.fake.login_calls, 0)
+        self.assertEqual(self.fake.push_calls, [])
+        summary = self._summary(self.base / "publish-root")
+        self.assertEqual(
+            summary["packages_initial"]["app"],
+            {"status": "ABSENT_CONFIRMED", "id": None},
+        )
+        self.assertFalse(summary["bootstrap_requested"])
+
+    def test_bootstrap_zero_existing_creates_both(self):
+        self.http.packages["app"] = None
+        self.http.packages["migrate"] = None
+        code, root = self._publish(bootstrap=True)
+        self.assertEqual(code, 0)
+        summary = self._summary(root)
+        self.assertTrue(summary["published"])
+        self.assertTrue(summary["bootstrap_requested"])
+        self.assertEqual(
+            summary["packages_initial"],
+            {
+                "app": {"status": "ABSENT_CONFIRMED", "id": None},
+                "migrate": {"status": "ABSENT_CONFIRMED", "id": None},
+            },
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["app"]["id"], 201
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["migrate"]["id"], 202
+        )
+        self.assertEqual(self.fake.push_calls[0].count("payment-hub-app"), 1)
+        self.assertNotIn("created_roles", summary)
+
+    def test_bootstrap_all_missing_with_public_repository_continues_after_first_push(
+        self,
+    ):
+        self._rewire(repository_private=False)
+        self.http.packages["app"] = None
+        self.http.packages["migrate"] = None
+        code, root = self._publish(bootstrap=True)
+        self.assertEqual(code, 0)
+        summary = self._summary(root)
+        self._assert_successful_pair_publish(summary)
+        self.assertEqual(
+            summary["packages_initial"],
+            {
+                "app": {"status": "ABSENT_CONFIRMED", "id": None},
+                "migrate": {"status": "ABSENT_CONFIRMED", "id": None},
+            },
+        )
+        self.assertEqual(summary["packages_postcheck"]["app"]["id"], 201)
+        self.assertEqual(
+            summary["packages_postcheck"]["migrate"]["id"], 202
+        )
+
+    def test_bootstrap_one_existing_creates_only_missing(self):
+        self.http.packages["app"] = None
+        code, root = self._publish(bootstrap=True)
+        self.assertEqual(code, 0)
+        summary = self._summary(root)
+        self.assertEqual(
+            summary["packages_initial"]["app"]["status"], "ABSENT_CONFIRMED"
+        )
+        self.assertEqual(
+            summary["packages_initial"]["migrate"]["status"], "EXISTING_VALID"
+        )
+        self.assertEqual(
+            summary["packages_initial"]["migrate"]["id"], MIGRATE_PACKAGE_ID
+        )
+        self.assertEqual(summary["packages_postcheck"]["app"]["id"], 201)
+
+    def test_bootstrap_mixed_with_public_repository_succeeds(self):
+        self._rewire(repository_private=False)
+        self.http.packages["migrate"] = None
+        code, root = self._publish(bootstrap=True)
+        self.assertEqual(code, 0)
+        summary = self._summary(root)
+        self._assert_successful_pair_publish(summary)
+        self.assertEqual(
+            summary["packages_initial"]["app"]["status"], "EXISTING_VALID"
+        )
+        self.assertEqual(
+            summary["packages_initial"]["migrate"]["status"],
+            "ABSENT_CONFIRMED",
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["migrate"]["id"], 202
+        )
+
+    def test_bootstrap_two_existing_is_allowed(self):
+        code, root = self._publish(bootstrap=True)
+        self.assertEqual(code, 0)
+        summary = self._summary(root)
+        self.assertTrue(summary["bootstrap_requested"])
+        self.assertEqual(
+            summary["packages_initial"]["app"]["id"], APP_PACKAGE_ID
+        )
+        self.assertEqual(
+            summary["packages_initial"]["migrate"]["id"],
+            MIGRATE_PACKAGE_ID,
+        )
+
+    def test_missing_audit_token_fails_before_any_child_or_network(self):
+        self.env.pop("GHCR_PACKAGE_AUDIT_TOKEN")
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("auth", "audit-token-missing"),
+        )
+        self.assertEqual(self.http.calls, [])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_audit_wrong_owner_rejected(self):
+        self.http.identity_login = "someone-else"
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("audit", "owner"),
+        )
+        self.assertEqual(self.fake.login_calls, 0)
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_audit_scope_too_broad_rejected(self):
+        self.http.identity_scopes = "read:packages, repo, write:packages"
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("audit", "scope"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_audit_missing_scope_header_is_unknown_not_trusted(self):
+        self.http.identity_scopes = None
+        code, root = self._publish()
+        self.assertEqual(code, 0)
+        self.assertEqual(self._summary(root)["audit_scope"], "unknown")
+
+    def test_inventory_403_and_404_are_unknown_rejected(self):
+        for status, kind in ((403, "inventory-forbidden"), (404, "inventory-http")):
+            with self.subTest(status=status):
+                self._rewire()
+                self.http.inventory_status_overrides = {1: status}
+                with self.assertRaises(release.ReleaseError) as caught:
+                    self._publish(name=f"root-{status}")
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("package", kind),
+                )
+                self.assertEqual(self.fake.push_calls, [])
+
+    def test_invalid_inventory_metadata_rejected(self):
+        cases = [
+            (
+                "public",
+                package_metadata("app", visibility="public"),
+                "app-visibility",
+            ),
+            (
+                "unlinked",
+                package_metadata("app", repository={}),
+                "app-repository",
+            ),
+            (
+                "wrong-repository",
+                package_metadata(
+                    "app",
+                    repository={
+                        "full_name": "other/repository",
+                        "private": False,
+                    },
+                ),
+                "app-repository",
+            ),
+            (
+                "public-with-public-repository",
+                package_metadata(
+                    "app", visibility="public", repository_private=False
+                ),
+                "app-visibility",
+            ),
+            (
+                "wrong-owner",
+                package_metadata("app", owner={"login": "other"}),
+                "app-owner",
+            ),
+            (
+                "wrong-type",
+                package_metadata("app", package_type="npm"),
+                "app-type",
+            ),
+            (
+                "zero-id",
+                package_metadata("app", package_id=0),
+                "app-id",
+            ),
+        ]
+        for label, metadata, kind in cases:
+            with self.subTest(label=label):
+                self._rewire()
+                self.http.packages["app"] = metadata
+                with self.assertRaises(release.ReleaseError) as caught:
+                    self._publish(name=f"root-{label}")
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("package", kind),
+                )
+                self.assertEqual(self.fake.push_calls, [])
+
+    def test_direct_metadata_name_mismatch_rejected(self):
+        self.http.package_failures = {
+            "app": [package_metadata("app", name="other-name")]
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-name"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_inventory_duplicate_target_rejected(self):
+        self.http.inventory_page_overrides = {
+            1: [package_metadata("app"), package_metadata("app")]
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-duplicate"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_inventory_malformed_page_rejected(self):
+        self.http.inventory_body_overrides = {1: b'{"not":"a-list"}'}
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-json"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_inventory_short_page_with_next_link_rejected(self):
+        self.http.inventory_page_overrides = {1: [package_metadata("app")]}
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"next\""
+            )
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-incomplete"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_link_header_malformed_fragment_after_valid_last_rejected(self):
+        header = (
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=3>; rel=\"last\", "
+            "malformed-next; rel=\"next\""
+        )
+        instance = release.Release(repo=self.repo)
+        with self.assertRaises(release.ReleaseError) as caught:
+            instance._inventory_next_page(header, 1)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-link"),
+        )
+
+    def test_link_header_first_and_last_terminal_page_accepted(self):
+        header = (
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=1>; rel=\"first\", "
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=1>; rel=\"last\""
+        )
+        instance = release.Release(repo=self.repo)
+        self.assertIsNone(instance._inventory_next_page(header, 1))
+
+    def test_link_header_multiple_relations_with_next_accepted(self):
+        header = (
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=2>; "
+            "type=\"application/json\"; rel=\"next\", "
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=1>; rel=\"prev\", "
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=2>; rel=\"last\", "
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=1>; rel=\"first\""
+        )
+        instance = release.Release(repo=self.repo)
+        self.assertEqual(instance._inventory_next_page(header, 1), 2)
+
+    def test_link_header_malformed_variants_rejected(self):
+        base = "https://api.github.com/user/packages"
+        cases = [
+            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next\" garbage",
+            f"<{base}?package_type=container&per_page=100&page=2>",
+            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next last\"",
+            f"<{base}?package_type=container&per_page=100&page=2>; rel=\" next \"",
+            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"unknown\"",
+            (
+                f"<{base}?package_type=container&per_page=100&page=2>; "
+                "rel=\"next\"; rel=\"last\""
+            ),
+            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next\",",
+            f"<{base}?package_type=container&per_page=100&page=1>; rel=\"last\", "
+            f"malformed; rel=\"next\"",
+            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next\", "
+            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next\"",
+            (
+                "<https://evil.example/user/packages?"
+                "package_type=container&per_page=100&page=1>; rel=\"last\""
+            ),
+            (
+                f"<{base}?package_type=container&per_page=50&page=1>; "
+                "rel=\"last\""
+            ),
+            f"<{base}?package_type=container&per_page=100&page=zero>; rel=\"last\"",
+        ]
+        instance = release.Release(repo=self.repo)
+        for header in cases:
+            with self.subTest(header=header):
+                with self.assertRaises(release.ReleaseError) as caught:
+                    instance._inventory_next_page(header, 1)
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("package", "inventory-link"),
+                )
+
+    def test_malformed_link_stops_before_login_load_or_push(self):
+        page_one = [foreign_package(index) for index in range(99)]
+        page_one.append(package_metadata("app"))
+        self.http.inventory_page_overrides = {1: page_one}
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"last\", "
+                "malformed-next; rel=\"next\""
+            )
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-link"),
+        )
+        self.assertEqual(self.fake.login_calls, 0)
+        self.assertEqual(self.fake.push_calls, [])
+        load_calls = [
+            call
+            for call in self.fake.calls
+            if len(call["argv"]) > 1 and call["argv"][1] == "load"
+        ]
+        self.assertEqual(load_calls, [])
+        summary = self._summary(self.base / "publish-root")
+        self.assertFalse(summary["published"])
+        self.assertEqual(summary["packages_initial"], {})
+
+    def test_link_header_last_beyond_current_without_next_rejected(self):
+        header = (
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=3>; rel=\"last\""
+        )
+        instance = release.Release(repo=self.repo)
+        with self.assertRaises(release.ReleaseError) as caught:
+            instance._inventory_next_page(header, 1)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-link"),
+        )
+
+    def test_link_header_last_current_without_next_accepted(self):
+        header = (
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=1>; rel=\"last\""
+        )
+        instance = release.Release(repo=self.repo)
+        self.assertIsNone(instance._inventory_next_page(header, 1))
+
+    def test_link_header_first_and_prev_terminal_page_accepted(self):
+        header = (
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=1>; rel=\"first\", "
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=1>; rel=\"prev\""
+        )
+        instance = release.Release(repo=self.repo)
+        self.assertIsNone(instance._inventory_next_page(header, 2))
+
+    def test_link_header_last_before_next_rejected(self):
+        header = (
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=2>; rel=\"next\", "
+            "<https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=1>; rel=\"last\""
+        )
+        instance = release.Release(repo=self.repo)
+        with self.assertRaises(release.ReleaseError) as caught:
+            instance._inventory_next_page(header, 1)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-link"),
+        )
+
+    def test_last_beyond_current_without_next_stops_before_login_load_or_push(self):
+        page_one = [foreign_package(index) for index in range(99)]
+        page_one.append(package_metadata("app"))
+        self.http.inventory_page_overrides = {1: page_one}
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=3>; rel=\"last\""
+            )
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-link"),
+        )
+        self.assertEqual(self.fake.login_calls, 0)
+        self.assertEqual(self.fake.push_calls, [])
+        load_calls = [
+            call
+            for call in self.fake.calls
+            if len(call["argv"]) > 1 and call["argv"][1] == "load"
+        ]
+        self.assertEqual(load_calls, [])
+        summary = self._summary(self.base / "publish-root")
+        self.assertFalse(summary["published"])
+        self.assertEqual(summary["packages_initial"], {})
+
+    def test_last_declared_later_page_then_early_terminal_stops_before_login(self):
+        page_one = [foreign_package(index) for index in range(99)]
+        page_one.append(package_metadata("app"))
+        self.http.inventory_page_overrides = {
+            1: page_one,
+            2: [package_metadata("migrate")],
+        }
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"next\", "
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=3>; rel=\"last\""
+            )
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-link"),
+        )
+        self.assertEqual(self.fake.login_calls, 0)
+        self.assertEqual(self.fake.push_calls, [])
+        load_calls = [
+            call
+            for call in self.fake.calls
+            if len(call["argv"]) > 1 and call["argv"][1] == "load"
+        ]
+        self.assertEqual(load_calls, [])
+        summary = self._summary(self.base / "publish-root")
+        self.assertFalse(summary["published"])
+        self.assertEqual(summary["packages_initial"], {})
+
+    def test_inventory_last_page_change_between_pages_rejected(self):
+        page_one = [foreign_package(index) for index in range(99)]
+        page_one.append(package_metadata("app"))
+        self.http.inventory_page_overrides = {
+            1: page_one,
+            2: [package_metadata("migrate")],
+        }
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"next\", "
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=3>; rel=\"last\""
+            ),
+            2: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=3>; rel=\"next\", "
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=4>; rel=\"last\""
+            ),
+        }
+        instance = release.Release(
+            repo=self.repo, http=self.http, env=self.env
+        )
+        with self.assertRaises(release.ReleaseError) as caught:
+            instance._list_owner_packages(AUDIT_TOKEN)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-link"),
+        )
+
+    def test_inventory_second_page_target_is_found(self):
+        page_one = [foreign_package(index) for index in range(99)]
+        page_one.append(package_metadata("app"))
+        self.http.inventory_page_overrides = {
+            1: page_one,
+            2: [package_metadata("migrate")],
+        }
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"next\", "
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"last\", "
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=1>; rel=\"first\""
+            ),
+            2: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=1>; rel=\"prev\", "
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=1>; rel=\"first\", "
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"last\""
+            ),
+        }
+        code, root = self._publish()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [(call["session"], call["page"]) for call in self.http.inventory_calls][
+                :2
+            ],
+            [(1, 1), (1, 2)],
+        )
+        summary = self._summary(root)
+        self.assertEqual(
+            summary["packages_initial"]["migrate"]["id"],
+            MIGRATE_PACKAGE_ID,
+        )
+        self.assertNotIn("unrelated-package", json.dumps(summary))
+
+    def test_inventory_second_page_error_rejected(self):
+        page_one = [foreign_package(index) for index in range(99)]
+        page_one.append(package_metadata("app"))
+        self.http.inventory_page_overrides = {1: page_one}
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"next\""
+            )
+        }
+        self.http.inventory_status_overrides = {2: 500}
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-http"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_inventory_foreign_next_link_rejected(self):
+        page_one = [foreign_package(index) for index in range(99)]
+        page_one.append(package_metadata("app"))
+        self.http.inventory_page_overrides = {1: page_one}
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://evil.example/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"next\""
+            )
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-link"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_inventory_page_limit_rejected(self):
+        page_one = [foreign_package(index) for index in range(99)]
+        page_one.append(package_metadata("app"))
+        self.http.inventory_page_overrides = {1: page_one}
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2>; rel=\"next\""
+            )
+        }
+        with mock.patch.object(release, "INVENTORY_MAX_PAGES", 1):
+            with self.assertRaises(release.ReleaseError) as caught:
+                self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-pages"),
+        )
+
+    def test_inventory_deadline_rejected(self):
+        with mock.patch.object(release, "INVENTORY_TIMEOUT_SECONDS", -1.0):
+            with self.assertRaises(release.ReleaseError) as caught:
+                self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-deadline"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_existing_package_disappears_before_push_rejected(self):
+        def mutate(session: int, page: int) -> None:
+            if session == 2:
+                self.http.packages["app"] = None
+
+        self.http.inventory_page_callback = mutate
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-missing"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_bootstrap_existing_disappearance_is_not_downgraded_to_create(self):
+        self.http.packages["migrate"] = None
+
+        def mutate(session: int, page: int) -> None:
+            if session == 2:
+                self.http.packages["app"] = None
+
+        self.http.inventory_page_callback = mutate
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish(bootstrap=True)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-missing"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_absent_package_appears_before_push_rejected(self):
+        self.http.packages["app"] = None
+
+        def mutate(session: int, page: int) -> None:
+            if session == 2:
+                self.http.packages["app"] = package_metadata(
+                    "app", package_id=999
+                )
+
+        self.http.inventory_page_callback = mutate
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish(bootstrap=True)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-appeared"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_existing_package_id_changes_before_push_rejected(self):
+        def mutate(session: int, page: int) -> None:
+            if session == 2:
+                self.http.packages["app"] = package_metadata(
+                    "app", package_id=999
+                )
+
+        self.http.inventory_page_callback = mutate
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-changed"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_existing_package_metadata_changes_before_push_rejected(self):
+        def mutate(session: int, page: int) -> None:
+            if session == 2:
+                self.http.packages["app"] = package_metadata(
+                    "app", visibility="public"
+                )
+
+        self.http.inventory_page_callback = mutate
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-visibility"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+
+    def test_postpush_bad_metadata_stops_before_second_push(self):
+        self.http.package_metadata_after_push = {
+            "app": package_metadata("app", visibility="public")
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-visibility"),
+        )
+        self.assertEqual(len(self.fake.push_calls), 1)
+        summary = self._summary(self.base / "publish-root")
+        self.assertEqual(summary["push_attempted_roles"], ["app"])
+        self.assertEqual(summary["push_side_effects"], {"app": "unknown"})
+        self.assertEqual(summary["pushed_roles"], [])
+        self.assertEqual(summary["pull"], {})
+        self.assertIsNone(summary["revalidation"])
+
+    def test_postpush_wrong_repository_stops_before_second_push(self):
+        self.http.package_metadata_after_push = {
+            "app": package_metadata(
+                "app",
+                repository={
+                    "full_name": "other/repository",
+                    "private": False,
+                },
+            )
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-repository"),
+        )
+        self.assertEqual(len(self.fake.push_calls), 1)
+        summary = self._summary(self.base / "publish-root")
+        self.assertEqual(summary["push_attempted_roles"], ["app"])
+        self.assertEqual(summary["push_side_effects"], {"app": "unknown"})
+        self.assertEqual(summary["pushed_roles"], [])
+        self.assertEqual(summary["pull"], {})
+        self.assertIsNone(summary["revalidation"])
+
+    def test_postpush_missing_metadata_stops_before_second_push(self):
+        self.http.package_metadata_after_push = {"app": None}
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-not-found"),
+        )
+        self.assertEqual(len(self.fake.push_calls), 1)
+        summary = self._summary(self.base / "publish-root")
+        self.assertEqual(summary["push_attempted_roles"], ["app"])
+        self.assertEqual(summary["push_side_effects"], {"app": "unknown"})
+        self.assertEqual(summary["pull"], {})
+        self.assertEqual(summary["pushed_roles"], [])
+
+    def test_postpush_package_id_change_stops_before_second_push(self):
+        self.http.package_metadata_after_push = {
+            "app": package_metadata("app", package_id=999)
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-changed"),
+        )
+        self.assertEqual(len(self.fake.push_calls), 1)
+        summary = self._summary(self.base / "publish-root")
+        self.assertEqual(summary["push_attempted_roles"], ["app"])
+        self.assertEqual(summary["push_side_effects"], {"app": "unknown"})
+
+    def test_partial_push_attempt_reports_unknown_without_retry(self):
+        self.fake.push_fail_role = "app"
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("push", "app-failed"),
+        )
+        self.assertEqual(len(self.fake.push_calls), 1)
+        summary = self._summary(self.base / "publish-root")
+        self.assertEqual(summary["push_attempted_roles"], ["app"])
+        self.assertEqual(summary["push_side_effects"], {"app": "unknown"})
+        self.assertEqual(summary["pushed_roles"], [])
+        self.assertEqual(summary["pull"], {})
+        self.assertIsNone(summary["revalidation"])
+
+    def test_inventory_cancellation_keeps_cancelled_semantics(self):
+        marker = self.base / "inventory.blocked"
+        self.http.block_inventory_session = 2
+        self.http.block_inventory_page = 1
+        self.http.block_inventory_marker = marker
+        sender = send_signal_when_marker(marker, signal.SIGTERM)
+        try:
+            with self.assertRaises(release.ReleaseError) as caught:
+                self._publish()
+        finally:
+            sender.join(timeout=3.0)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("cancelled", "signal"),
+        )
+        self.assertEqual(self.fake.push_calls, [])
+        summary = self._summary(self.base / "publish-root")
+        self.assertFalse(summary["published"])
+        self.assertEqual(summary["push_attempted_roles"], [])
+        self.assertEqual(summary["push_side_effects"], {})
+
+    def test_cli_rejects_bootstrap_flag_for_prepare_and_verify_handoff(self):
+        prepare = self.prepare_args(self.base / "root")
+        prepare.bootstrap_packages = True
+        with self.assertRaises(release.ReleaseError) as caught:
+            release._validate_cli(prepare)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("cli", "bootstrap-stage"),
+        )
+        verify = self.verify_args(self.bundle, self.descriptor_sha)
+        verify.bootstrap_packages = True
+        with self.assertRaises(release.ReleaseError) as caught:
+            release._validate_cli(verify)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("cli", "bootstrap-stage"),
+        )
+        instance = release.Release(repo=self.repo, env=self.env)
+        with self.assertRaises(release.ReleaseError) as caught:
+            instance.prepare(prepare)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("cli", "bootstrap-stage"),
+        )
+        with self.assertRaises(release.ReleaseError) as caught:
+            instance.verify_handoff(verify)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("cli", "bootstrap-stage"),
+        )
+
+    def test_prepare_never_passes_either_token_to_children(self):
+        code, root, fake = self.run_prepare()
+        self.assertEqual(code, 0)
+        for call in fake.calls:
+            self.assertNotIn(AUDIT_TOKEN, call["env"].values())
+            self.assertNotIn(GITHUB_TOKEN, call["env"].values())
+        self.assertNotIn(AUDIT_TOKEN, json.dumps(self._summary(root)))
 
 
 class CancellationTests(ReleaseTestBase):

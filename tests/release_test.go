@@ -288,6 +288,7 @@ func releaseTrustedEnv(head, status string) []string {
 		"GITHUB_SHA=" + releaseSourceSHA,
 		"GITHUB_REPOSITORY=xtianxx/payment-hub",
 		"GITHUB_ACTOR=xtianxx",
+		"GITHUB_TRIGGERING_ACTOR=xtianxx",
 		"GITHUB_TOKEN=" + releaseTokenCanary,
 		"FAKE_HEAD=" + head,
 		"FAKE_STATUS=" + status,
@@ -422,7 +423,7 @@ func TestReleaseGates(t *testing.T) {
 		docker, marker := releaseFakeDocker(t, temp)
 		env := releaseTrustedEnv(releaseSourceSHA, "")
 		env = append(env, "GITHUB_REF=refs/heads/feature")
-		code, _ := releaseCommand(
+		code, output := releaseCommand(
 			t, python, root, env,
 			"--stage", "prepare",
 			"--source-sha", releaseSourceSHA,
@@ -436,6 +437,9 @@ func TestReleaseGates(t *testing.T) {
 		if code == 0 {
 			t.Fatal("non-main ref was accepted")
 		}
+		if !strings.Contains(output, "ERROR: context/ref") {
+			t.Fatalf("wrong rejection for non-main ref: %s", output)
+		}
 		if _, err := os.Stat(marker); err == nil {
 			t.Fatal("Docker was invoked before the trusted-ref gate")
 		}
@@ -446,7 +450,7 @@ func TestReleaseGates(t *testing.T) {
 		git := releaseFakeGit(t, temp)
 		docker, marker := releaseFakeDocker(t, temp)
 		env := releaseTrustedEnv(releaseSourceSHA, " M dirty.go\n")
-		code, _ := releaseCommand(
+		code, output := releaseCommand(
 			t, python, root, env,
 			"--stage", "prepare",
 			"--source-sha", releaseSourceSHA,
@@ -460,6 +464,9 @@ func TestReleaseGates(t *testing.T) {
 		if code == 0 {
 			t.Fatal("dirty worktree was accepted")
 		}
+		if !strings.Contains(output, "ERROR: context/dirty") {
+			t.Fatalf("wrong rejection for dirty worktree: %s", output)
+		}
 		if _, err := os.Stat(marker); err == nil {
 			t.Fatal("Docker was invoked before the dirty-tree gate")
 		}
@@ -471,7 +478,7 @@ func TestReleaseGates(t *testing.T) {
 		docker, _ := releaseFakeDocker(t, temp)
 		env := releaseTrustedEnv(releaseSourceSHA, "")
 		env = append(env, "GITHUB_SHA="+strings.Repeat("c", 40))
-		code, _ := releaseCommand(
+		code, output := releaseCommand(
 			t, python, root, env,
 			"--stage", "prepare",
 			"--source-sha", releaseSourceSHA,
@@ -484,6 +491,9 @@ func TestReleaseGates(t *testing.T) {
 		)
 		if code == 0 {
 			t.Fatal("source SHA mismatch was accepted")
+		}
+		if !strings.Contains(output, "ERROR: context/sha") {
+			t.Fatalf("wrong rejection for source SHA mismatch: %s", output)
 		}
 	})
 

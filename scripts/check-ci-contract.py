@@ -201,7 +201,88 @@ PUBLISH_DOCKER_CONTEXT = "payment-hub-release"
 PUBLISH_DOCKER_RUNTIME_BASEDIR = DOCKER_RUNTIME_BASEDIR
 PUBLISH_DOCKER_DAEMON_CONFIG = DOCKER_DAEMON_CONFIG
 PUBLISH_DOCKER_VERIFY_RUN = DOCKER_VERIFY_RUN
-PUBLISH_INPUT_NAMES = ("publish_authorized", "packages_verified")
+PUBLISH_INPUT_NAMES = (
+    "publish_authorized",
+    "packages_verified",
+    "bootstrap_packages",
+)
+PUBLISH_OWNER_GUARD = (
+    "${{ github.actor == 'xtianxx' && "
+    "github.triggering_actor == 'xtianxx' }}"
+)
+PUBLISH_PREPARE_GATE_ENV = {
+    "SOURCE_SHA": "${{ github.sha }}",
+    "EVENT_NAME": "${{ github.event_name }}",
+    "REF_NAME": "${{ github.ref }}",
+    "REPOSITORY": "${{ github.repository }}",
+    "RELEASE_ACTOR": "${{ github.actor }}",
+    "RELEASE_TRIGGERING_ACTOR": "${{ github.triggering_actor }}",
+    "PUBLISH_AUTHORIZED": "${{ inputs.publish_authorized }}",
+    "PACKAGES_VERIFIED": "${{ inputs.packages_verified }}",
+}
+PUBLISH_PREPARE_GATE_RUN = """set -euo pipefail
+if [[ "$RELEASE_ACTOR" != "xtianxx" || "$RELEASE_TRIGGERING_ACTOR" != "xtianxx" ]]; then
+  echo "::error::owner-only publish requires actor and triggering actor xtianxx"
+  exit 1
+fi
+if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+  echo "::error::publish requires workflow_dispatch"
+  exit 1
+fi
+if [[ "$REF_NAME" != "refs/heads/main" ]]; then
+  echo "::error::publish requires refs/heads/main"
+  exit 1
+fi
+if [[ "$REPOSITORY" != "xtianxx/payment-hub" ]]; then
+  echo "::error::publish requires the trusted repository"
+  exit 1
+fi
+if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "::error::publish requires a 40-hex source SHA"
+  exit 1
+fi
+if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]; then
+  echo "::error::publish requires both manual authorizations"
+  exit 1
+fi
+"""
+PUBLISH_AUDIT_SECRET_NAME = "GHCR_PACKAGE_AUDIT_TOKEN"
+PUBLISH_AUDIT_SECRET_EXPRESSION = "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}"
+PUBLISH_PUBLISH_ENV = {
+    "SOURCE_SHA": "${{ github.sha }}",
+    "EXPECTED_DESCRIPTOR_SHA": "${{ needs.prepare.outputs.descriptor_sha256 }}",
+    "GITHUB_TOKEN": "${{ github.token }}",
+    "GHCR_PACKAGE_AUDIT_TOKEN": PUBLISH_AUDIT_SECRET_EXPRESSION,
+    "BOOTSTRAP_PACKAGES": "${{ inputs.bootstrap_packages }}",
+}
+PUBLISH_PUBLISH_RUN = """set -euo pipefail
+bootstrap_args=()
+case "$BOOTSTRAP_PACKAGES" in
+  true)
+    bootstrap_args+=(--bootstrap-packages)
+    ;;
+  false)
+    ;;
+  *)
+    echo "::error::BOOTSTRAP_PACKAGES must be true or false"
+    exit 1
+    ;;
+esac
+bash scripts/release.sh --stage publish \\
+  --source-sha "$SOURCE_SHA" \\
+  --go "$(command -v go)" \\
+  --cache-dir "$RUNNER_TEMP/payment-hub-release-cache" \\
+  --artifact-root "$RUNNER_TEMP/payment-hub-release-publish" \\
+  --bundle-dir "$RUNNER_TEMP/payment-hub-release-handoff" \\
+  --expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA" \\
+  --approve-external \\
+  --package-preconditions-verified \\
+  --prepare-inputs \\
+  "${bootstrap_args[@]}"
+"""
+SECRETS_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])secrets(?![A-Za-z0-9_])", re.IGNORECASE
+)
 PUBLISH_BUNDLE_PATHS = (
     "${{ runner.temp }}/payment-hub-release-prepare/bundle/pair.tar",
     "${{ runner.temp }}/payment-hub-release-prepare/bundle/descriptor.json",
@@ -669,6 +750,58 @@ def load_workflow(path: Path) -> tuple[dict[str, Any], str]:
     except OSError:
         raise ContractError("workflow-missing") from None
     return parse_workflow_text(text), text
+
+
+def iter_github_expressions(text: str) -> list[str]:
+    """Return the bodies of all ``${{ ... }}`` expressions in text.
+
+    This is deliberately not a general GitHub expression parser.  It only
+    locates expression boundaries, ignoring closing braces inside single- or
+    double-quoted strings, so callers can fail closed on the ``secrets``
+    context.  Unclosed or ambiguous expressions are a fixed contract error.
+    """
+    expressions: list[str] = []
+    index = 0
+    while True:
+        start = text.find("${{", index)
+        if start == -1:
+            return expressions
+        position = start + 3
+        quote: str | None = None
+        while position < len(text):
+            character = text[position]
+            if quote == "'":
+                if character == "'":
+                    if (
+                        position + 1 < len(text)
+                        and text[position + 1] == "'"
+                    ):
+                        position += 2
+                        continue
+                    quote = None
+                    position += 1
+                    continue
+                position += 1
+                continue
+            if quote == '"':
+                if character == "\\" and position + 1 < len(text):
+                    position += 2
+                    continue
+                if character == '"':
+                    quote = None
+                position += 1
+                continue
+            if character in ("'", '"'):
+                quote = character
+                position += 1
+                continue
+            if text.startswith("}}", position):
+                expressions.append(text[start + 3 : position])
+                index = position + 2
+                break
+            position += 1
+        else:
+            raise ContractError("workflow-expression-unclosed")
 
 
 def _step_names(job: dict[str, Any]) -> list[str]:
@@ -1400,27 +1533,11 @@ def validate_publish_workflow(
                 add("publish-prepare-gate-shell")
             if "if" in gate or "continue-on-error" in gate:
                 add("publish-prepare-gate-skip")
-            if gate.get("env") != {
-                "SOURCE_SHA": "${{ github.sha }}",
-                "EVENT_NAME": "${{ github.event_name }}",
-                "REF_NAME": "${{ github.ref }}",
-                "REPOSITORY": "${{ github.repository }}",
-                "PUBLISH_AUTHORIZED": "${{ inputs.publish_authorized }}",
-                "PACKAGES_VERIFIED": "${{ inputs.packages_verified }}",
-            }:
+            if gate.get("env") != PUBLISH_PREPARE_GATE_ENV:
                 add("publish-prepare-gate-env")
             run = gate.get("run", "")
-            for token in (
-                "set -euo pipefail",
-                'if [[ "$EVENT_NAME" != "workflow_dispatch" ]]',
-                'if [[ "$REF_NAME" != "refs/heads/main" ]]',
-                'if [[ "$REPOSITORY" != "xtianxx/payment-hub" ]]',
-                'if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]',
-                'if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]',
-                "exit 1",
-            ):
-                if token not in run:
-                    add("publish-prepare-gate-run")
+            if run.strip() != PUBLISH_PREPARE_GATE_RUN.strip():
+                add("publish-prepare-gate-run")
         isolation = _find_step(prepare, "Isolate release Go config and caches")
         if isolation is None:
             add("publish-prepare-isolation-missing")
@@ -1492,7 +1609,14 @@ def validate_publish_workflow(
             ):
                 if token not in run:
                     add("publish-prepare-command-run")
-            for token in ("GITHUB_TOKEN", "secrets.", "docker build", "docker save"):
+            for token in (
+                "GITHUB_TOKEN",
+                "secrets.",
+                "docker build",
+                "docker save",
+                "BOOTSTRAP_PACKAGES",
+                "--bootstrap-packages",
+            ):
                 if token in run:
                     add("publish-prepare-command-unsafe")
         handoff = _find_step(prepare, "Read trusted prepare outputs")
@@ -1555,6 +1679,8 @@ def validate_publish_workflow(
             context=PUBLISH_DOCKER_CONTEXT,
             prefix="publish-docker",
         )
+        if "bootstrap" in json.dumps(prepare).lower():
+            add("publish-prepare-bootstrap")
 
     if isinstance(upload, dict):
         if upload.get("name") != "Publish paired images (linux/amd64)":
@@ -1573,7 +1699,7 @@ def validate_publish_workflow(
             add("publish-upload-permissions")
         if "env" in upload:
             add("publish-upload-env")
-        if "if" in upload:
+        if upload.get("if") != PUBLISH_OWNER_GUARD:
             add("publish-upload-condition")
         names = _step_names(upload)
         if tuple(names) != (
@@ -1722,17 +1848,15 @@ def validate_publish_workflow(
         if publish_step is None:
             add("publish-command-missing")
         else:
+            if set(publish_step) != {"name", "shell", "env", "run"}:
+                add("publish-command-shape")
             if publish_step.get("shell") != "bash":
                 add("publish-command-shell")
-            if publish_step.get("env") != {
-                "SOURCE_SHA": "${{ github.sha }}",
-                "EXPECTED_DESCRIPTOR_SHA": (
-                    "${{ needs.prepare.outputs.descriptor_sha256 }}"
-                ),
-                "GITHUB_TOKEN": "${{ github.token }}",
-            }:
+            if publish_step.get("env") != PUBLISH_PUBLISH_ENV:
                 add("publish-command-env")
             run = publish_step.get("run", "")
+            if run.strip() != PUBLISH_PUBLISH_RUN.strip():
+                add("publish-command-run")
             for token in (
                 "set -euo pipefail",
                 PUBLISH_PUBLISH_COMMAND,
@@ -1745,11 +1869,20 @@ def validate_publish_workflow(
                 "--approve-external",
                 "--package-preconditions-verified",
                 "--prepare-inputs",
+                "bootstrap_args=()",
+                'case "$BOOTSTRAP_PACKAGES" in',
+                "bootstrap_args+=(--bootstrap-packages)",
+                '"${bootstrap_args[@]}"',
             ):
                 if token not in run:
                     add("publish-command-run")
+            if run.count("--bootstrap-packages") != 1:
+                add("publish-command-run")
             for token in (
                 "secrets.",
+                "GHCR_PACKAGE_AUDIT_TOKEN",
+                "set -x",
+                "printenv",
                 "docker push",
                 "docker login",
                 "docker build",
@@ -1797,29 +1930,96 @@ def validate_publish_workflow(
         ("upload", PUBLISH_CI_GATE_STEP),
         ("upload", "Publish paired images"),
     }
+    allowed_audit_steps = {("upload", "Publish paired images")}
     for job_id, job in jobs.items():
         if not isinstance(job, dict):
             continue
         if "env" in job:
             add("publish-job-env", job_id)
-        if "GITHUB_TOKEN" in job.get("env", {}):
+        job_env = job.get("env", {})
+        if "GITHUB_TOKEN" in job_env:
             add("publish-token-location")
+        if PUBLISH_AUDIT_SECRET_NAME in job_env:
+            add("publish-token-location")
+        if "BOOTSTRAP_PACKAGES" in job_env:
+            add("publish-bootstrap-location")
         for step in job.get("steps", []):
             if "continue-on-error" in step:
                 add("publish-continue-on-error")
-            if "GITHUB_TOKEN" in step.get("env", {}):
-                if (job_id, step.get("name")) not in allowed_token_steps:
+            step_env = step.get("env", {})
+            location = (job_id, step.get("name"))
+            if "GITHUB_TOKEN" in step_env:
+                if location not in allowed_token_steps:
                     add("publish-token-location")
+                if step_env["GITHUB_TOKEN"] != "${{ github.token }}":
+                    add("publish-token-location")
+            if PUBLISH_AUDIT_SECRET_NAME in step_env:
+                if location not in allowed_audit_steps:
+                    add("publish-token-location")
+                if (
+                    step_env[PUBLISH_AUDIT_SECRET_NAME]
+                    != PUBLISH_AUDIT_SECRET_EXPRESSION
+                ):
+                    add("publish-token-location")
+            if "BOOTSTRAP_PACKAGES" in step_env:
+                if location not in allowed_audit_steps:
+                    add("publish-bootstrap-location")
+            for key, value in step_env.items():
+                if key != PUBLISH_AUDIT_SECRET_NAME and (
+                    PUBLISH_AUDIT_SECRET_EXPRESSION in str(value)
+                ):
+                    add("publish-token-location")
+                if key not in (
+                    "GITHUB_TOKEN",
+                    PUBLISH_AUDIT_SECRET_NAME,
+                ) and "secrets." in str(value):
+                    add("publish-token-location")
+            for field in ("run", "with"):
+                field_value = step.get(field)
+                if field_value is None:
+                    continue
+                blob = (
+                    field_value
+                    if isinstance(field_value, str)
+                    else json.dumps(field_value)
+                )
+                if "secrets." in blob or PUBLISH_AUDIT_SECRET_NAME in blob:
+                    add("publish-token-location")
+            if location not in allowed_audit_steps and "bootstrap" in json.dumps(
+                step
+            ).lower():
+                add("publish-bootstrap-location")
             if step.get("uses") == DOWNLOAD and job_id != "upload":
                 add("publish-download-location")
     if "GITHUB_TOKEN" in workflow.get("env", {}):
+        add("publish-token-location")
+    if PUBLISH_AUDIT_SECRET_NAME in workflow.get("env", {}):
+        add("publish-token-location")
+    if "BOOTSTRAP_PACKAGES" in workflow.get("env", {}):
+        add("publish-bootstrap-location")
+
+    try:
+        expressions = iter_github_expressions(text)
+    except ContractError:
+        add("publish-secret-policy")
+    else:
+        allowed_expression_count = 0
+        for expression in expressions:
+            if SECRETS_TOKEN_RE.search(expression) is None:
+                continue
+            if "${{" + expression + "}}" == PUBLISH_AUDIT_SECRET_EXPRESSION:
+                allowed_expression_count += 1
+            else:
+                add("publish-secret-policy")
+        if allowed_expression_count != 1:
+            add("publish-secret-policy")
+    if text.count(PUBLISH_AUDIT_SECRET_NAME + ":") != 1:
         add("publish-token-location")
 
     for token in (
         "pull_request_target",
         "workflow_run",
         "workflow_call",
-        "secrets.",
         "id-token",
         "attestations",
         "contents: write",
