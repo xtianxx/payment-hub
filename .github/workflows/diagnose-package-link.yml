@@ -1,0 +1,40 @@
+name: Diagnose package inventory Link / 包清单分页诊断
+
+on:
+  push:
+    branches:
+      - fix/ghcr-inventory-link
+    paths:
+      - .github/workflows/diagnose-package-link.yml
+      - scripts/diagnose-package-link.py
+      - scripts/test_diagnose_package_link.py
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: Read-only inventory Link diagnostic
+    if: ${{ github.repository == 'xtianxx/payment-hub' && github.actor == 'xtianxx' && github.triggering_actor == 'xtianxx' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Diagnose package inventory Link
+        shell: bash
+        env:
+          GHCR_PACKAGE_AUDIT_TOKEN: ${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}
+          DIAGNOSE_REPOSITORY: ${{ github.repository }}
+          DIAGNOSE_REF: ${{ github.ref }}
+          DIAGNOSE_ACTOR: ${{ github.actor }}
+          DIAGNOSE_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          DIAGNOSE_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/diagnose-package-link.py

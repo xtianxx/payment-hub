@@ -1,5 +1,47 @@
 # 本地镜像与受控发布
 
+## 包清单分页失败诊断（2026-11-14）
+
+真实发布运行`43599112781`、upload job `132462192508`在源码
+`3826d42167f09e783b7caeb57587c391567e132c`上报
+`package/inventory-link`。该运行的日志和摘要未记录实际Link头，
+因此不能确定是哪项导航校验失败，也不能据此认定某种URL格式就是根因。
+该次摘要的`push_attempted_roles`、`pushed_roles`均为空，
+`published=false`；按代码执行顺序，此次失败早于login/push。
+这不代表其他运行或重跑也没有副作用。
+
+本轮先补固定、脱敏的分页拒绝分类，通过原有错误日志和摘要的
+`failure.stage`、`failure.kind`定位具体拒绝条件，不增加摘要字段。
+不输出原始Link、URL、查询参数值、包清单或认证信息。
+这只是可观测性改进，不放宽路径、同源、查询参数、页号或完整分页门禁，
+也不把畸形或未知响应当作缺失包证据。
+
+`failure.stage`仍为`package`；原`inventory-link`细分为以下固定kind，
+按旧kind精确匹配的消费者需更新，不能把新分类当作成功：
+
+| kind | 拒绝条件 |
+| --- | --- |
+| `inventory-link-url` | URL解析失败、非法端口格式或fragment |
+| `inventory-link-origin` | 协议、主机、端口或用户信息不符 |
+| `inventory-link-path` | 路径不符 |
+| `inventory-link-query` | 查询语法、键集合或固定参数值不符 |
+| `inventory-link-page` | 页号格式、数量或next连续性不符 |
+| `inventory-link-syntax` | Link头或参数语法不符 |
+| `inventory-link-relation` | rel缺失、多值、未知或重复 |
+| `inventory-link-navigation` | 同一响应的next/last关系不一致 |
+| `inventory-link-last` | 跨页last改变、提前终止或next越界 |
+
+后续取得具体拒绝原因后，再对照实际响应与官方契约决定兼容性修复，
+并补充相应回归。当前未证明真实响应可被接受，也未重新执行真实审计、
+初始化、发布或部署；重跑发布仍须另行授权，不能用重跑试探包状态。
+
+负责人随后批准临时只读Actions诊断：仅在修复分支的受限push事件中运行，
+复用现有审计Secret读取身份和包清单，在内存中检查分页响应，
+只输出固定分类及结构判断，不输出原始响应或包数据。
+该诊断不调用发布入口，不授予包写权限，不合并main；取得结果后移除临时工作流。
+本地GitHub CLI凭据的Packages请求返回403，不代表Actions审计Secret无效。
+临时工作流的实现或本地测试成功不等于真实诊断已运行，结果须另行记录。
+
 ## GHCR首次初始化修复（2026-11-14）
 
 本节描述`fix/ghcr-bootstrap`分支中的修复；合并main后才会进入正式工作流，尚未在真实发布中验证。后文历史状态保留原始证据，不作为当前操作步骤。

@@ -2209,6 +2209,168 @@ class PackageAuditBoundaryTests(unittest.TestCase):
         self.assertIs(caught.exception, error)
         self.http.assert_called_once()
 
+    def test_inventory_link_rejection_kinds_are_fixed_and_prefixed(self):
+        expected = {
+            "inventory-link-url",
+            "inventory-link-origin",
+            "inventory-link-path",
+            "inventory-link-query",
+            "inventory-link-page",
+            "inventory-link-syntax",
+            "inventory-link-relation",
+            "inventory-link-navigation",
+            "inventory-link-last",
+        }
+        self.assertEqual(release.INVENTORY_LINK_KINDS, frozenset(expected))
+        self.assertNotIn("inventory-link", release.INVENTORY_LINK_KINDS)
+        self.assertTrue(
+            all(kind.startswith("inventory-link-") for kind in expected)
+        )
+
+    def test_inventory_link_rejection_does_not_echo_external_input(self):
+        sentinel = "SENTINEL_LEAK_CANARY_9f3a"
+        base = (
+            "https://api.github.com/user/packages?"
+            "package_type=container&per_page=100"
+        )
+        cases = [
+            (
+                "url",
+                "https://api.github.com:" + sentinel + "/user/packages?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-url",
+            ),
+            (
+                "origin",
+                "https://" + sentinel + ".example/user/packages?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-origin",
+            ),
+            (
+                "path",
+                "https://api.github.com/" + sentinel + "/packages?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-path",
+            ),
+            (
+                "query-key",
+                f"{base}&page=2&{sentinel}=1",
+                1,
+                "inventory-link-query",
+            ),
+            (
+                "query-value",
+                f"{base}&package_type={sentinel}&page=2",
+                1,
+                "inventory-link-query",
+            ),
+            (
+                "page",
+                f"{base}&page={sentinel}",
+                1,
+                "inventory-link-page",
+            ),
+            (
+                "relation",
+                f'<{base}&page=2>; rel="{sentinel}"',
+                1,
+                "inventory-link-relation",
+            ),
+            (
+                "syntax",
+                f'<{base}&page=2>; rel="next", {sentinel}',
+                1,
+                "inventory-link-syntax",
+            ),
+            (
+                "navigation",
+                f'<{base}&page=1&{sentinel}=1>; rel="prev", '
+                f'<{base}&page=2>; rel="last"',
+                3,
+                "inventory-link-navigation",
+            ),
+        ]
+        for label, header, current_page, kind in cases:
+            with self.subTest(label=label):
+                link_header = (
+                    header
+                    if header.startswith("<")
+                    else f'<{header}>; rel="next"'
+                )
+                with self.assertRaises(release.ReleaseError) as caught:
+                    self.instance._inventory_next_page(
+                        link_header, current_page
+                    )
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("package", kind),
+                )
+                self.assertNotIn(sentinel, str(caught.exception))
+                self.assertNotIn(sentinel, repr(caught.exception))
+
+    def test_inventory_cross_page_last_inconsistency_rejected(self):
+        sentinel = "SENTINEL_LEAK_CANARY_9f3a"
+        base = (
+            release.GITHUB_API + "/user/packages?"
+            "package_type=container&per_page=100"
+        )
+        page_one = [
+            foreign_package(index)
+            for index in range(release.INVENTORY_PER_PAGE)
+        ]
+        first = f'<{base}&page=1&{sentinel}=1>; rel="first"'
+        cases = [
+            (
+                "last-changed",
+                f'{first}, <{base}&page=2>; rel="next", '
+                f'<{base}&page=3>; rel="last"',
+                f'<{base}&page=3>; rel="next", '
+                f'<{base}&page=4>; rel="last"',
+            ),
+            (
+                "next-beyond-last",
+                f'{first}, <{base}&page=2>; rel="next", '
+                f'<{base}&page=2>; rel="last"',
+                f'<{base}&page=3>; rel="next"',
+            ),
+            (
+                "early-terminal",
+                f'{first}, <{base}&page=2>; rel="next", '
+                f'<{base}&page=3>; rel="last"',
+                None,
+            ),
+        ]
+        for label, first_link, second_link in cases:
+            with self.subTest(label=label):
+                self.http.reset_mock()
+                second_headers = (
+                    {} if second_link is None else {"Link": second_link}
+                )
+                self.http.side_effect = [
+                    release.HttpResult(
+                        200,
+                        {"Link": first_link},
+                        json.dumps(page_one).encode(),
+                    ),
+                    release.HttpResult(
+                        200,
+                        second_headers,
+                        json.dumps([foreign_package(100)]).encode(),
+                    ),
+                ]
+                with self.assertRaises(release.ReleaseError) as caught:
+                    self.instance._list_owner_packages(AUDIT_TOKEN)
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("package", "inventory-link-last"),
+                )
+                self.assertNotIn(sentinel, str(caught.exception))
+                self.assertNotIn(sentinel, repr(caught.exception))
+                self.assertEqual(self.http.call_count, 2)
+
     def test_inventory_caps_request_timeout_to_remaining_deadline(self):
         self.http.return_value = release.HttpResult(200, {}, b'[]')
         with mock.patch.object(release.time, "monotonic", side_effect=[100.0, 109.75]), \
@@ -2728,7 +2890,7 @@ class PackageInventoryTests(ReleaseTestBase):
             instance._inventory_next_page(header, 1)
         self.assertEqual(
             (caught.exception.stage, caught.exception.kind),
-            ("package", "inventory-link"),
+            ("package", "inventory-link-syntax"),
         )
 
     def test_link_header_first_and_last_terminal_page_accepted(self):
@@ -2756,41 +2918,192 @@ class PackageInventoryTests(ReleaseTestBase):
         instance = release.Release(repo=self.repo)
         self.assertEqual(instance._inventory_next_page(header, 1), 2)
 
-    def test_link_header_malformed_variants_rejected(self):
-        base = "https://api.github.com/user/packages"
+    def test_link_header_syntax_and_relation_kinds_table(self):
+        valid = (
+            "https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=2"
+        )
         cases = [
-            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next\" garbage",
-            f"<{base}?package_type=container&per_page=100&page=2>",
-            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next last\"",
-            f"<{base}?package_type=container&per_page=100&page=2>; rel=\" next \"",
-            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"unknown\"",
+            ("not-a-string", 123, 1, "inventory-link-syntax"),
+            ("empty", "", 1, "inventory-link-syntax"),
+            ("oversized", "x" * 8193, 1, "inventory-link-syntax"),
+            ("ows-only", " \t ", 1, "inventory-link-syntax"),
+            ("missing-open-angle", 'next; rel="next"', 1,
+             "inventory-link-syntax"),
+            ("missing-close-angle", f"<{valid}", 1,
+             "inventory-link-syntax"),
+            ("empty-uri", '<>; rel="next"', 1, "inventory-link-syntax"),
             (
-                f"<{base}?package_type=container&per_page=100&page=2>; "
-                "rel=\"next\"; rel=\"last\""
-            ),
-            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next\",",
-            f"<{base}?package_type=container&per_page=100&page=1>; rel=\"last\", "
-            f"malformed; rel=\"next\"",
-            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next\", "
-            f"<{base}?package_type=container&per_page=100&page=2>; rel=\"next\"",
-            (
-                "<https://evil.example/user/packages?"
-                "package_type=container&per_page=100&page=1>; rel=\"last\""
+                "uri-control",
+                '<https://api.github.com/user/packages?x=\x7f>; rel="next"',
+                1,
+                "inventory-link-syntax",
             ),
             (
-                f"<{base}?package_type=container&per_page=50&page=1>; "
-                "rel=\"last\""
+                "uri-quote",
+                '<https://api.github.com/user/packages?x="bad>; rel="next"',
+                1,
+                "inventory-link-syntax",
             ),
-            f"<{base}?package_type=container&per_page=100&page=zero>; rel=\"last\"",
+            ("param-name-missing", f'<{valid}>; =', 1,
+             "inventory-link-syntax"),
+            ("param-value-missing", f'<{valid}>; rel=', 1,
+             "inventory-link-syntax"),
+            (
+                "duplicate-param",
+                f'<{valid}>; rel="next"; rel="last"',
+                1,
+                "inventory-link-syntax",
+            ),
+            ("unterminated-quote", f'<{valid}>; rel="next', 1,
+             "inventory-link-syntax"),
+            ("quoted-control", f'<{valid}>; rel="next\n"', 1,
+             "inventory-link-syntax"),
+            ("escape-eof", f'<{valid}>; rel="next\\', 1,
+             "inventory-link-syntax"),
+            ("escaped-control", f'<{valid}>; rel="next\\\n"', 1,
+             "inventory-link-syntax"),
+            ("missing-comma", f'<{valid}>; rel="next" garbage', 1,
+             "inventory-link-syntax"),
+            ("trailing-comma", f'<{valid}>; rel="next",', 1,
+             "inventory-link-syntax"),
+            ("missing-rel", f"<{valid}>", 1, "inventory-link-relation"),
+            ("rel-without-value", f"<{valid}>; rel", 1,
+             "inventory-link-relation"),
+            ("rel-whitespace", f'<{valid}>; rel=" next "', 1,
+             "inventory-link-relation"),
+            ("rel-multiple", f'<{valid}>; rel="next last"', 1,
+             "inventory-link-relation"),
+            ("rel-unknown", f'<{valid}>; rel="unknown"', 1,
+             "inventory-link-relation"),
+            (
+                "rel-duplicate",
+                f'<{valid}>; rel="next", <{valid}>; rel="next"',
+                1,
+                "inventory-link-relation",
+            ),
         ]
         instance = release.Release(repo=self.repo)
-        for header in cases:
-            with self.subTest(header=header):
+        for label, header, current_page, kind in cases:
+            with self.subTest(label=label):
                 with self.assertRaises(release.ReleaseError) as caught:
-                    instance._inventory_next_page(header, 1)
+                    instance._inventory_next_page(header, current_page)
                 self.assertEqual(
                     (caught.exception.stage, caught.exception.kind),
-                    ("package", "inventory-link"),
+                    ("package", kind),
+                )
+
+    def test_inventory_nav_url_kinds_table(self):
+        base = (
+            "https://api.github.com/user/packages?"
+            "package_type=container&per_page=100"
+        )
+        cases = [
+            (
+                "url-unparseable-port",
+                "https://api.github.com:bad/user/packages?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-url",
+            ),
+            ("url-fragment", f"{base}&page=2#frag", 1,
+             "inventory-link-url"),
+            (
+                "origin-http",
+                "http://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-origin",
+            ),
+            (
+                "origin-foreign-host",
+                "https://evil.example/user/packages?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-origin",
+            ),
+            (
+                "origin-explicit-port",
+                "https://api.github.com:443/user/packages?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-origin",
+            ),
+            (
+                "origin-username",
+                "https://user@api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-origin",
+            ),
+            (
+                "origin-password",
+                "https://user:pass@api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-origin",
+            ),
+            (
+                "path-wrong",
+                "https://api.github.com/user/package?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-path",
+            ),
+            (
+                "path-extra",
+                "https://api.github.com/user/packages/extra?"
+                "package_type=container&per_page=100&page=2",
+                1,
+                "inventory-link-path",
+            ),
+            ("query-syntax", f"{base}&page=2&broken", 1,
+             "inventory-link-query"),
+            ("query-extra-key", f"{base}&page=2&extra=1", 1,
+             "inventory-link-query"),
+            (
+                "query-package-type",
+                "https://api.github.com/user/packages?"
+                "package_type=npm&per_page=100&page=2",
+                1,
+                "inventory-link-query",
+            ),
+            (
+                "query-per-page",
+                "https://api.github.com/user/packages?"
+                "package_type=container&per_page=50&page=2",
+                1,
+                "inventory-link-query",
+            ),
+            (
+                "query-duplicate-key",
+                "https://api.github.com/user/packages?"
+                "package_type=container&package_type=container"
+                "&per_page=100&page=2",
+                1,
+                "inventory-link-query",
+            ),
+            ("page-zero", f"{base}&page=0", 1, "inventory-link-page"),
+            ("page-leading-zero", f"{base}&page=02", 1,
+             "inventory-link-page"),
+            ("page-nonnumeric", f"{base}&page=zero", 1,
+             "inventory-link-page"),
+            ("page-duplicate", f"{base}&page=2&page=3", 1,
+             "inventory-link-page"),
+            ("page-not-next", f"{base}&page=3", 1,
+             "inventory-link-page"),
+            ("page-too-long", f"{base}&page=1234567890", 1,
+             "inventory-link-page"),
+        ]
+        instance = release.Release(repo=self.repo)
+        for label, uri, current_page, kind in cases:
+            with self.subTest(label=label):
+                header = f'<{uri}>; rel="next"'
+                with self.assertRaises(release.ReleaseError) as caught:
+                    instance._inventory_next_page(header, current_page)
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("package", kind),
                 )
 
     def test_malformed_link_stops_before_login_load_or_push(self):
@@ -2808,7 +3121,7 @@ class PackageInventoryTests(ReleaseTestBase):
             self._publish()
         self.assertEqual(
             (caught.exception.stage, caught.exception.kind),
-            ("package", "inventory-link"),
+            ("package", "inventory-link-syntax"),
         )
         self.assertEqual(self.fake.login_calls, 0)
         self.assertEqual(self.fake.push_calls, [])
@@ -2821,19 +3134,6 @@ class PackageInventoryTests(ReleaseTestBase):
         summary = self._summary(self.base / "publish-root")
         self.assertFalse(summary["published"])
         self.assertEqual(summary["packages_initial"], {})
-
-    def test_link_header_last_beyond_current_without_next_rejected(self):
-        header = (
-            "<https://api.github.com/user/packages?"
-            "package_type=container&per_page=100&page=3>; rel=\"last\""
-        )
-        instance = release.Release(repo=self.repo)
-        with self.assertRaises(release.ReleaseError) as caught:
-            instance._inventory_next_page(header, 1)
-        self.assertEqual(
-            (caught.exception.stage, caught.exception.kind),
-            ("package", "inventory-link"),
-        )
 
     def test_link_header_last_current_without_next_accepted(self):
         header = (
@@ -2853,20 +3153,57 @@ class PackageInventoryTests(ReleaseTestBase):
         instance = release.Release(repo=self.repo)
         self.assertIsNone(instance._inventory_next_page(header, 2))
 
-    def test_link_header_last_before_next_rejected(self):
-        header = (
-            "<https://api.github.com/user/packages?"
-            "package_type=container&per_page=100&page=2>; rel=\"next\", "
-            "<https://api.github.com/user/packages?"
-            "package_type=container&per_page=100&page=1>; rel=\"last\""
+    def test_inventory_duplicate_navigation_relation_branch_classified(self):
+        duplicate = (
+            "https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page=2"
         )
         instance = release.Release(repo=self.repo)
-        with self.assertRaises(release.ReleaseError) as caught:
-            instance._inventory_next_page(header, 1)
+        with mock.patch.object(
+            release,
+            "_parse_link_header",
+            return_value=[(duplicate, "next"), (duplicate, "next")],
+        ):
+            with self.assertRaises(release.ReleaseError) as caught:
+                instance._inventory_next_page("ignored", 1)
         self.assertEqual(
             (caught.exception.stage, caught.exception.kind),
-            ("package", "inventory-link"),
+            ("package", "inventory-link-relation"),
         )
+
+    def test_link_header_next_last_inconsistency_rejected(self):
+        base = "https://api.github.com/user/packages"
+        cases = [
+            (
+                "last-before-current",
+                f"<{base}?package_type=container&per_page=100&page=2>; "
+                'rel="last"',
+                3,
+            ),
+            (
+                "last-before-next",
+                f"<{base}?package_type=container&per_page=100&page=2>; "
+                'rel="next", '
+                f"<{base}?package_type=container&per_page=100&page=1>; "
+                'rel="last"',
+                1,
+            ),
+            (
+                "last-beyond-current-without-next",
+                f"<{base}?package_type=container&per_page=100&page=3>; "
+                'rel="last"',
+                1,
+            ),
+        ]
+        instance = release.Release(repo=self.repo)
+        for label, header, current_page in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(release.ReleaseError) as caught:
+                    instance._inventory_next_page(header, current_page)
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("package", "inventory-link-navigation"),
+                )
 
     def test_last_beyond_current_without_next_stops_before_login_load_or_push(self):
         page_one = [foreign_package(index) for index in range(99)]
@@ -2882,7 +3219,7 @@ class PackageInventoryTests(ReleaseTestBase):
             self._publish()
         self.assertEqual(
             (caught.exception.stage, caught.exception.kind),
-            ("package", "inventory-link"),
+            ("package", "inventory-link-navigation"),
         )
         self.assertEqual(self.fake.login_calls, 0)
         self.assertEqual(self.fake.push_calls, [])
@@ -2915,7 +3252,7 @@ class PackageInventoryTests(ReleaseTestBase):
             self._publish()
         self.assertEqual(
             (caught.exception.stage, caught.exception.kind),
-            ("package", "inventory-link"),
+            ("package", "inventory-link-last"),
         )
         self.assertEqual(self.fake.login_calls, 0)
         self.assertEqual(self.fake.push_calls, [])
@@ -2957,7 +3294,7 @@ class PackageInventoryTests(ReleaseTestBase):
             instance._list_owner_packages(AUDIT_TOKEN)
         self.assertEqual(
             (caught.exception.stage, caught.exception.kind),
-            ("package", "inventory-link"),
+            ("package", "inventory-link-last"),
         )
 
     def test_inventory_second_page_target_is_found(self):
@@ -3033,9 +3370,41 @@ class PackageInventoryTests(ReleaseTestBase):
             self._publish()
         self.assertEqual(
             (caught.exception.stage, caught.exception.kind),
-            ("package", "inventory-link"),
+            ("package", "inventory-link-origin"),
         )
         self.assertEqual(self.fake.push_calls, [])
+
+    def test_inventory_link_failure_summary_does_not_echo_external_input(self):
+        sentinel = "SENTINEL_LEAK_CANARY_9f3a"
+        self.http.inventory_page_overrides = {
+            1: [
+                package_metadata("app"),
+                foreign_package(0) | {"name": sentinel},
+            ]
+        }
+        self.http.inventory_link_overrides = {
+            1: (
+                "<https://api.github.com/user/packages?"
+                "package_type=container&per_page=100&page=2&"
+                f"{sentinel}=1>; rel=\"next\""
+            )
+        }
+        with self.assertRaises(release.ReleaseError) as caught:
+            self._publish()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "inventory-link-query"),
+        )
+        self.assertNotIn(sentinel, str(caught.exception))
+        self.assertNotIn(sentinel, repr(caught.exception))
+        summary = self._summary(self.base / "publish-root")
+        self.assertEqual(
+            summary["failure"],
+            {"stage": "package", "kind": "inventory-link-query"},
+        )
+        self.assertEqual(set(summary["failure"]), {"stage", "kind"})
+        self.assertNotIn(sentinel, json.dumps(summary))
+        self.assertNotIn(AUDIT_TOKEN, json.dumps(summary))
 
     def test_inventory_page_limit_rejected(self):
         page_one = [foreign_package(index) for index in range(99)]

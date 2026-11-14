@@ -144,6 +144,35 @@ INVENTORY_TIMEOUT_SECONDS = 60.0
 LINK_REL_TYPES = frozenset(("next", "last", "prev", "first"))
 _LINK_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
+# Fixed rejection taxonomy for strict GitHub package-inventory Link
+# navigation.  Every value extends the historical ``inventory-link`` kind so
+# log and summary consumers can group the failure family by prefix; the
+# suffix names the rejected validation layer without echoing external input.
+INVENTORY_LINK_KIND_URL = "inventory-link-url"
+INVENTORY_LINK_KIND_ORIGIN = "inventory-link-origin"
+INVENTORY_LINK_KIND_PATH = "inventory-link-path"
+INVENTORY_LINK_KIND_QUERY = "inventory-link-query"
+INVENTORY_LINK_KIND_PAGE = "inventory-link-page"
+INVENTORY_LINK_KIND_SYNTAX = "inventory-link-syntax"
+INVENTORY_LINK_KIND_RELATION = "inventory-link-relation"
+# ``navigation`` covers next/last consistency within one header; ``last``
+# covers cross-page last stability and early termination.
+INVENTORY_LINK_KIND_NAVIGATION = "inventory-link-navigation"
+INVENTORY_LINK_KIND_LAST = "inventory-link-last"
+INVENTORY_LINK_KINDS = frozenset(
+    (
+        INVENTORY_LINK_KIND_URL,
+        INVENTORY_LINK_KIND_ORIGIN,
+        INVENTORY_LINK_KIND_PATH,
+        INVENTORY_LINK_KIND_QUERY,
+        INVENTORY_LINK_KIND_PAGE,
+        INVENTORY_LINK_KIND_SYNTAX,
+        INVENTORY_LINK_KIND_RELATION,
+        INVENTORY_LINK_KIND_NAVIGATION,
+        INVENTORY_LINK_KIND_LAST,
+    )
+)
+
 # Fixed tool-class budgets.  The builder and check-images launcher own their
 # internal build/test/PG budgets; these outer values only bound the process
 # wrapper and are never extended or retried.
@@ -250,7 +279,12 @@ def _header_value(headers: Mapping[str, str], name: str) -> str | None:
     return None
 
 
-def _parse_link_header(value: Any) -> list[tuple[str, str]]:
+def _parse_link_header(
+    value: Any,
+    *,
+    syntax_kind: str = "inventory-link",
+    relation_kind: str = "inventory-link",
+) -> list[tuple[str, str]]:
     """Strictly consume one GitHub inventory Link header.
 
     Every comma-separated link-value and every ``;`` parameter must parse.
@@ -258,9 +292,13 @@ def _parse_link_header(value: Any) -> list[tuple[str, str]]:
     not repeat across the header, and the URI is kept only for fixed
     same-origin inventory navigation.  No URI from this header is followed
     directly.
+
+    The caller supplies fixed rejection kinds so this parser can be reused
+    without imposing inventory-specific classifications on other consumers.
+    The defaults keep the historical generic kind for such callers.
     """
     if not isinstance(value, str) or not value or len(value) > 8192:
-        raise ReleaseError("package", "inventory-link")
+        raise ReleaseError("package", syntax_kind)
     links: list[tuple[str, str]] = []
     seen_rels: set[str] = set()
     length = len(value)
@@ -272,19 +310,19 @@ def _parse_link_header(value: Any) -> list[tuple[str, str]]:
 
     pos = skip_ows(0)
     if pos >= length:
-        raise ReleaseError("package", "inventory-link")
+        raise ReleaseError("package", syntax_kind)
     while True:
         if pos >= length or value[pos] != "<":
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", syntax_kind)
         end = value.find(">", pos + 1)
         if end < 0:
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", syntax_kind)
         uri = value[pos + 1 : end]
         if not uri or any(
             ord(char) <= 0x20 or ord(char) == 0x7F or char in '<">'
             for char in uri
         ):
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", syntax_kind)
         pos = end + 1
         params: dict[str, str | None] = {}
         while True:
@@ -294,7 +332,7 @@ def _parse_link_header(value: Any) -> list[tuple[str, str]]:
             pos = skip_ows(pos + 1)
             match = _LINK_TOKEN.match(value, pos)
             if match is None:
-                raise ReleaseError("package", "inventory-link")
+                raise ReleaseError("package", syntax_kind)
             name = match.group(0).lower()
             pos = match.end()
             pos = skip_ows(pos)
@@ -308,16 +346,14 @@ def _parse_link_header(value: Any) -> list[tuple[str, str]]:
                         char = value[pos]
                         if char == "\\":
                             if pos + 1 >= length:
-                                raise ReleaseError("package", "inventory-link")
+                                raise ReleaseError("package", syntax_kind)
                             escaped = value[pos + 1]
                             if (
                                 escaped in "\r\n"
                                 or ord(escaped) == 0x7F
                                 or (ord(escaped) < 0x20 and escaped != "\t")
                             ):
-                                raise ReleaseError(
-                                    "package", "inventory-link"
-                                )
+                                raise ReleaseError("package", syntax_kind)
                             chars.append(escaped)
                             pos += 2
                             continue
@@ -330,45 +366,45 @@ def _parse_link_header(value: Any) -> list[tuple[str, str]]:
                             or ord(char) == 0x7F
                             or (ord(char) < 0x20 and char != "\t")
                         ):
-                            raise ReleaseError("package", "inventory-link")
+                            raise ReleaseError("package", syntax_kind)
                         chars.append(char)
                         pos += 1
                     if not closed:
-                        raise ReleaseError("package", "inventory-link")
+                        raise ReleaseError("package", syntax_kind)
                     param_value: str | None = "".join(chars)
                 else:
                     match = _LINK_TOKEN.match(value, pos)
                     if match is None:
-                        raise ReleaseError("package", "inventory-link")
+                        raise ReleaseError("package", syntax_kind)
                     param_value = match.group(0)
                     pos = match.end()
             else:
                 param_value = None
             if name in params:
-                raise ReleaseError("package", "inventory-link")
+                raise ReleaseError("package", syntax_kind)
             params[name] = param_value
         if "rel" not in params or params["rel"] is None:
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", relation_kind)
         if params["rel"].strip() != params["rel"]:
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", relation_kind)
         rel_values = params["rel"].split()
         if len(rel_values) != 1:
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", relation_kind)
         rel = rel_values[0].lower()
         if rel not in LINK_REL_TYPES or rel in seen_rels:
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", relation_kind)
         seen_rels.add(rel)
         links.append((uri, rel))
         pos = skip_ows(pos)
         if pos >= length:
             break
         if value[pos] != ",":
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", syntax_kind)
         pos = skip_ows(pos + 1)
         if pos >= length:
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", syntax_kind)
     if not links:
-        raise ReleaseError("package", "inventory-link")
+        raise ReleaseError("package", syntax_kind)
     return links
 
 
@@ -2381,39 +2417,41 @@ class Release:
             parsed = urllib.parse.urlsplit(uri)
             port = parsed.port
         except ValueError as exc:
-            raise ReleaseError("package", "inventory-link") from exc
+            raise ReleaseError("package", INVENTORY_LINK_KIND_URL) from exc
         if (
             parsed.scheme != "https"
             or parsed.hostname != "api.github.com"
             or port is not None
             or parsed.username is not None
             or parsed.password is not None
-            or parsed.path != "/user/packages"
-            or parsed.fragment
         ):
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", INVENTORY_LINK_KIND_ORIGIN)
+        if parsed.path != "/user/packages":
+            raise ReleaseError("package", INVENTORY_LINK_KIND_PATH)
+        if parsed.fragment:
+            raise ReleaseError("package", INVENTORY_LINK_KIND_URL)
         try:
             query = urllib.parse.parse_qs(
                 parsed.query, keep_blank_values=True, strict_parsing=True
             )
         except ValueError as exc:
-            raise ReleaseError("package", "inventory-link") from exc
+            raise ReleaseError("package", INVENTORY_LINK_KIND_QUERY) from exc
         if set(query) != {"package_type", "per_page", "page"}:
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", INVENTORY_LINK_KIND_QUERY)
         if (
             query["package_type"] != ["container"]
             or query["per_page"] != [str(INVENTORY_PER_PAGE)]
         ):
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", INVENTORY_LINK_KIND_QUERY)
         page_values = query["page"]
         if (
             len(page_values) != 1
             or not re.fullmatch(r"[1-9][0-9]{0,8}", page_values[0])
         ):
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", INVENTORY_LINK_KIND_PAGE)
         page = int(page_values[0])
         if expected_page is not None and page != expected_page:
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", INVENTORY_LINK_KIND_PAGE)
         return page
 
     def _inventory_link_navigation(
@@ -2422,11 +2460,15 @@ class Release:
         """Validate the whole Link header and return (next, last) pages."""
         if link_header is None:
             return None, None
-        links = _parse_link_header(link_header)
+        links = _parse_link_header(
+            link_header,
+            syntax_kind=INVENTORY_LINK_KIND_SYNTAX,
+            relation_kind=INVENTORY_LINK_KIND_RELATION,
+        )
         next_links = [uri for uri, rel in links if rel == "next"]
         last_links = [uri for uri, rel in links if rel == "last"]
         if len(next_links) > 1 or len(last_links) > 1:
-            raise ReleaseError("package", "inventory-link")
+            raise ReleaseError("package", INVENTORY_LINK_KIND_RELATION)
         next_page = None
         if next_links:
             next_page = self._inventory_nav_page(
@@ -2437,12 +2479,14 @@ class Release:
             last_page = self._inventory_nav_page(last_links[0], None)
         if last_page is not None:
             if last_page < current_page:
-                raise ReleaseError("package", "inventory-link")
+                raise ReleaseError("package", INVENTORY_LINK_KIND_NAVIGATION)
             if next_page is not None:
                 if last_page < next_page:
-                    raise ReleaseError("package", "inventory-link")
+                    raise ReleaseError(
+                        "package", INVENTORY_LINK_KIND_NAVIGATION
+                    )
             elif last_page > current_page:
-                raise ReleaseError("package", "inventory-link")
+                raise ReleaseError("package", INVENTORY_LINK_KIND_NAVIGATION)
         return next_page, last_page
 
     def _inventory_next_page(
@@ -2543,13 +2587,13 @@ class Release:
                 if expected_last is None:
                     expected_last = last_page
                 elif last_page != expected_last:
-                    raise ReleaseError("package", "inventory-link")
+                    raise ReleaseError("package", INVENTORY_LINK_KIND_LAST)
             if next_page is None:
                 if expected_last is not None and expected_last != page:
-                    raise ReleaseError("package", "inventory-link")
+                    raise ReleaseError("package", INVENTORY_LINK_KIND_LAST)
                 break
             if expected_last is not None and next_page > expected_last:
-                raise ReleaseError("package", "inventory-link")
+                raise ReleaseError("package", INVENTORY_LINK_KIND_LAST)
             if len(items) != INVENTORY_PER_PAGE:
                 raise ReleaseError("package", "inventory-incomplete")
             page = next_page
