@@ -83,8 +83,8 @@ PUBLISH_ACTION_COUNTS = {
 }
 PUBLISH_BOOTSTRAP_INPUT_BLOCK = (
     "      bootstrap_packages:\n"
-    "        description: Third confirmation to bootstrap missing GHCR packages; "
-    "never replaces publish_authorized or packages_verified\n"
+    "        description: 兼容开关：自动创建已暂停；仍要求两包已存在且为private；"
+    "不替代 publish_authorized 或 packages_verified\n"
     "        required: true\n"
     "        default: false\n"
     "        type: boolean\n"
@@ -1522,8 +1522,18 @@ class PublishWorkflowContractTests(unittest.TestCase):
                 self.assertEqual(body["type"], "boolean")
                 self.assertTrue(body["description"].strip())
 
-    def test_packages_verified_description_covers_normal_and_bootstrap(self):
+    def test_manual_input_descriptions_do_not_authorize_package_creation(self):
         inputs = self.workflow["on"]["workflow_dispatch"]["inputs"]
+        for name in MOD.PUBLISH_INPUT_NAMES:
+            with self.subTest(input=name):
+                self.assertEqual(
+                    inputs[name]["description"],
+                    MOD.PUBLISH_INPUT_DESCRIPTIONS[name],
+                )
+        self.assertEqual(
+            inputs["publish_authorized"]["description"],
+            "Explicit authorization to publish the prepared pair",
+        )
         normal = inputs["packages_verified"]["description"].lower()
         for token in (
             "normal",
@@ -1531,14 +1541,18 @@ class PublishWorkflowContractTests(unittest.TestCase):
             "linked",
             "bootstrap",
             "owner",
-            "missing",
             "risk",
         ):
             with self.subTest(token=token):
                 self.assertIn(token, normal)
-        bootstrap = inputs["bootstrap_packages"]["description"].lower()
-        self.assertIn("bootstrap", bootstrap)
-        self.assertIn("never replaces", bootstrap)
+        self.assertIn("creation is suspended", normal)
+        self.assertNotIn("missing creation", normal)
+        bootstrap = inputs["bootstrap_packages"]["description"]
+        for token in ("兼容开关", "自动创建已暂停", "两包已存在", "private"):
+            with self.subTest(token=token):
+                self.assertIn(token, bootstrap)
+        self.assertNotIn("Third confirmation", bootstrap)
+        self.assertNotIn("never replaces", bootstrap)
 
     def test_prepare_gate_fails_closed(self):
         step = _step(
@@ -2686,6 +2700,43 @@ class PublishWorkflowMutationTests(unittest.TestCase):
 
     def test_mutation_bootstrap_input_omitted_is_rejected(self):
         text = self.text.replace(PUBLISH_BOOTSTRAP_INPUT_BLOCK, "", 1)
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "publish-workflow-trigger-inputs",
+            {issue.kind for issue in issues},
+        )
+
+    def test_mutation_bootstrap_description_restores_creation_is_rejected(self):
+        current = MOD.PUBLISH_INPUT_DESCRIPTIONS["bootstrap_packages"]
+        legacy = (
+            "Third confirmation to bootstrap missing GHCR packages; "
+            "never replaces publish_authorized or packages_verified"
+        )
+        text = self.text.replace(
+            f"        description: {current}\n",
+            f"        description: {legacy}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "publish-workflow-trigger-inputs",
+            {issue.kind for issue in issues},
+        )
+
+    def test_mutation_packages_verified_restores_creation_scope_is_rejected(self):
+        current = MOD.PUBLISH_INPUT_DESCRIPTIONS["packages_verified"]
+        legacy = (
+            "Package preconditions verified for normal runs (existing private "
+            "and linked packages) and bootstrap runs (owner inventory, missing "
+            "creation scope, risk)"
+        )
+        text = self.text.replace(
+            f"        description: {current}\n",
+            f"        description: {legacy}\n",
+            1,
+        )
         self.assertNotEqual(text, self.text)
         issues = self._issues_for_mutation(text)
         self.assertIn(
