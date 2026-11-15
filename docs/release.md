@@ -1,5 +1,93 @@
 # 本地镜像与受控发布
 
+## 包清单分页失败诊断（2026-11-14）
+
+真实发布运行`43599112781`、upload job `132462192508`在源码
+`3826d42167f09e783b7caeb57587c391567e132c`上报
+`package/inventory-link`。该运行的日志和摘要未记录实际Link头，
+因此不能确定是哪项导航校验失败，也不能据此认定某种URL格式就是根因。
+该次摘要的`push_attempted_roles`、`pushed_roles`均为空，
+`published=false`；按代码执行顺序，此次失败早于login/push。
+这不代表其他运行或重跑也没有副作用。
+
+本轮补固定、脱敏的分页拒绝分类：内部异常和错误日志保留细分类，
+摘要则保留原有`failure.stage=package`、`failure.kind=inventory-link`，
+以新增的可选`failure.detail`记录固定拒绝原因。
+不输出原始Link、URL、查询参数值、包清单或认证信息。
+这只是可观测性改进，不放宽路径、同源、查询参数、页号或完整分页门禁，
+也不把畸形或未知响应当作缺失包证据。
+
+旧消费者仍可精确匹配`package/inventory-link`，并忽略未知字段；
+需要具体原因的消费者再读取`failure.detail`。仅当内部错误属于以下
+固定白名单时才映射，不按任意字符串前缀归类。
+其他错误保留原有`stage/kind`，不增加`detail`；成功摘要不增加错误详情。
+
+例如查询参数校验失败的摘要为：
+
+```json
+{"stage":"package","kind":"inventory-link","detail":"inventory-link-query"}
+```
+
+| detail（亦为内部异常及日志的细kind） | 拒绝条件 |
+| --- | --- |
+| `inventory-link-url` | URL解析失败、非法端口格式或fragment |
+| `inventory-link-origin` | 协议、主机、端口或用户信息不符 |
+| `inventory-link-path` | 路径不符 |
+| `inventory-link-query` | 查询语法、键集合或固定参数值不符 |
+| `inventory-link-page` | 页号格式、数量或next连续性不符 |
+| `inventory-link-syntax` | Link头或参数语法不符 |
+| `inventory-link-relation` | rel缺失、多值、未知或重复 |
+| `inventory-link-navigation` | 同一响应的next/last关系不一致 |
+| `inventory-link-last` | 跨页last改变、提前终止或next越界 |
+
+在获取具体拒绝原因前不凭猜测扩大接受集合。下方记录后续只读调查证据和
+据此实施的兼容性修复；未执行初始化、发布或部署，
+重跑发布仍须另行授权，不能用重跑试探包状态。
+
+负责人随后批准临时只读Actions诊断：仅在修复分支的受限push事件中运行，
+复用现有审计Secret读取身份和包清单，在内存中检查分页响应，
+只输出固定分类及结构判断，不输出原始响应或包数据。
+该诊断不调用发布入口，不授予包写权限，不合并main；取得结果后移除临时工作流。
+本地GitHub CLI凭据的Packages请求返回403，不代表Actions审计Secret无效。
+诊断结果如下；临时工作流、诊断脚本及第四工作流合同例外在取证后清理，
+不作为永久发布能力保留。
+
+### 实际响应证据
+
+只读诊断运行`43617184884`（提交`844fba2cf01b941e03dcc5c3cfc17711b6f0e930`）
+已真实执行：身份校验成功、scope为`read:packages`，首页返回唯一`last`关系，
+页号为`0`。路径仍为标准authenticated-user包清单路径，
+协议、主机及`package_type=container`、`per_page=100`均匹配，
+没有额外查询键或未知关系；因此本次拒绝明确为`inventory-link-page`，
+不是路径规范化、Secret缺失或权限不足。
+
+该观测复现了相同校验层的失败，但原运行未保留Link，不能声称恢复了原始响应。
+修复后只读诊断运行[`43619979740`](https://github.com/xtianxx/payment-hub/actions/runs/43619979740)
+（提交`fe8361f41e9134cfb24cb27ab8c6656334433bf6`）成功，并明确记录
+`inventory_empty=true`、`inventory_pages=1`、`inventory_result=accepted`；
+实际响应仍为标准路径、唯一`last=0`。这证实了空清单零页终态的真实边界，
+不是Secret不生效，也不是路径或额外查询参数不兼容。
+
+修复仅在实际首页数组为空、唯一链接为通过原有URL与查询校验的`last`、
+页号精确为`0`时接受为空清单终态，绝不请求page 0。
+不能全局允许零页号或忽略分页头；非空清单、后续页、`next=0`、
+重复页号、`00`、额外查询参数及其他畸形格式继续拒绝。
+HTTP适配器同时保留全部重复Link字段，按逗号合并后交给完整解析器；
+不能因字典覆盖丢掉一个`next`而误认唯一`last=0`。
+合并后的头仍受原长度限制，重定向拒绝、请求预算和完整分页校验不变。
+
+空清单只证明审计读取结果；正常发布仍因目标缺失而拒绝，
+不自动获得初始化许可。bootstrap仍须三项明确确认及原有owner、private、
+仓库关联、镜像内容和推送前后验证门禁。只读成功不等于GHCR上传、
+首次创建、仓库关联或按digest拉回已通过。
+
+清理后本地验证：`python3 -B -m unittest discover -s scripts -p 'test_*.py'`
+通过1085项测试；`scripts/check-ci-contract.py --go <固定Go1.27.4绝对路径>`、
+`go test -mod=readonly -run '^TestReleaseGates$' -count=1 -p=1 -timeout=90s ./tests`
+及`git diff --check origin/main`均退出0。
+两个CI合同文件与main字节一致，最终只保留发布脚本、对应测试与本文档的变化。
+这些本地验证不替代新提交的PR/main远端检查。
+
 ## GHCR首次初始化修复（2026-11-14）
 
 本节描述`fix/ghcr-bootstrap`分支中的修复；合并main后才会进入正式工作流，尚未在真实发布中验证。后文历史状态保留原始证据，不作为当前操作步骤。
