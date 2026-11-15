@@ -12,6 +12,8 @@
 设为true且任一目标缺失时仍失败；两包已满足要求时只执行同样的正常更新。
 缺失判断、空清单`last=0`兼容和只读审计保留，不能将空清单解释为创建许可。
 负责人已明确将两包的目标可见性从private改为public；private和internal包不满足当前策略。
+此具名策略修订同时记录于[Git协作规范](git-workflow.md#5-发布标签与回退)，
+不构成公开凭据、敏感数据或任意其他软件包的授权。
 源码仓库可见性仍独立，不以`repository.private`的值替代包自身可见性检查。
 public包可匿名读取且不能直接改回private，公开包内容不应包含任何凭据或敏感数据。
 
@@ -76,6 +78,40 @@ owner确认migrate原本为Public，但独立匿名页面返回404、
 这些响应不能单独区分缺失、私有、名称不符或访问限制。
 本地CLI缺少`read:packages`且没有可用的已登录管理浏览器，因此本轮未写入任何远端包设置。
 恢复发布前仍需核对准确包名、public属性及仓库关联，不能用本地测试代替。
+
+### 公开镜像对的消费门禁
+
+两个GHCR仓库的push不是原子事务。app推送成功而migrate或后续验证失败时，
+app标签仍可能已经被匿名读取；失败不会隐藏、撤销或自动删除已公开内容。
+源码标签、单个包页面、一个digest可拉取或某次push成功，
+都不是“完整镜像对已发布”的承诺，不得据此部署或更新。
+
+消费者（包括人工部署操作者和后续自动化）必须先满足以下全部条件：
+
+1. 从受信仓库取得对应发布run及attempt的`release-summary.json`，
+   核对该run的源码SHA和预期交付SHA一致；不拼接不同run、attempt或源码的两份结果。
+   发布工作流必须全部结束且结论为success；仅prepare、PR CI或单个job成功不够。
+2. 摘要必须为`payment-hub.release-summary.v1`、`stage=publish`、
+   `outcome=pass`、`published=true`、`failure=null`，
+   且`credentials_removed=true`、`cleanup_failed=false`。
+   缺失、未知、矛盾或任何失败状态均拒绝消费，不默认成功。
+3. `descriptor_sha256`必须匹配该run受信交接值，descriptor源码SHA也须一致。
+   `pushed_roles`必须包含且仅包含app和migrate，二者的`push_side_effects`均为`verified`；
+   两role的`push.exit`均为0，且各自`push.candidate_digest`、`remote.digest`
+   与descriptor中的对应`root_descriptor.digest`一致；
+   两role的`pull.exit`均为0、`pull.id`与descriptor中的对应`local_id`一致。
+   两包`packages_postcheck`元数据必须完整且符合public、owner、仓库及原ID要求，
+   `revalidation.result`必须为`pass`。
+   单role完成或`unknown`副作用均不是可用发布对；
+   即使两项都为`verified`，也不能跳过pull、重新验收及整体成功判断。
+4. 使用该摘要中经验证、属于相同源码及交接描述的两个registry digest固定镜像引用，
+   不用可移动tag代替digest，也不与历史版本的另一个角色混配。
+   公开下载权限本身不代表这些镜像已获验收或部署授权。
+
+目前没有自动阻止匿名用户下载半成品标签的机制，任意外部读者不受文档技术约束。
+本消费门禁定义受控消费者何时可将镜像对视为完成，不声称在两包验证前隐藏镜像，
+也不新增自动部署或原子发布服务。
+不满足上述条件时只能保留诊断和部分副作用记录，等待负责人另行处置。
 
 ### 暂停创建策略的上线与发布检查清单
 
@@ -269,6 +305,15 @@ push后检查只能检测问题，不能保证阻止首次暴露；包一旦publ
 `payment-hub.release-summary.v1`的对象字段允许向后兼容地追加；消费者应读取其需要的已知字段，并忽略未知字段，不把旧字段集合当作封闭schema。本次新增审计、初始包状态、push尝试及副作用字段，不删除或改变原有字段的类型与含义；不能只检查旧`pushed_roles`就推断没有远端副作用。
 
 后续若需删除既有字段、改变其类型或含义，应评估并升级schema版本及迁移方式。历史v1摘要不重写；仅新增字段不自动升级为v2。仓内当前消费者按字段读取，未发现release-summary封闭字段集消费者；此检索不保证仓外不存在自行实现的严格消费者。
+
+`limits`是描述当前实现边界的开放风险标识列表，不是封闭枚举、成功状态或授权条件；
+标识可随实际策略更新，消费者应保留未知项用于风险审阅，
+不能据某项缺失或出现未知项就将失败当作成功。
+当前公开包策略用`package-visibility-check-not-atomic`描述可见性检查的非原子性，
+并用`pair-publication-not-atomic`明确成对发布不是原子事务，
+不再生成已过时的`initial-default-private-contract-not-atomic`。
+历史摘要及其风险标识不改写；保持v1不等于保证仓外精确匹配旧列表的实现完全不受影响。
+完整发布的成功判断以顶部消费门禁为准，不以`limits`列表推断。
 
 ### 官方依据
 

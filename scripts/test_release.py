@@ -1674,6 +1674,36 @@ class PublishTests(ReleaseTestBase):
         self.fake = FakeRunner(self.pair)
         self.http = FakeHTTP(self.pair)
 
+    def _assert_failed_publish_summary(
+        self,
+        summary: dict[str, Any],
+        stage: str,
+        kind: str,
+        *,
+        pushed_roles: list[str],
+        side_effects: dict[str, str],
+        pull_roles: tuple[str, ...],
+    ) -> None:
+        self.assertEqual(summary["outcome"], "fail")
+        self.assertFalse(summary["published"])
+        self.assertEqual(
+            summary["failure"], {"stage": stage, "kind": kind}
+        )
+        self.assertEqual(
+            summary["push_attempted_roles"], ["app", "migrate"]
+        )
+        self.assertEqual(summary["pushed_roles"], pushed_roles)
+        self.assertEqual(summary["push_side_effects"], side_effects)
+        self.assertEqual(set(summary["pull"]), set(pull_roles))
+        for role in pull_roles:
+            expected = (
+                self.pair.app_id
+                if role == "app"
+                else self.pair.migrate_id
+            )
+            self.assertEqual(summary["pull"][role]["id"], expected)
+        self.assertIsNone(summary["revalidation"])
+
     def test_owner_actor_and_triggering_actor_required_before_git_or_network(self):
         cases = [
             (
@@ -1831,19 +1861,24 @@ class PublishTests(ReleaseTestBase):
         root = self.base / "publish-root"
         with self.assertRaises(release.ReleaseError) as caught:
             self.run_publish(root, self.bundle, self.descriptor_sha, self.fake, self.http)
-        self.assertEqual((caught.exception.stage, caught.exception.kind), ("push", "migrate-failed"))
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("push", "migrate-failed"),
+        )
         summary = json.loads((root / release.SUMMARY_FILE).read_text())
-        self.assertFalse(summary["published"])
-        self.assertEqual(summary["pushed_roles"], ["app"])
-        self.assertEqual(
-            summary["push_attempted_roles"], ["app", "migrate"]
+        self._assert_failed_publish_summary(
+            summary,
+            "push",
+            "migrate-failed",
+            pushed_roles=["app"],
+            side_effects={
+                "app": "verified",
+                "migrate": "unknown",
+            },
+            pull_roles=(),
         )
-        self.assertEqual(
-            summary["push_side_effects"],
-            {"app": "verified", "migrate": "unknown"},
-        )
-        self.assertEqual(summary["pull"], {})
-        self.assertIsNone(summary["revalidation"])
+        self.assertEqual(set(summary["push"]), {"app"})
+        self.assertEqual(set(summary["remote"]), {"app"})
 
     def test_remote_header_digest_mismatch_rejected(self):
         self.http.manifest_header_override = {"app": "sha256:" + "9" * 64}
@@ -1935,18 +1970,46 @@ class PublishTests(ReleaseTestBase):
         root = self.base / "publish-root"
         with self.assertRaises(release.ReleaseError) as caught:
             self.run_publish(root, self.bundle, self.descriptor_sha, self.fake, self.http)
-        self.assertEqual((caught.exception.stage, caught.exception.kind), ("pull", "app-failed"))
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("pull", "app-failed"),
+        )
         summary = json.loads((root / release.SUMMARY_FILE).read_text())
-        self.assertFalse(summary["published"])
+        self._assert_failed_publish_summary(
+            summary,
+            "pull",
+            "app-failed",
+            pushed_roles=["app", "migrate"],
+            side_effects={
+                "app": "verified",
+                "migrate": "verified",
+            },
+            pull_roles=(),
+        )
+        self.assertEqual(len(self.fake.push_calls), 2)
 
     def test_pull_identity_change_is_not_published(self):
         self.fake.after_pull_ids = {"app": "sha256:" + "9" * 64}
         root = self.base / "publish-root"
         with self.assertRaises(release.ReleaseError) as caught:
             self.run_publish(root, self.bundle, self.descriptor_sha, self.fake, self.http)
-        self.assertEqual((caught.exception.stage, caught.exception.kind), ("pull", "app-id"))
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("pull", "app-id"),
+        )
         summary = json.loads((root / release.SUMMARY_FILE).read_text())
-        self.assertFalse(summary["published"])
+        self._assert_failed_publish_summary(
+            summary,
+            "pull",
+            "app-id",
+            pushed_roles=["app", "migrate"],
+            side_effects={
+                "app": "verified",
+                "migrate": "verified",
+            },
+            pull_roles=(),
+        )
+        self.assertEqual(len(self.fake.push_calls), 2)
 
     def test_load_root_mismatch_rejected(self):
         self.fake.local_root_override = {
@@ -2003,16 +2066,46 @@ class PublishTests(ReleaseTestBase):
         root = self.base / "publish-root"
         with self.assertRaises(release.ReleaseError) as caught:
             self.run_publish(root, self.bundle, self.descriptor_sha, self.fake, self.http)
-        self.assertEqual((caught.exception.stage, caught.exception.kind), ("revalidation", "check-images"))
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("revalidation", "check-images"),
+        )
         summary = json.loads((root / release.SUMMARY_FILE).read_text())
-        self.assertFalse(summary["published"])
+        self._assert_failed_publish_summary(
+            summary,
+            "revalidation",
+            "check-images",
+            pushed_roles=["app", "migrate"],
+            side_effects={
+                "app": "verified",
+                "migrate": "verified",
+            },
+            pull_roles=("app", "migrate"),
+        )
+        self.assertEqual(len(self.fake.push_calls), 2)
 
     def test_revalidation_bad_report_is_not_published(self):
         self.fake.revalidation_bad_report = True
         root = self.base / "publish-root"
         with self.assertRaises(release.ReleaseError) as caught:
             self.run_publish(root, self.bundle, self.descriptor_sha, self.fake, self.http)
-        self.assertEqual((caught.exception.stage, caught.exception.kind), ("revalidation", "check-images"))
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("revalidation", "check-images"),
+        )
+        summary = json.loads((root / release.SUMMARY_FILE).read_text())
+        self._assert_failed_publish_summary(
+            summary,
+            "revalidation",
+            "check-images",
+            pushed_roles=["app", "migrate"],
+            side_effects={
+                "app": "verified",
+                "migrate": "verified",
+            },
+            pull_roles=("app", "migrate"),
+        )
+        self.assertEqual(len(self.fake.push_calls), 2)
 
     def test_push_cleanup_failure_is_reported(self):
         self.fake.push_cleanup_failed = True
@@ -2602,6 +2695,16 @@ class PackageInventoryTests(ReleaseTestBase):
     def _summary(self, root: Path) -> dict[str, Any]:
         return json.loads((root / release.SUMMARY_FILE).read_text())
 
+    def _assert_limits(self, summary: dict[str, Any]) -> None:
+        self.assertIn(
+            "package-visibility-check-not-atomic", summary["limits"]
+        )
+        self.assertIn("pair-publication-not-atomic", summary["limits"])
+        self.assertNotIn(
+            "initial-default-private-contract-not-atomic",
+            summary["limits"],
+        )
+
     @staticmethod
     def _empty_terminal_link() -> str:
         return (
@@ -2626,8 +2729,18 @@ class PackageInventoryTests(ReleaseTestBase):
         *,
         anonymous_manifest: bool = False,
     ) -> None:
+        self.assertEqual(summary["outcome"], "pass")
         self.assertTrue(summary["published"])
+        self.assertIsNone(summary["failure"])
         self.assertEqual(len(self.fake.push_calls), 2)
+        self.assertEqual(
+            summary["push_attempted_roles"], ["app", "migrate"]
+        )
+        self.assertEqual(summary["pushed_roles"], ["app", "migrate"])
+        self.assertEqual(
+            summary["push_side_effects"],
+            {"app": "verified", "migrate": "verified"},
+        )
         for role in release.ROLES:
             expected = (
                 self.pair.app_id if role == "app" else self.pair.migrate_id
@@ -2695,8 +2808,11 @@ class PackageInventoryTests(ReleaseTestBase):
         code, root = self._publish()
         self.assertEqual(code, 0)
         summary = self._summary(root)
+        self.assertEqual(summary["outcome"], "pass")
         self.assertTrue(summary["published"])
+        self.assertIsNone(summary["failure"])
         self.assertFalse(summary["bootstrap_requested"])
+        self._assert_limits(summary)
         self.assertEqual(
             summary["packages_initial"],
             {
@@ -2723,6 +2839,9 @@ class PackageInventoryTests(ReleaseTestBase):
         )
         self.assertEqual(
             summary["push_attempted_roles"], ["app", "migrate"]
+        )
+        self.assertEqual(
+            summary["pushed_roles"], ["app", "migrate"]
         )
         self.assertEqual(
             summary["push_side_effects"],
@@ -3292,6 +3411,7 @@ class PackageInventoryTests(ReleaseTestBase):
         self.assertEqual(self.fake.login_calls, 0)
         self.assertEqual(self.fake.push_calls, [])
         summary = self._summary(self.base / "publish-root")
+        self._assert_limits(summary)
         self.assertEqual(
             summary["packages_initial"],
             {

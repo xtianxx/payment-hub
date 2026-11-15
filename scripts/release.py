@@ -3061,7 +3061,8 @@ class Release:
             "failure": _summary_failure(state.get("failure")),
             "limits": [
                 "package-inventory-not-atomic",
-                "initial-default-private-contract-not-atomic",
+                "package-visibility-check-not-atomic",
+                "pair-publication-not-atomic",
                 "postcheck-detects-not-prevents-first-exposure",
                 "package-deletion-race-not-excluded",
                 "pre-push-tag-identity-check-not-atomic",
