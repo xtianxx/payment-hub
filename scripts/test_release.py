@@ -2783,85 +2783,240 @@ class PackageInventoryTests(ReleaseTestBase):
         )
         self.assertFalse(summary["bootstrap_requested"])
 
-    def test_bootstrap_zero_existing_creates_both(self):
-        self.http.packages["app"] = None
-        self.http.packages["migrate"] = None
-        code, root = self._publish(bootstrap=True)
-        self.assertEqual(code, 0)
-        summary = self._summary(root)
-        self.assertTrue(summary["published"])
-        self.assertTrue(summary["bootstrap_requested"])
-        self.assertEqual(
-            summary["packages_initial"],
-            {
-                "app": {"status": "ABSENT_CONFIRMED", "id": None},
-                "migrate": {"status": "ABSENT_CONFIRMED", "id": None},
-            },
-        )
-        self.assertEqual(
-            summary["packages_postcheck"]["app"]["id"], 201
-        )
-        self.assertEqual(
-            summary["packages_postcheck"]["migrate"]["id"], 202
-        )
-        self.assertEqual(self.fake.push_calls[0].count("payment-hub-app"), 1)
-        self.assertNotIn("created_roles", summary)
+    def test_missing_packages_rejected_before_prepare_or_docker(self):
+        cases = [
+            (
+                "both-missing-normal",
+                False,
+                True,
+                True,
+                None,
+                False,
+                "app-absent",
+            ),
+            (
+                "both-missing-bootstrap",
+                True,
+                True,
+                True,
+                None,
+                False,
+                "app-absent",
+            ),
+            (
+                "app-missing-normal",
+                False,
+                True,
+                False,
+                None,
+                False,
+                "app-absent",
+            ),
+            (
+                "app-missing-bootstrap",
+                True,
+                True,
+                False,
+                None,
+                False,
+                "app-absent",
+            ),
+            (
+                "migrate-missing-normal",
+                False,
+                False,
+                True,
+                None,
+                False,
+                "migrate-absent",
+            ),
+            (
+                "migrate-missing-bootstrap",
+                True,
+                False,
+                True,
+                None,
+                False,
+                "migrate-absent",
+            ),
+            (
+                "both-missing-public-repo-bootstrap",
+                True,
+                True,
+                True,
+                False,
+                False,
+                "app-absent",
+            ),
+            (
+                "migrate-missing-public-repo-bootstrap",
+                True,
+                False,
+                True,
+                False,
+                False,
+                "migrate-absent",
+            ),
+            (
+                "both-missing-empty-terminal-bootstrap",
+                True,
+                True,
+                True,
+                None,
+                True,
+                "app-absent",
+            ),
+        ]
+        for (
+            label,
+            bootstrap,
+            app_missing,
+            migrate_missing,
+            repository_private,
+            empty_terminal,
+            kind,
+        ) in cases:
+            with self.subTest(label=label):
+                self._rewire(repository_private=repository_private)
+                if app_missing:
+                    self.http.packages["app"] = None
+                if migrate_missing:
+                    self.http.packages["migrate"] = None
+                if empty_terminal:
+                    self.http.inventory_page_overrides = {1: []}
+                    self.http.inventory_link_overrides = {
+                        1: self._empty_terminal_link()
+                    }
+                prepare_result = {
+                    "requested": False,
+                    "postgres_pull": "not-run",
+                    "module_prepare": "not-run",
+                    "precompile_only": "not-run",
+                }
+                with mock.patch.object(
+                    release.Release,
+                    "_prepare_publish_inputs",
+                    return_value=prepare_result,
+                ) as prepare:
+                    with self.assertRaises(
+                        release.ReleaseError
+                    ) as caught:
+                        self._publish(
+                            bootstrap=bootstrap,
+                            name=f"publish-{label}",
+                        )
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("package", kind),
+                )
+                prepare.assert_not_called()
+                self.assertEqual(self.fake.login_calls, 0)
+                self.assertEqual(self.fake.push_calls, [])
+                docker_verbs = [
+                    call["argv"][1]
+                    for call in self.fake.calls
+                    if len(call["argv"]) > 1
+                    and Path(call["argv"][0]).name == "docker"
+                ]
+                for verb in ("load", "login", "tag", "push"):
+                    self.assertNotIn(verb, docker_verbs)
+                summary = self._summary(
+                    self.base / f"publish-{label}"
+                )
+                self.assertFalse(summary["published"])
+                self.assertEqual(summary["push_attempted_roles"], [])
+                self.assertEqual(summary["pushed_roles"], [])
+                self.assertEqual(summary["push"], {})
+                self.assertEqual(summary["remote"], {})
+                self.assertEqual(summary["pull"], {})
+                self.assertIsNone(summary["revalidation"])
+                self.assertEqual(
+                    summary["failure"],
+                    {"stage": "package", "kind": kind},
+                )
+                self.assertEqual(
+                    set(summary["failure"]), {"stage", "kind"}
+                )
+                self.assertEqual(
+                    summary["bootstrap_requested"], bootstrap
+                )
+                self.assertEqual(
+                    summary["packages_initial"],
+                    {
+                        "app": {
+                            "status": (
+                                "ABSENT_CONFIRMED"
+                                if app_missing
+                                else "EXISTING_VALID"
+                            ),
+                            "id": (
+                                None
+                                if app_missing
+                                else APP_PACKAGE_ID
+                            ),
+                        },
+                        "migrate": {
+                            "status": (
+                                "ABSENT_CONFIRMED"
+                                if migrate_missing
+                                else "EXISTING_VALID"
+                            ),
+                            "id": (
+                                None
+                                if migrate_missing
+                                else MIGRATE_PACKAGE_ID
+                            ),
+                        },
+                    },
+                )
 
-    def test_bootstrap_all_missing_with_public_repository_continues_after_first_push(
-        self,
-    ):
-        self._rewire(repository_private=False)
-        self.http.packages["app"] = None
-        self.http.packages["migrate"] = None
-        code, root = self._publish(bootstrap=True)
-        self.assertEqual(code, 0)
-        summary = self._summary(root)
-        self._assert_successful_pair_publish(summary)
-        self.assertEqual(
-            summary["packages_initial"],
-            {
-                "app": {"status": "ABSENT_CONFIRMED", "id": None},
-                "migrate": {"status": "ABSENT_CONFIRMED", "id": None},
-            },
-        )
-        self.assertEqual(summary["packages_postcheck"]["app"]["id"], 201)
-        self.assertEqual(
-            summary["packages_postcheck"]["migrate"]["id"], 202
-        )
-
-    def test_bootstrap_one_existing_creates_only_missing(self):
-        self.http.packages["app"] = None
-        code, root = self._publish(bootstrap=True)
-        self.assertEqual(code, 0)
-        summary = self._summary(root)
-        self.assertEqual(
-            summary["packages_initial"]["app"]["status"], "ABSENT_CONFIRMED"
-        )
-        self.assertEqual(
-            summary["packages_initial"]["migrate"]["status"], "EXISTING_VALID"
-        )
-        self.assertEqual(
-            summary["packages_initial"]["migrate"]["id"], MIGRATE_PACKAGE_ID
-        )
-        self.assertEqual(summary["packages_postcheck"]["app"]["id"], 201)
-
-    def test_bootstrap_mixed_with_public_repository_succeeds(self):
-        self._rewire(repository_private=False)
-        self.http.packages["migrate"] = None
-        code, root = self._publish(bootstrap=True)
-        self.assertEqual(code, 0)
-        summary = self._summary(root)
-        self._assert_successful_pair_publish(summary)
-        self.assertEqual(
-            summary["packages_initial"]["app"]["status"], "EXISTING_VALID"
-        )
-        self.assertEqual(
-            summary["packages_initial"]["migrate"]["status"],
-            "ABSENT_CONFIRMED",
-        )
-        self.assertEqual(
-            summary["packages_postcheck"]["migrate"]["id"], 202
-        )
+    def test_existing_private_packages_succeed_for_both_bootstrap_flags(self):
+        for bootstrap in (False, True):
+            for repository_private in (False, True):
+                label = f"{bootstrap}-{repository_private}"
+                with self.subTest(label=label):
+                    self._rewire(
+                        repository_private=repository_private
+                    )
+                    code, root = self._publish(
+                        bootstrap=bootstrap,
+                        name=f"publish-existing-{label}",
+                    )
+                    self.assertEqual(code, 0)
+                    summary = self._summary(root)
+                    self._assert_successful_pair_publish(summary)
+                    self.assertEqual(
+                        summary["bootstrap_requested"], bootstrap
+                    )
+                    self.assertEqual(
+                        summary["packages_initial"],
+                        {
+                            "app": {
+                                "status": "EXISTING_VALID",
+                                "id": APP_PACKAGE_ID,
+                            },
+                            "migrate": {
+                                "status": "EXISTING_VALID",
+                                "id": MIGRATE_PACKAGE_ID,
+                            },
+                        },
+                    )
+                    self.assertEqual(
+                        summary["packages_postcheck"]["app"]["id"],
+                        APP_PACKAGE_ID,
+                    )
+                    self.assertEqual(
+                        summary["packages_postcheck"]["migrate"]["id"],
+                        MIGRATE_PACKAGE_ID,
+                    )
+                    self.assertEqual(
+                        summary["push_attempted_roles"],
+                        ["app", "migrate"],
+                    )
+                    self.assertEqual(
+                        summary["pushed_roles"], ["app", "migrate"]
+                    )
+                    self.assertNotIn("created_roles", summary)
 
     def test_bootstrap_two_existing_is_allowed(self):
         code, root = self._publish(bootstrap=True)
@@ -2875,37 +3030,12 @@ class PackageInventoryTests(ReleaseTestBase):
             summary["packages_initial"]["migrate"]["id"],
             MIGRATE_PACKAGE_ID,
         )
-
-    def test_bootstrap_empty_first_page_last_zero_creates_both(self):
-        self.http.packages["app"] = None
-        self.http.packages["migrate"] = None
-        self.http.inventory_page_overrides = {1: []}
-        self.http.inventory_link_overrides = {
-            1: self._empty_terminal_link()
-        }
-
-        def mutate(session: int, page: int) -> None:
-            if session == 3:
-                self.http.inventory_page_overrides.pop(1, None)
-                self.http.inventory_link_overrides.pop(1, None)
-
-        self.http.inventory_page_callback = mutate
-        code, root = self._publish(bootstrap=True)
-        self.assertEqual(code, 0)
-        summary = self._summary(root)
-        self._assert_successful_pair_publish(summary)
         self.assertEqual(
-            summary["packages_initial"],
-            {
-                "app": {"status": "ABSENT_CONFIRMED", "id": None},
-                "migrate": {"status": "ABSENT_CONFIRMED", "id": None},
-            },
+            summary["packages_postcheck"]["app"]["id"], APP_PACKAGE_ID
         )
         self.assertEqual(
-            summary["packages_postcheck"]["app"]["id"], 201
-        )
-        self.assertEqual(
-            summary["packages_postcheck"]["migrate"]["id"], 202
+            summary["packages_postcheck"]["migrate"]["id"],
+            MIGRATE_PACKAGE_ID,
         )
 
     def test_normal_empty_first_page_last_zero_is_not_created(self):
@@ -3031,16 +3161,20 @@ class PackageInventoryTests(ReleaseTestBase):
             ),
         ]
         for label, metadata, kind in cases:
-            with self.subTest(label=label):
-                self._rewire()
-                self.http.packages["app"] = metadata
-                with self.assertRaises(release.ReleaseError) as caught:
-                    self._publish(name=f"root-{label}")
-                self.assertEqual(
-                    (caught.exception.stage, caught.exception.kind),
-                    ("package", kind),
-                )
-                self.assertEqual(self.fake.push_calls, [])
+            for bootstrap in (False, True):
+                with self.subTest(label=label, bootstrap=bootstrap):
+                    self._rewire()
+                    self.http.packages["app"] = metadata
+                    with self.assertRaises(release.ReleaseError) as caught:
+                        self._publish(
+                            bootstrap=bootstrap,
+                            name=f"root-{label}-{bootstrap}",
+                        )
+                    self.assertEqual(
+                        (caught.exception.stage, caught.exception.kind),
+                        ("package", kind),
+                    )
+                    self.assertEqual(self.fake.push_calls, [])
 
     def test_direct_metadata_name_mismatch_rejected(self):
         self.http.package_failures = {
@@ -3826,8 +3960,6 @@ class PackageInventoryTests(ReleaseTestBase):
         self.assertEqual(self.fake.push_calls, [])
 
     def test_bootstrap_existing_disappearance_is_not_downgraded_to_create(self):
-        self.http.packages["migrate"] = None
-
         def mutate(session: int, page: int) -> None:
             if session == 2:
                 self.http.packages["app"] = None
@@ -3840,24 +3972,41 @@ class PackageInventoryTests(ReleaseTestBase):
             ("package", "app-missing"),
         )
         self.assertEqual(self.fake.push_calls, [])
+        summary = self._summary(self.base / "publish-root")
+        self.assertTrue(summary["bootstrap_requested"])
+        self.assertEqual(summary["push_attempted_roles"], [])
+        self.assertEqual(
+            summary["failure"],
+            {"stage": "package", "kind": "app-missing"},
+        )
 
-    def test_absent_package_appears_before_push_rejected(self):
-        self.http.packages["app"] = None
-
-        def mutate(session: int, page: int) -> None:
-            if session == 2:
-                self.http.packages["app"] = package_metadata(
-                    "app", package_id=999
+    def test_refresh_rejects_absent_package_appearing(self):
+        expected = {
+            role: {"status": "ABSENT_CONFIRMED", "id": None}
+            for role in release.ROLES
+        }
+        current = {
+            role: {"status": "ABSENT_CONFIRMED", "id": None}
+            for role in release.ROLES
+        }
+        current["app"] = {"status": "EXISTING_VALID", "id": 999}
+        instance = release.Release(
+            repo=self.repo, http=self.http, env=self.env
+        )
+        with mock.patch.object(
+            instance,
+            "_inventory_packages",
+            return_value=(current, {}),
+        ) as inventory:
+            with self.assertRaises(release.ReleaseError) as caught:
+                instance._refresh_package_expectations(
+                    AUDIT_TOKEN, expected
                 )
-
-        self.http.inventory_page_callback = mutate
-        with self.assertRaises(release.ReleaseError) as caught:
-            self._publish(bootstrap=True)
         self.assertEqual(
             (caught.exception.stage, caught.exception.kind),
             ("package", "app-appeared"),
         )
-        self.assertEqual(self.fake.push_calls, [])
+        inventory.assert_called_once_with(AUDIT_TOKEN)
 
     def test_existing_package_id_changes_before_push_rejected(self):
         def mutate(session: int, page: int) -> None:
@@ -4030,6 +4179,10 @@ class PackageInventoryTests(ReleaseTestBase):
             (caught.exception.stage, caught.exception.kind),
             ("cli", "bootstrap-stage"),
         )
+
+    def test_bootstrap_cli_help_marks_creation_paused(self):
+        help_text = release._build_parser().format_help()
+        self.assertIn("兼容开关，自动创建已暂停", help_text)
 
     def test_prepare_never_passes_either_token_to_children(self):
         code, root, fake = self.run_prepare()

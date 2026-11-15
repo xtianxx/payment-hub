@@ -206,6 +206,21 @@ PUBLISH_INPUT_NAMES = (
     "packages_verified",
     "bootstrap_packages",
 )
+# Manual package creation is paused: bootstrap_packages is only a compatibility
+# switch.  The workflow must keep the two existing private packages, and the
+# descriptions must not claim that creation is authorized.
+PUBLISH_INPUT_DESCRIPTIONS = {
+    "publish_authorized": "Explicit authorization to publish the prepared pair",
+    "packages_verified": (
+        "Package preconditions verified for normal updates (both existing "
+        "private linked packages) and bootstrap compatibility (owner inventory, "
+        "risk); automatic package creation is suspended"
+    ),
+    "bootstrap_packages": (
+        "兼容开关：自动创建已暂停；仍要求两包已存在且为private；"
+        "不替代 publish_authorized 或 packages_verified"
+    ),
+}
 PUBLISH_OWNER_GUARD = (
     "${{ github.actor == 'xtianxx' && "
     "github.triggering_actor == 'xtianxx' }}"
@@ -1361,6 +1376,8 @@ def _publish_inputs_ok(workflow: dict[str, Any]) -> bool:
             return False
         description = body.get("description")
         if not isinstance(description, str) or not description.strip():
+            return False
+        if description != PUBLISH_INPUT_DESCRIPTIONS[name]:
             return False
     return True
 

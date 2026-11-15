@@ -24,9 +24,9 @@ Fixed stages:
     digest from a fixed GHCR manifest GET, pulls by that digest, inspects the
     pulled images, and re-runs the existing image acceptance launcher against
     the original artifact.  A temporary private Docker config is always
-    removed.  No deployment is performed.  ``--bootstrap-packages`` is only a
-    third explicit confirmation for creating packages proven absent by the
-    complete inventory; it never replaces the two existing confirmations.
+    removed.  No deployment is performed.  ``--bootstrap-packages`` is retained
+    only as a compatibility flag; automatic package creation is paused and both
+    target packages must already exist as private linked packages.
 
 The script reads only a small, fixed subset of the builder and acceptance
 reports.  Raw command output, tokens, DSNs, request bodies, and environment
@@ -2689,9 +2689,8 @@ class Release:
         """Refresh the complete inventory before a push and fail closed.
 
         An initially existing package must still exist with the same ID.  An
-        initially absent package must remain absent unless this run already
-        pushed and verified it (in which case its expected state was updated
-        to the verified ID).  Any other transition stops the run.
+        initially absent package must remain absent.  Publish now passes only
+        existing expectations; any other transition stops the run.
         """
         states, metadata = self._inventory_packages(token)
         for role in ROLES:
@@ -3189,13 +3188,15 @@ class Release:
                 for role in ROLES
             }
             state["packages"] = dict(initial_metadata)
+            # Normal-only release: every target must already exist as a
+            # validated private linked package.  The compatibility flag never
+            # authorizes creation and does not relax this gate.
+            for role in ROLES:
+                if initial_states[role]["status"] != "EXISTING_VALID":
+                    raise ReleaseError("package", role + "-absent")
             expected_states = {
                 role: dict(initial_states[role]) for role in ROLES
             }
-            if not getattr(args, "bootstrap_packages", False):
-                for role in ROLES:
-                    if initial_states[role]["status"] != "EXISTING_VALID":
-                        raise ReleaseError("package", role + "-absent")
             state["prepare_inputs"] = self._prepare_publish_inputs(args, root)
             load_result = self._docker(["load", "--input", str(bundle / PAIR_FILE)])
             if load_result.timed_out or load_result.exit_code != 0:
@@ -3223,10 +3224,10 @@ class Release:
                     raise ReleaseError("auth", "login")
                 for role in ROLES:
                     # The complete inventory and every target metadata record
-                    # are refreshed immediately before each push.  An existing
-                    # package may not disappear; an absent package may not be
-                    # occupied externally.  A package this run already pushed
-                    # is checked against its verified ID instead.
+                    # are refreshed immediately before each push.  Every target
+                    # must remain existing with its original ID; a detected
+                    # absence never authorizes creation.  This is not atomic
+                    # with an external writer's subsequent deletion or update.
                     self._refresh_package_expectations(
                         audit_token, expected_states
                     )
@@ -3249,14 +3250,8 @@ class Release:
                     # credential.  Missing or bad metadata stops the run before
                     # the second package is pushed.
                     metadata = self._check_package(role, audit_token)
-                    if expected_states[role]["status"] == "EXISTING_VALID":
-                        if metadata["id"] != expected_states[role]["id"]:
-                            raise ReleaseError("package", role + "-changed")
-                    else:
-                        expected_states[role] = {
-                            "status": "EXISTING_VALID",
-                            "id": metadata["id"],
-                        }
+                    if metadata["id"] != expected_states[role]["id"]:
+                        raise ReleaseError("package", role + "-changed")
                     state["packages"][role] = metadata
                     candidate = _push_candidate_digest(push)
                     expected = descriptor["images"][role]["root_descriptor"][
@@ -3540,7 +3535,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prepare-inputs", action="store_true")
     parser.add_argument("--approve-external", action="store_true")
     parser.add_argument("--package-preconditions-verified", action="store_true")
-    parser.add_argument("--bootstrap-packages", action="store_true")
+    parser.add_argument(
+        "--bootstrap-packages",
+        action="store_true",
+        help="兼容开关，自动创建已暂停",
+    )
     parser.add_argument("--repo", default=str(REPO_ROOT))
     parser.add_argument("--git")
     parser.add_argument("--docker")

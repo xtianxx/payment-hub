@@ -1,5 +1,90 @@
 # 本地镜像与受控发布
 
+## 当前策略：仅更新已存在的private包（2026-11-15）
+
+负责人已确认暂停工作流自动创建缺失包。无论源码仓库公开或私有，
+两个目标包都必须已存在、为private、属于`xtianxx`并正确关联
+`xtianxx/payment-hub`；否则在准备发布输入、Docker load/login/tag/push前停止。
+缺失分别报告`package/app-absent`或`package/migrate-absent`。
+
+保留`bootstrap_packages`输入、`--bootstrap-packages`参数和摘要的
+`bootstrap_requested`以兼容已有调用，但它们不再授权创建包。
+设为true且任一目标缺失时仍失败；两包已满足要求时只执行同样的正常更新。
+缺失判断、空清单`last=0`兼容和只读审计保留，不能将空清单解释为创建许可。
+已有private包可以关联公开源码仓库，不以`repository.private=false`拒绝它。
+
+### 本次失败证据及处置边界
+
+运行[`43677641633`](https://github.com/xtianxx/payment-hub/actions/runs/43677641633)
+（源码`fbdab728aa9e16485ac50077c52970bab51b4230`）的prepare通过，
+两包初查缺失；app push正常返回后，包元数据可见性校验报`package/app-visibility`，
+migrate未尝试。摘要`push_attempted_roles=["app"]`、
+`push_side_effects.app="unknown"`及空`pushed_roles`不代表没有远端写入。
+后续匿名读取该次app源码标签manifest返回HTTP 200，证明它当时可公开读取。
+这不是“没有上传成功”的无副作用失败。
+
+[Actions创建包的默认规则](https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions#default-permissions-and-access-settings-for-packages-modified-through-workflows)
+说明，工作流使用`GITHUB_TOKEN`创建包时默认继承仓库的可见性和权限模型。
+此前仅依赖通用首次默认private及普通仓库关联规则的判断不完整。
+该规则与本次公开仓库首次创建的执行路径及公开可读结果一致，
+但缺少包设置变更审计，不能据此声称已经排除外部操作。
+当前策略不再以任何首次默认可见性假设批准创建。
+
+本轮只修改前置门禁、回归和说明，不删除或重建现有public包，
+不改变源码仓库可见性，不扩大审计token权限，不新增写入PAT，
+不执行初始化、发布或部署。public包不能直接改回private；
+保留原名删除重建、更名及独立初始化均须另行明确授权和验证，
+不能靠重跑工作流试探。后续初始化必须使用真实已验收的配对镜像，
+不可用占位镜像冒充；当前未实现或批准此恢复路径。
+
+本门禁只阻止已检测到的缺失包进入push。完整分页和push前后重查不是原子锁，
+外部写者仍可能在最后检查后删除、重建或改变包可见性；
+不能宣称normal-only完全消除了创建竞态或首次暴露风险。
+出现部分成功或未知副作用时继续停止并人工核对，不自动重试、删除或回滚。
+本节覆盖下文历史初始化授权和首次创建步骤；当前不存在可用的自动创建模式。
+
+本轮本地验证：`python3 -B -m unittest discover -s scripts -p 'test_*.py'`
+通过1088项测试；固定Go1.27.4执行的CI合同检查、
+`go test -mod=readonly -run '^TestReleaseGates$' -count=1 -p=1 -timeout=90s ./tests`
+和差异检查均退出0。回归覆盖兼容开关开/关、两包全缺失/仅一包缺失、
+空清单`last=0`、首次Docker操作前拒绝，以及两包有效时的正常更新。
+这些是离线/fake验证，未据此重跑真实发布，也未验证任何新的初始化方式。
+
+### 暂停创建策略的上线与发布检查清单
+
+以下是操作门禁，不是新增的平台锁或自动取消功能。合并只影响后续使用新提交的运行，
+不能替换已启动任务检出的旧代码；重跑历史任务也不能假定会加载最新main。
+
+**合并前：**
+
+1. 由owner安排维护窗口，停止新增手动发布及历史发布重跑；确认没有其他仓库、
+   本地客户端或外部自动化正在写入两个目标包。
+2. 在Actions中检查`publish.yml`的全部未结束运行，包括排队、执行中、等待审批
+   或待启动状态。逐一记录run ID、attempt、源码SHA、状态及核查时间；
+   不能仅按分支名或最近一次运行判断，也不能把取消请求已受理当作已经停止。
+3. 如果存在仍使用旧创建逻辑的运行，暂停合并；获得明确取消授权后取消，
+   等待其所有作业终止，再检查摘要和实际包状态。即使显示cancelled，
+   也不能推断已发起的push被撤销。未能确认停止或远端副作用时继续保持暂停。
+4. 按Git协作规范重新核对PR head、最新main基线、必需检查和审查讨论。
+   “当前没有活动运行”只是当时快照，不能替代紧邻合并动作的再次核查；
+   维护窗口必须覆盖核查、合并及新策略生效的过程。
+
+**合并后及恢复发布前：**
+
+1. 等待合并提交对应main检查通过；不自动恢复发布。
+2. 禁止通过重跑旧run、旧job或选择旧源码SHA恢复发布。后续确有发布授权时，
+   从已包含本门禁的当前main新建运行，核对该run的实际源码SHA，
+   不复用旧运行的bundle或旧源码候选。
+3. 两包必须事先均有效且private。现有public app及缺失migrate未处置完成前保持停止；
+   删除、重建、更名及独立初始化不包含在本检查清单的授权中。
+4. 从最后一次包状态检查直到发布结束，owner及其他有权限的操作者不得删除、
+   替换目标包或更改可见性、关联和访问权限；存在外部写者或无法保证维护窗口时，
+   不开始发布。
+
+上述纪律只能降低并发风险，不能把检查和push变为原子操作。
+若要求技术上绝不创建包或绝不发生首次公开，现有normal-only门禁不满足这一保证，
+必须先批准并验证更强的写入权限边界或协调方案，不能增加一次GET就宣称风险消失。
+
 ## 包清单分页失败诊断（2026-11-14）
 
 真实发布运行`43599112781`、upload job `132462192508`在源码
@@ -77,8 +162,9 @@ HTTP适配器同时保留全部重复Link字段，按逗号合并后交给完整
 合并后的头仍受原长度限制，重定向拒绝、请求预算和完整分页校验不变。
 
 空清单只证明审计读取结果；正常发布仍因目标缺失而拒绝，
-不自动获得初始化许可。bootstrap仍须三项明确确认及原有owner、private、
-仓库关联、镜像内容和推送前后验证门禁。只读成功不等于GHCR上传、
+不自动获得初始化许可。当时保留的显式bootstrap创建路径现已按上方当前策略暂停；
+owner、private、仓库关联、镜像内容和推送前后验证门禁保持。
+只读成功不等于GHCR上传、
 首次创建、仓库关联或按digest拉回已通过。
 
 清理后本地验证：`python3 -B -m unittest discover -s scripts -p 'test_*.py'`
@@ -90,30 +176,32 @@ HTTP适配器同时保留全部重复Link字段，按逗号合并后交给完整
 
 ## GHCR首次初始化修复（2026-11-14）
 
-本节描述`fix/ghcr-bootstrap`分支中的修复；合并main后才会进入正式工作流，尚未在真实发布中验证。后文历史状态保留原始证据，不作为当前操作步骤。
+本节保留`fix/ghcr-bootstrap`修复的背景，并按当前normal-only策略更新操作约束。
+首次创建能力曾进入工作流，但已因上方真实发布证据暂停。
+后文历史状态保留原始证据，不替代当前规则。
 
 真实运行`43544040888`（源码`e12ebbd8a30fb3a764402c9db52d3bcf7207be90`）的prepare及交接已通过，upload在`Publish paired images`报`package/app-not-found`，未进入login/push。旧流程在首次push前强制要求两个包已存在，且用`/users/xtianxx/packages/container/<name>`查询私有包；该接口文档限定public包，404既不能证明私有包不存在，也不能授予创建资格。
 
-### 两种模式与共同门禁
+### 正常更新与兼容输入
 
 - **正常发布**：默认`bootstrap_packages=false`；两个目标包必须已存在、为private、属于`xtianxx`并关联`xtianxx/payment-hub`。任一缺失、不可见、元数据不符均失败。
-- **显式初始化**：仅在负责人另行批准创建缺失目标包后，设置`bootstrap_packages=true`，对应publish阶段的`--bootstrap-packages`。这只是第三项附加授权，原`publish_authorized=true`、`packages_verified=true`及两个CLI确认参数仍必须满足。
-- 初始化支持两个包全缺失、仅一个缺失、两个已存在；不为public、未关联仓库、owner或名称不符的现存包提供豁免。
+- **兼容开关**：`bootstrap_packages=true`及publish阶段的`--bootstrap-packages`不再允许创建。两包全缺失或仅一个缺失都失败；两包已存在且有效时仅正常更新。原`publish_authorized=true`、`packages_verified=true`及两个CLI确认参数仍必须满足。
+- 不为public、未关联仓库、owner或名称不符的现存包提供豁免。
 - **包与源码仓库的可见性独立**：必须为private的是GHCR包，不是关联的源码仓库。私有包关联公开的`xtianxx/payment-hub`属于允许状态；`repository.private=false`不构成拒绝理由，仓库身份仍必须精确匹配。
 - prepare不读取包审计Secret、不查询包，也不接收初始化CLI参数。PR和定时检查不获得包凭据或写权限。
 - main/SHA/clean checkout、同提交CI成功、原产物交接、load/tag身份、registry manifest、按digest拉回及重新验收保持原有严格要求，不重构建或改用另一对镜像绕过。
 
 ### 调用者限制：仅账号所有者
 
-正常发布和首次初始化都只允许`xtianxx`发起，并且重跑发起者也必须是`xtianxx`。`github.actor`与`github.triggering_actor`缺失或任一不符时拒绝，不回退为“原调用者曾获批准即可重跑”。
+正常更新（含设置兼容开关的调用）只允许`xtianxx`发起，并且重跑发起者也必须是`xtianxx`。`github.actor`与`github.triggering_actor`缺失或任一不符时拒绝，不回退为“原调用者曾获批准即可重跑”。此限制不恢复已暂停的初始化创建能力。
 
-prepare首个前置检查明确失败；upload在job条件中复核两项身份，非owner不启动带`packages: write`的作业。脚本在受信上下文检查中再次验证，不能只靠workflow传入三个true值。原有两项主确认和初始化附加确认仍然必须满足。
+prepare首个前置检查明确失败；upload在job条件中复核两项身份，非owner不启动带`packages: write`的作业。脚本在受信上下文检查中再次验证；原有两项主确认仍必须满足，把三个输入均设为true也不能授权创建缺失包。
 
 这是owner单人操作授权，不是多人独立审批。本次不配置GitHub Environment或改变仓库权限；受信工作流内的allowlist不能替代平台级Secret隔离，也不授权通过修改其他分支的工作流绕过策略。以后增加发布者或独立审批须另行确认。
 
 ### 凭据准备：只读审计与上传分离
 
-正常发布和初始化都需要独立的仓库Secret `GHCR_PACKAGE_AUDIT_TOKEN`，不再用仓库级`GITHUB_TOKEN`推断owner命名空间是否缺少某个包。
+正常更新需要独立的仓库Secret `GHCR_PACKAGE_AUDIT_TOKEN`，不使用仓库级`GITHUB_TOKEN`推断owner命名空间是否缺少某个包。兼容开关不改变凭据分工。
 
 由账号所有者在GitHub网页完成以下操作，**不要把token发到对话、命令参数、Git或日志中**：
 
@@ -126,19 +214,20 @@ prepare首个前置检查明确失败；upload在job条件中复核两项身份�
 
 写入和registry验证继续使用工作流`GITHUB_TOKEN`，仅upload job给`packages: write`。该权限包含read，不应重复增加同名`packages: read`配置。审计token绝不用于Docker login/push或registry认证。
 
-### 缺失判断与首次push后的验证
+### 已存在包判断与每次push后的验证
 
 1. 用审计token查询`GET /user`核对owner，再完整分页读取`GET /user/packages?package_type=container&per_page=100`，不按visibility过滤。
 2. 对清单内目标，使用authenticated-user接口`GET /user/packages/container/<name>`严格校验private、仓库关联、owner、name、type和package ID。不得退回public-only接口。
-3. 只有身份正确、完整清单成功且目标确实缺失，才能在显式初始化模式中获得该role的首次push资格。403、404、超时、分页不完整、畸形响应及任何未知状态均失败。
-4. 每个role push前刷新清单；已存在包消失、ID改变或缺失名称被外部占用，都停止，不自动把更新切换为创建。自身已成功推送并验证的role按新记录核对。
+3. 两包都必须已有有效元数据和稳定ID，才能继续发布准备；任一缺失即拒绝。403、404、超时、分页不完整、畸形响应及任何未知状态均失败。
+4. 每个role push前刷新清单；已存在包消失或ID改变都停止，不自动把更新切换为创建。push后继续核对原ID，不将缺失状态提升为新创建包。
 5. 每次push后立即复查private及仓库关联等元数据；失败即停止，不继续第二个包。最终再次核对两包，并保留原digest/拉回/验收链路，全部通过才记为发布成功。
 
 分页结束遵循GitHub的`Link`契约：无后续链接可表示终页，恰好100条的终页也合法，不能仅凭返回数量认定缺页。已声明未来last却缺少续链、畸形链接或跨页last不一致会失败；这不保证检测到服务端违反契约或所有并发位移。
 
 ### 必须接受的剩余风险与失败处置
 
-GHCR没有“仅当名称不存在才创建”的原子前提。完整分页、push前重查和push后验证都不是原子快照；首次private和自动仓库关联依赖GitHub契约、现有source label及工作流token。外部写者仍可能在检查与push之间占用名称或改变visibility。负责人已批准实现该受控路径，但实际使用仍须另行批准，并安排没有其他发布者操作的窗口。
+历史初始化曾在负责人接受非原子风险后实现，但现已暂停，不能继续据此批准创建。
+完整分页、push前重查和push后验证都不是原子快照；外部写者仍可能在检查与push之间删除、重建包或改变visibility。正常更新也需受控窗口，不承诺原子安全。
 
 push后检查只能检测问题，不能保证阻止首次暴露；包一旦public不能直接改回private。排他操作窗口仅降低风险，不提供零风险保证。
 
