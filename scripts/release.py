@@ -499,6 +499,32 @@ def _write_json_exclusive(path: Path, value: Mapping[str, Any]) -> None:
     _write_bytes_exclusive(path, text.encode("utf-8"))
 
 
+def _summary_failure(failure: Any) -> Any:
+    """Project one failure for release-summary v1 compatibility.
+
+    The detailed inventory-Link kinds remain internal for stderr and logs.  In
+    the summary only, the fixed taxonomy is collapsed back to the historical
+    ``package/inventory-link`` kind, with the precise whitelisted kind retained
+    in ``detail``.  Unknown, non-string, or non-package kinds are returned as a
+    plain stage/kind object and never receive ``detail``.
+    """
+    if not isinstance(failure, Mapping):
+        return failure
+    stage = failure.get("stage")
+    kind = failure.get("kind")
+    if (
+        stage == "package"
+        and isinstance(kind, str)
+        and kind in INVENTORY_LINK_KINDS
+    ):
+        return {
+            "stage": "package",
+            "kind": "inventory-link",
+            "detail": kind,
+        }
+    return {"stage": stage, "kind": kind}
+
+
 def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
     """Write one summary atomically; a partial temp is never the summary."""
     text = json.dumps(value, indent=2, sort_keys=True) + "\n"
@@ -3015,7 +3041,7 @@ class Release:
             "cleanup_failed": bool(
                 state.get("cleanup_failed", self._cancel_cleanup_failed)
             ),
-            "failure": state.get("failure"),
+            "failure": _summary_failure(state.get("failure")),
             "limits": [
                 "package-inventory-not-atomic",
                 "initial-default-private-contract-not-atomic",

@@ -10,16 +10,25 @@
 `published=false`；按代码执行顺序，此次失败早于login/push。
 这不代表其他运行或重跑也没有副作用。
 
-本轮先补固定、脱敏的分页拒绝分类，通过原有错误日志和摘要的
-`failure.stage`、`failure.kind`定位具体拒绝条件，不增加摘要字段。
+本轮补固定、脱敏的分页拒绝分类：内部异常和错误日志保留细分类，
+摘要则保留原有`failure.stage=package`、`failure.kind=inventory-link`，
+以新增的可选`failure.detail`记录固定拒绝原因。
 不输出原始Link、URL、查询参数值、包清单或认证信息。
 这只是可观测性改进，不放宽路径、同源、查询参数、页号或完整分页门禁，
 也不把畸形或未知响应当作缺失包证据。
 
-`failure.stage`仍为`package`；原`inventory-link`细分为以下固定kind，
-按旧kind精确匹配的消费者需更新，不能把新分类当作成功：
+旧消费者仍可精确匹配`package/inventory-link`，并忽略未知字段；
+需要具体原因的消费者再读取`failure.detail`。仅当内部错误属于以下
+固定白名单时才映射，不按任意字符串前缀归类。
+其他错误保留原有`stage/kind`，不增加`detail`；成功摘要不增加错误详情。
 
-| kind | 拒绝条件 |
+例如查询参数校验失败的摘要为：
+
+```json
+{"stage":"package","kind":"inventory-link","detail":"inventory-link-query"}
+```
+
+| detail（亦为内部异常及日志的细kind） | 拒绝条件 |
 | --- | --- |
 | `inventory-link-url` | URL解析失败、非法端口格式或fragment |
 | `inventory-link-origin` | 协议、主机、端口或用户信息不符 |

@@ -2074,7 +2074,11 @@ class PublishTests(ReleaseTestBase):
         self.assertEqual((caught.exception.stage, caught.exception.kind), ("handoff", "descriptor-sha"))
         summary = json.loads((root / release.SUMMARY_FILE).read_text())
         self.assertFalse(summary["published"])
-        self.assertEqual(summary["failure"], {"stage": "handoff", "kind": "descriptor-sha"})
+        self.assertEqual(
+            summary["failure"],
+            {"stage": "handoff", "kind": "descriptor-sha"},
+        )
+        self.assertEqual(set(summary["failure"]), {"stage", "kind"})
 
 
 class PackageAuditBoundaryTests(unittest.TestCase):
@@ -3609,11 +3613,175 @@ class PackageInventoryTests(ReleaseTestBase):
         summary = self._summary(self.base / "publish-root")
         self.assertEqual(
             summary["failure"],
-            {"stage": "package", "kind": "inventory-link-query"},
+            {
+                "stage": "package",
+                "kind": "inventory-link",
+                "detail": "inventory-link-query",
+            },
         )
-        self.assertEqual(set(summary["failure"]), {"stage", "kind"})
+        self.assertEqual(
+            set(summary["failure"]), {"stage", "kind", "detail"}
+        )
         self.assertNotIn(sentinel, json.dumps(summary))
         self.assertNotIn(AUDIT_TOKEN, json.dumps(summary))
+
+    def test_inventory_link_summary_compatibility_table(self):
+        base = (
+            "https://api.github.com/user/packages?"
+            "package_type=container&per_page=100&page="
+        )
+        page_one = [
+            foreign_package(index)
+            for index in range(release.INVENTORY_PER_PAGE)
+        ]
+        cases = [
+            (
+                "query",
+                {},
+                {1: f'<{base}2&extra=1>; rel="next"'},
+                "inventory-link-query",
+            ),
+            (
+                "path",
+                {},
+                {
+                    1: (
+                        "<https://api.github.com/users/123/packages?"
+                        "package_type=container&per_page=100&page=2>; "
+                        'rel="last"'
+                    )
+                },
+                "inventory-link-path",
+            ),
+            (
+                "syntax",
+                {},
+                {1: 'malformed; rel="next"'},
+                "inventory-link-syntax",
+            ),
+            (
+                "relation",
+                {},
+                {1: f"<{base}2>"},
+                "inventory-link-relation",
+            ),
+            (
+                "navigation",
+                {},
+                {1: f'<{base}2>; rel="next", <{base}1>; rel="last"'},
+                "inventory-link-navigation",
+            ),
+            (
+                "last",
+                {1: page_one},
+                {
+                    1: (
+                        f'<{base}2>; rel="next", '
+                        f'<{base}3>; rel="last"'
+                    )
+                },
+                "inventory-link-last",
+            ),
+            (
+                "page",
+                {},
+                {1: f'<{base}0>; rel="last"'},
+                "inventory-link-page",
+            ),
+            (
+                "origin",
+                {},
+                {
+                    1: (
+                        "<https://evil.example/user/packages?"
+                        "package_type=container&per_page=100&page=2>; "
+                        'rel="last"'
+                    )
+                },
+                "inventory-link-origin",
+            ),
+            (
+                "url",
+                {},
+                {1: f'<{base}2#frag>; rel="last"'},
+                "inventory-link-url",
+            ),
+        ]
+        for label, pages, links, kind in cases:
+            with self.subTest(label=label):
+                self._rewire()
+                self.http.inventory_page_overrides = pages
+                self.http.inventory_link_overrides = links
+                with self.assertRaises(release.ReleaseError) as caught:
+                    self._publish(name=f"publish-{label}")
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("package", kind),
+                )
+                summary = self._summary(
+                    self.base / f"publish-{label}"
+                )
+                self.assertEqual(
+                    summary["failure"],
+                    {
+                        "stage": "package",
+                        "kind": "inventory-link",
+                        "detail": kind,
+                    },
+                )
+                self.assertNotIn(
+                    AUDIT_TOKEN, json.dumps(summary)
+                )
+                self.assertNotIn(
+                    GITHUB_TOKEN, json.dumps(summary)
+                )
+
+    def test_summary_failure_mapping_is_exact_and_non_leaking(self):
+        for kind in sorted(release.INVENTORY_LINK_KINDS):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    release._summary_failure(
+                        {"stage": "package", "kind": kind}
+                    ),
+                    {
+                        "stage": "package",
+                        "kind": "inventory-link",
+                        "detail": kind,
+                    },
+                )
+        sentinel = "SENTINEL_UNKNOWN_KIND"
+        unknown = release._summary_failure(
+            {"stage": "package", "kind": sentinel, "detail": sentinel}
+        )
+        self.assertEqual(
+            unknown, {"stage": "package", "kind": sentinel}
+        )
+        self.assertNotIn("detail", unknown)
+        self.assertEqual(
+            release._summary_failure(
+                {
+                    "stage": "handoff",
+                    "kind": "inventory-link-query",
+                    "detail": sentinel,
+                }
+            ),
+            {"stage": "handoff", "kind": "inventory-link-query"},
+        )
+        self.assertEqual(
+            release._summary_failure(
+                {"stage": "package", "kind": "inventory-link"}
+            ),
+            {"stage": "package", "kind": "inventory-link"},
+        )
+        self.assertIsNone(release._summary_failure(None))
+        self.assertEqual(release._summary_failure("raw"), "raw")
+
+    def test_success_summary_has_no_failure_detail(self):
+        code, root = self._publish(name="publish-success-detail")
+        self.assertEqual(code, 0)
+        summary = self._summary(root)
+        self.assertIsNone(summary["failure"])
+        self.assertNotIn("detail", json.dumps(summary))
 
     def test_inventory_page_limit_rejected(self):
         page_one = [foreign_package(index) for index in range(99)]
