@@ -61,7 +61,7 @@ def package_metadata(
     role: str,
     *,
     package_id: int | None = None,
-    visibility: str = "private",
+    visibility: str = "public",
     repository: Any = None,
     owner: Any = None,
     name: str | None = None,
@@ -796,6 +796,7 @@ class FakeHTTP:
         self.package_counts: dict[str, int] = {"app": 0, "migrate": 0}
         self.manifest_header_override: dict[str, str] = {}
         self.manifest_body_override: dict[str, bytes] = {}
+        self.public_manifest_for: set[str] = set()
         self.runtime_override: dict[str, bytes] = {}
         self.block_package_role: str | None = None
         self.block_package_count: int | None = None
@@ -1005,6 +1006,23 @@ class FakeHTTP:
             authorization = self._authorization(headers)
             call_index = self.ghcr_manifest_calls[role]
             self.ghcr_manifest_calls[role] += 1
+            if role in self.public_manifest_for:
+                if authorization is not None:
+                    return release.HttpResult(403, {}, b"{}")
+                digest = url.rsplit("/", 1)[-1]
+                body = self.manifest_body_override.get(
+                    role, self.pair.root_bytes.get(digest, b"")
+                )
+                return release.HttpResult(
+                    200,
+                    {
+                        "content-type": release.OCI_INDEX,
+                        "docker-content-digest": (
+                            self.manifest_header_override.get(role, digest)
+                        ),
+                    },
+                    body,
+                )
             if call_index % 2 == 0:
                 if authorization is not None:
                     return release.HttpResult(403, {}, b"{}")
@@ -1771,14 +1789,23 @@ class PublishTests(ReleaseTestBase):
         self.assertEqual((caught.exception.stage, caught.exception.kind), ("package", "app-not-found"))
         self.assertEqual(self.fake.push_calls, [])
 
-    def test_public_package_fails_before_push(self):
-        self.http.package_failures = {
-            "app": [package_metadata("app", visibility="public")]
-        }
+    def test_private_package_fails_before_push(self):
+        self.http.packages["app"] = package_metadata(
+            "app", visibility="private"
+        )
         root = self.base / "publish-root"
         with self.assertRaises(release.ReleaseError) as caught:
-            self.run_publish(root, self.bundle, self.descriptor_sha, self.fake, self.http)
-        self.assertEqual((caught.exception.stage, caught.exception.kind), ("package", "app-visibility"))
+            self.run_publish(
+                root,
+                self.bundle,
+                self.descriptor_sha,
+                self.fake,
+                self.http,
+            )
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("package", "app-visibility"),
+        )
         self.assertEqual(self.fake.push_calls, [])
 
     def test_unlinked_package_fails_before_push(self):
@@ -2157,7 +2184,7 @@ class PackageAuditBoundaryTests(unittest.TestCase):
                 original = json.dumps(metadata, sort_keys=True)
                 self.assertEqual(release._validate_package_metadata(metadata, role), {
                     "name": release.PACKAGE_NAMES[role], "id": 1,
-                    "repository": release.REPOSITORY, "visibility": "private",
+                    "repository": release.REPOSITORY, "visibility": "public",
                 })
                 self.assertEqual(json.dumps(metadata, sort_keys=True), original)
 
@@ -2582,7 +2609,23 @@ class PackageInventoryTests(ReleaseTestBase):
             'package_type=container&per_page=100&page=0>; rel="last"'
         )
 
-    def _assert_successful_pair_publish(self, summary: dict[str, Any]) -> None:
+    def _anonymous_manifest_expected_root(self) -> dict[str, Any]:
+        return {
+            **self.descriptor["images"]["app"]["root_descriptor"],
+            "runtime_digest": "sha256:" + sha256(b"runtime-app"),
+            "runtime_size": len(b"runtime-app"),
+            "runtime_media_type": release.OCI_MANIFEST,
+            "attestations": (
+                "sha256:" + sha256(b"attestation-app"),
+            ),
+        }
+
+    def _assert_successful_pair_publish(
+        self,
+        summary: dict[str, Any],
+        *,
+        anonymous_manifest: bool = False,
+    ) -> None:
         self.assertTrue(summary["published"])
         self.assertEqual(len(self.fake.push_calls), 2)
         for role in release.ROLES:
@@ -2594,6 +2637,13 @@ class PackageInventoryTests(ReleaseTestBase):
             )
             self.assertEqual(summary["remote"][role]["digest"], expected)
             self.assertEqual(summary["pull"][role]["id"], expected)
+            self.assertEqual(
+                summary["packages"][role]["visibility"], "public"
+            )
+            self.assertEqual(
+                summary["packages_postcheck"][role]["visibility"],
+                "public",
+            )
         self.assertEqual(summary["revalidation"]["result"], "pass")
         self.assertEqual(self.fake.login_input, GITHUB_TOKEN)
         self.assertNotEqual(self.fake.login_input, AUDIT_TOKEN)
@@ -2610,7 +2660,26 @@ class PackageInventoryTests(ReleaseTestBase):
                     call["headers"].get("Authorization"),
                     "Bearer " + AUDIT_TOKEN,
                 )
-        self.assert_ghcr_auth_contract(self.http)
+        if anonymous_manifest:
+            self.assertEqual(
+                self.http.ghcr_token_calls,
+                {"app": 0, "migrate": 0},
+            )
+            manifest_calls = [
+                call
+                for call in self.http.calls
+                if "/v2/" in call["url"] and "/manifests/" in call["url"]
+            ]
+            self.assertEqual(len(manifest_calls), 2)
+            for call in manifest_calls:
+                self.assertIsNone(
+                    FakeHTTP._authorization(call["headers"])
+                )
+                for value in call["headers"].values():
+                    self.assertNotIn(AUDIT_TOKEN, value)
+                    self.assertNotIn(GITHUB_TOKEN, value)
+        else:
+            self.assert_ghcr_auth_contract(self.http)
 
     def _rewire(self, *, repository_private: Any = None) -> None:
         self.fake = FakeRunner(self.pair)
@@ -2644,6 +2713,13 @@ class PackageInventoryTests(ReleaseTestBase):
         self.assertEqual(
             summary["packages_postcheck"]["migrate"]["id"],
             MIGRATE_PACKAGE_ID,
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["app"]["visibility"], "public"
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["migrate"]["visibility"],
+            "public",
         )
         self.assertEqual(
             summary["push_attempted_roles"], ["app", "migrate"]
@@ -2697,7 +2773,162 @@ class PackageInventoryTests(ReleaseTestBase):
                 self.assertNotIn(AUDIT_TOKEN.encode(), data)
                 self.assertNotIn(GITHUB_TOKEN.encode(), data)
 
-    def test_normal_private_packages_with_public_repository_succeed(self):
+    def test_anonymous_public_manifest_full_publish_succeeds(self):
+        self.http.public_manifest_for = {"app", "migrate"}
+        code, root = self._publish(name="publish-anonymous")
+        self.assertEqual(code, 0)
+        summary = self._summary(root)
+        self._assert_successful_pair_publish(
+            summary, anonymous_manifest=True
+        )
+
+    def test_anonymous_public_manifest_direct_success(self):
+        body = self.pair.root_bytes[self.pair.app_id]
+        digest = self.pair.app_id
+        http = mock.Mock()
+        http.return_value = release.HttpResult(
+            200,
+            {
+                "content-type": release.OCI_INDEX,
+                "docker-content-digest": digest,
+            },
+            body,
+        )
+        instance = release.Release(
+            repo=self.repo, http=http, env=self.env
+        )
+        result = instance._registry_manifest(
+            "app",
+            digest,
+            self._anonymous_manifest_expected_root(),
+            GITHUB_TOKEN,
+            "xtianxx",
+        )
+        self.assertEqual(result["digest"], digest)
+        self.assertEqual(http.call_count, 1)
+        _args, kwargs = http.call_args
+        self.assertNotIn("Authorization", kwargs["headers"])
+        self.assertNotIn(release.TOKEN_REALM, _args[1])
+
+    def test_anonymous_public_manifest_validation_table(self):
+        body = self.pair.root_bytes[self.pair.app_id]
+        digest = self.pair.app_id
+        valid_headers = {
+            "content-type": release.OCI_INDEX,
+            "docker-content-digest": digest,
+        }
+        valid_expected = self._anonymous_manifest_expected_root()
+        wrong_root_body = json_bytes(
+            {
+                "schemaVersion": 2,
+                "mediaType": release.OCI_MANIFEST,
+                "manifests": [],
+            }
+        )
+        wrong_root_digest = "sha256:" + sha256(wrong_root_body)
+        cases = [
+            (
+                "body-hash",
+                body[:1],
+                valid_headers,
+                valid_expected,
+                digest,
+                "app-body-hash",
+            ),
+            (
+                "header-digest",
+                body,
+                {
+                    **valid_headers,
+                    "docker-content-digest": "sha256:" + "9" * 64,
+                },
+                valid_expected,
+                digest,
+                "app-header-digest",
+            ),
+            (
+                "media-type",
+                body,
+                {
+                    **valid_headers,
+                    "content-type": release.OCI_MANIFEST,
+                },
+                valid_expected,
+                digest,
+                "app-media-type",
+            ),
+            (
+                "size",
+                body,
+                valid_headers,
+                {
+                    **valid_expected,
+                    "size": valid_expected["size"] + 1,
+                },
+                digest,
+                "app-size",
+            ),
+            (
+                "root",
+                wrong_root_body,
+                {
+                    "content-type": release.OCI_INDEX,
+                    "docker-content-digest": wrong_root_digest,
+                },
+                {
+                    **valid_expected,
+                    "mediaType": release.OCI_INDEX,
+                    "size": len(wrong_root_body),
+                },
+                wrong_root_digest,
+                "app-root",
+            ),
+            (
+                "runtime",
+                body,
+                valid_headers,
+                {
+                    **valid_expected,
+                    "runtime_digest": "sha256:" + "2" * 64,
+                },
+                digest,
+                "app-runtime",
+            ),
+        ]
+        for (
+            label,
+            response_body,
+            headers,
+            expected_root,
+            candidate_digest,
+            kind,
+        ) in cases:
+            with self.subTest(label=label):
+                http = mock.Mock()
+                http.return_value = release.HttpResult(
+                    200, headers, response_body
+                )
+                instance = release.Release(
+                    repo=self.repo, http=http, env=self.env
+                )
+                with self.assertRaises(release.ReleaseError) as caught:
+                    instance._registry_manifest(
+                        "app",
+                        candidate_digest,
+                        expected_root,
+                        GITHUB_TOKEN,
+                        "xtianxx",
+                    )
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("registry", kind),
+                )
+                self.assertEqual(http.call_count, 1)
+                _args, kwargs = http.call_args
+                self.assertNotIn("Authorization", kwargs["headers"])
+                self.assertNotIn(release.TOKEN_REALM, _args[1])
+
+    def test_public_packages_with_public_repository_succeed(self):
         self._rewire(repository_private=False)
         code, root = self._publish()
         self.assertEqual(code, 0)
@@ -2725,7 +2956,7 @@ class PackageInventoryTests(ReleaseTestBase):
                     metadata, "app"
                 )
                 self.assertEqual(projection["id"], APP_PACKAGE_ID)
-                self.assertEqual(projection["visibility"], "private")
+                self.assertEqual(projection["visibility"], "public")
                 self.assertEqual(
                     projection["repository"], release.REPOSITORY
                 )
@@ -2970,7 +3201,7 @@ class PackageInventoryTests(ReleaseTestBase):
                     },
                 )
 
-    def test_existing_private_packages_succeed_for_both_bootstrap_flags(self):
+    def test_existing_public_packages_succeed_for_both_bootstrap_flags(self):
         for bootstrap in (False, True):
             for repository_private in (False, True):
                 label = f"{bootstrap}-{repository_private}"
@@ -3036,6 +3267,13 @@ class PackageInventoryTests(ReleaseTestBase):
         self.assertEqual(
             summary["packages_postcheck"]["migrate"]["id"],
             MIGRATE_PACKAGE_ID,
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["app"]["visibility"], "public"
+        )
+        self.assertEqual(
+            summary["packages_postcheck"]["migrate"]["visibility"],
+            "public",
         )
 
     def test_normal_empty_first_page_last_zero_is_not_created(self):
@@ -3115,10 +3353,37 @@ class PackageInventoryTests(ReleaseTestBase):
                 self.assertEqual(self.fake.push_calls, [])
 
     def test_invalid_inventory_metadata_rejected(self):
+        missing_visibility = package_metadata("app")
+        missing_visibility.pop("visibility")
         cases = [
             (
-                "public",
-                package_metadata("app", visibility="public"),
+                "private",
+                package_metadata("app", visibility="private"),
+                "app-visibility",
+            ),
+            (
+                "internal",
+                package_metadata("app", visibility="internal"),
+                "app-visibility",
+            ),
+            (
+                "missing",
+                missing_visibility,
+                "app-visibility",
+            ),
+            (
+                "none",
+                package_metadata("app", visibility=None),
+                "app-visibility",
+            ),
+            (
+                "wrong-case",
+                package_metadata("app", visibility="Public"),
+                "app-visibility",
+            ),
+            (
+                "bool",
+                package_metadata("app", visibility=True),
                 "app-visibility",
             ),
             (
@@ -3138,9 +3403,9 @@ class PackageInventoryTests(ReleaseTestBase):
                 "app-repository",
             ),
             (
-                "public-with-public-repository",
+                "private-with-public-repository",
                 package_metadata(
-                    "app", visibility="public", repository_private=False
+                    "app", visibility="private", repository_private=False
                 ),
                 "app-visibility",
             ),
@@ -4028,7 +4293,7 @@ class PackageInventoryTests(ReleaseTestBase):
         def mutate(session: int, page: int) -> None:
             if session == 2:
                 self.http.packages["app"] = package_metadata(
-                    "app", visibility="public"
+                    "app", visibility="private"
                 )
 
         self.http.inventory_page_callback = mutate
@@ -4042,7 +4307,7 @@ class PackageInventoryTests(ReleaseTestBase):
 
     def test_postpush_bad_metadata_stops_before_second_push(self):
         self.http.package_metadata_after_push = {
-            "app": package_metadata("app", visibility="public")
+            "app": package_metadata("app", visibility="private")
         }
         with self.assertRaises(release.ReleaseError) as caught:
             self._publish()

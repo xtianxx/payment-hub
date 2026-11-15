@@ -26,7 +26,7 @@ Fixed stages:
     the original artifact.  A temporary private Docker config is always
     removed.  No deployment is performed.  ``--bootstrap-packages`` is retained
     only as a compatibility flag; automatic package creation is paused and both
-    target packages must already exist as private linked packages.
+    target packages must already exist as public linked packages.
 
 The script reads only a small, fixed subset of the builder and acceptance
 reports.  Raw command output, tokens, DSNs, request bodies, and environment
@@ -413,10 +413,10 @@ def _validate_package_metadata(
 ) -> dict[str, Any]:
     """Return a small safe projection only after every fixed field matches.
 
-    Package ``visibility`` must be private; repository identity is the fixed
+    Package ``visibility`` must be public; repository identity is the fixed
     ``REPOSITORY`` full name.  ``repository.private`` describes the linked
-    repository, not the package, and is intentionally ignored so a private
-    package may be linked to a public repository.
+    repository, not the package, and is intentionally ignored so a public
+    package may be linked to a public or private repository.
     """
     if not isinstance(value, dict):
         raise ReleaseError(stage, role + "-metadata")
@@ -425,7 +425,7 @@ def _validate_package_metadata(
         raise ReleaseError(stage, role + "-name")
     if value.get("package_type") != "container":
         raise ReleaseError(stage, role + "-type")
-    if value.get("visibility") != "private":
+    if value.get("visibility") != "public":
         raise ReleaseError(stage, role + "-visibility")
     owner = value.get("owner")
     if not isinstance(owner, dict) or owner.get("login") != OWNER_LOGIN:
@@ -436,7 +436,7 @@ def _validate_package_metadata(
     package_id = _positive_package_id(value.get("id"), stage, role + "-id")
     return {
         "name": name,
-        "visibility": "private",
+        "visibility": "public",
         "repository": REPOSITORY,
         "id": package_id,
     }
@@ -669,6 +669,53 @@ def _parse_root_index(value: Any, stage: str, kind: str) -> RootContent:
         runtime_media_type=runtime["mediaType"],
         attestations=tuple(sorted(attestations)),
     )
+
+
+def _validate_registry_manifest_response(
+    role: str,
+    candidate_digest: str,
+    expected_root: Mapping[str, Any],
+    response: HttpResult,
+) -> dict[str, Any]:
+    """Validate one manifest response shared by anonymous and token paths."""
+    if response.status != 200:
+        raise ReleaseError("registry", role + "-manifest-status")
+    if len(response.body) > REGISTRY_MANIFEST_MAX_BYTES:
+        raise ReleaseError("registry", role + "-manifest-body")
+    body_sha = _sha256_bytes(response.body)
+    expected_hex = candidate_digest.split(":", 1)[1]
+    if body_sha != expected_hex:
+        raise ReleaseError("registry", role + "-body-hash")
+    header_digest = response.headers.get("docker-content-digest", "")
+    if header_digest != candidate_digest:
+        raise ReleaseError("registry", role + "-header-digest")
+    content_type = response.headers.get("content-type", "")
+    media_type = content_type.split(";", 1)[0].strip()
+    if media_type != expected_root["mediaType"]:
+        raise ReleaseError("registry", role + "-media-type")
+    if len(response.body) != expected_root["size"]:
+        raise ReleaseError("registry", role + "-size")
+    try:
+        value = json.loads(response.body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("registry", role + "-manifest-json") from exc
+    content = _parse_root_index(value, "registry", role + "-root")
+    if (
+        content.runtime_digest != expected_root.get("runtime_digest")
+        or content.runtime_size != expected_root.get("runtime_size")
+        or content.runtime_media_type != expected_root.get("runtime_media_type")
+        or not set(content.attestations).issubset(
+            set(expected_root.get("attestations", ()))
+        )
+    ):
+        raise ReleaseError("registry", role + "-runtime")
+    return {
+        "digest": candidate_digest,
+        "mediaType": media_type,
+        "body_sha256": body_sha,
+        "size": len(response.body),
+        "header_digest": header_digest,
+    }
 
 
 def _read_tar_root(
@@ -2752,97 +2799,68 @@ class Release:
             max_bytes=REGISTRY_MANIFEST_MAX_BYTES,
         )
         if response.status == 200:
-            raise ReleaseError("registry", role + "-unexpected-public")
-        if response.status != 401:
-            raise ReleaseError("registry", role + "-challenge-status")
-        challenge = response.headers.get("www-authenticate", "")
-        realm, service, scope = _parse_bearer_challenge(challenge, role)
-        expected_scope = f"repository:{repository}:pull"
-        if (
-            realm != TOKEN_REALM
-            or service != TOKEN_SERVICE
-            or scope != expected_scope
-        ):
-            raise ReleaseError("registry", role + "-challenge")
-        basic = base64.b64encode(
-            (actor + ":" + token).encode("utf-8")
-        ).decode("ascii")
-        token_url = TOKEN_REALM + "?" + urllib.parse.urlencode(
-            {"service": TOKEN_SERVICE, "scope": expected_scope}
-        )
-        token_response = self.http(
-            "GET",
-            token_url,
-            headers={
-                "Authorization": "Basic " + basic,
-                "User-Agent": "payment-hub-release",
-            },
-            timeout=HTTP_TIMEOUT_SECONDS,
-            max_bytes=TOKEN_MAX_BYTES,
-        )
-        if token_response.status != 200:
-            raise ReleaseError("registry", role + "-token")
-        try:
-            token_value = json.loads(token_response.body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ReleaseError("registry", role + "-token-json") from exc
-        if not isinstance(token_value, dict):
-            raise ReleaseError("registry", role + "-token-json")
-        scoped_token = token_value.get("token") or token_value.get("access_token")
-        if (
-            not isinstance(scoped_token, str)
-            or not scoped_token
-            or len(scoped_token) > 8192
-        ):
-            raise ReleaseError("registry", role + "-token-value")
-        manifest_response = self.http(
-            "GET",
-            url,
-            headers={
-                **headers,
-                "Authorization": "Bearer " + scoped_token,
-            },
-            timeout=HTTP_TIMEOUT_SECONDS,
-            max_bytes=REGISTRY_MANIFEST_MAX_BYTES,
-        )
-        if manifest_response.status != 200:
-            raise ReleaseError("registry", role + "-manifest-status")
-        if len(manifest_response.body) > REGISTRY_MANIFEST_MAX_BYTES:
-            raise ReleaseError("registry", role + "-manifest-body")
-        body_sha = _sha256_bytes(manifest_response.body)
-        expected_hex = candidate_digest.split(":", 1)[1]
-        if body_sha != expected_hex:
-            raise ReleaseError("registry", role + "-body-hash")
-        header_digest = manifest_response.headers.get("docker-content-digest", "")
-        if header_digest != candidate_digest:
-            raise ReleaseError("registry", role + "-header-digest")
-        content_type = manifest_response.headers.get("content-type", "")
-        media_type = content_type.split(";", 1)[0].strip()
-        if media_type != expected_root["mediaType"]:
-            raise ReleaseError("registry", role + "-media-type")
-        if len(manifest_response.body) != expected_root["size"]:
-            raise ReleaseError("registry", role + "-size")
-        try:
-            value = json.loads(manifest_response.body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ReleaseError("registry", role + "-manifest-json") from exc
-        content = _parse_root_index(value, "registry", role + "-root")
-        if (
-            content.runtime_digest != expected_root.get("runtime_digest")
-            or content.runtime_size != expected_root.get("runtime_size")
-            or content.runtime_media_type != expected_root.get("runtime_media_type")
-            or not set(content.attestations).issubset(
-                set(expected_root.get("attestations", ()))
+            manifest_response = response
+        elif response.status == 401:
+            challenge = response.headers.get("www-authenticate", "")
+            realm, service, scope = _parse_bearer_challenge(challenge, role)
+            expected_scope = f"repository:{repository}:pull"
+            if (
+                realm != TOKEN_REALM
+                or service != TOKEN_SERVICE
+                or scope != expected_scope
+            ):
+                raise ReleaseError("registry", role + "-challenge")
+            basic = base64.b64encode(
+                (actor + ":" + token).encode("utf-8")
+            ).decode("ascii")
+            token_url = TOKEN_REALM + "?" + urllib.parse.urlencode(
+                {"service": TOKEN_SERVICE, "scope": expected_scope}
             )
-        ):
-            raise ReleaseError("registry", role + "-runtime")
-        return {
-            "digest": candidate_digest,
-            "mediaType": media_type,
-            "body_sha256": body_sha,
-            "size": len(manifest_response.body),
-            "header_digest": header_digest,
-        }
+            token_response = self.http(
+                "GET",
+                token_url,
+                headers={
+                    "Authorization": "Basic " + basic,
+                    "User-Agent": "payment-hub-release",
+                },
+                timeout=HTTP_TIMEOUT_SECONDS,
+                max_bytes=TOKEN_MAX_BYTES,
+            )
+            if token_response.status != 200:
+                raise ReleaseError("registry", role + "-token")
+            try:
+                token_value = json.loads(token_response.body)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ReleaseError("registry", role + "-token-json") from exc
+            if not isinstance(token_value, dict):
+                raise ReleaseError("registry", role + "-token-json")
+            scoped_token = token_value.get("token") or token_value.get(
+                "access_token"
+            )
+            if (
+                not isinstance(scoped_token, str)
+                or not scoped_token
+                or len(scoped_token) > 8192
+            ):
+                raise ReleaseError("registry", role + "-token-value")
+            manifest_response = self.http(
+                "GET",
+                url,
+                headers={
+                    **headers,
+                    "Authorization": "Bearer " + scoped_token,
+                },
+                timeout=HTTP_TIMEOUT_SECONDS,
+                max_bytes=REGISTRY_MANIFEST_MAX_BYTES,
+            )
+        else:
+            raise ReleaseError("registry", role + "-challenge-status")
+        return _validate_registry_manifest_response(
+            role,
+            candidate_digest,
+            expected_root,
+            manifest_response,
+        )
 
     def _prepare_publish_inputs(
         self, args: argparse.Namespace, root: Path
@@ -3189,7 +3207,7 @@ class Release:
             }
             state["packages"] = dict(initial_metadata)
             # Normal-only release: every target must already exist as a
-            # validated private linked package.  The compatibility flag never
+            # validated public linked package.  The compatibility flag never
             # authorizes creation and does not relax this gate.
             for role in ROLES:
                 if initial_states[role]["status"] != "EXISTING_VALID":

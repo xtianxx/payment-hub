@@ -207,17 +207,17 @@ PUBLISH_INPUT_NAMES = (
     "bootstrap_packages",
 )
 # Manual package creation is paused: bootstrap_packages is only a compatibility
-# switch.  The workflow must keep the two existing private packages, and the
+# switch.  The workflow must keep the two existing public packages, and the
 # descriptions must not claim that creation is authorized.
 PUBLISH_INPUT_DESCRIPTIONS = {
     "publish_authorized": "Explicit authorization to publish the prepared pair",
     "packages_verified": (
         "Package preconditions verified for normal updates (both existing "
-        "private linked packages) and bootstrap compatibility (owner inventory, "
+        "public linked packages) and bootstrap compatibility (owner inventory, "
         "risk); automatic package creation is suspended"
     ),
     "bootstrap_packages": (
-        "兼容开关：自动创建已暂停；仍要求两包已存在且为private；"
+        "兼容开关：自动创建已暂停；仍要求两包已存在且为public；"
         "不替代 publish_authorized 或 packages_verified"
     ),
 }
