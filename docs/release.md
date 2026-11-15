@@ -1,9 +1,9 @@
 # 本地镜像与受控发布
 
-## 当前策略：仅更新已存在的private包（2026-11-15）
+## 当前策略：仅更新已存在的public包（2026-11-15）
 
 负责人已确认暂停工作流自动创建缺失包。无论源码仓库公开或私有，
-两个目标包都必须已存在、为private、属于`xtianxx`并正确关联
+两个目标包都必须已存在、为public、属于`xtianxx`并正确关联
 `xtianxx/payment-hub`；否则在准备发布输入、Docker load/login/tag/push前停止。
 缺失分别报告`package/app-absent`或`package/migrate-absent`。
 
@@ -11,7 +11,21 @@
 `bootstrap_requested`以兼容已有调用，但它们不再授权创建包。
 设为true且任一目标缺失时仍失败；两包已满足要求时只执行同样的正常更新。
 缺失判断、空清单`last=0`兼容和只读审计保留，不能将空清单解释为创建许可。
-已有private包可以关联公开源码仓库，不以`repository.private=false`拒绝它。
+负责人已明确将两包的目标可见性从private改为public；private和internal包不满足当前策略。
+此具名策略修订同时记录于[Git协作规范](git-workflow.md#5-发布标签与回退)，
+不构成公开凭据、敏感数据或任意其他软件包的授权。
+源码仓库可见性仍独立，不以`repository.private`的值替代包自身可见性检查。
+public包可匿名读取且不能直接改回private，公开包内容不应包含任何凭据或敏感数据。
+
+registry验证允许匿名GET直接返回200，但必须完成与鉴权响应相同的manifest大小、
+内容哈希、响应摘要、媒体类型、根描述及runtime/attestation校验；
+匿名200不等于跳过镜像身份验证。若仍返回401，则继续使用原受限challenge、
+writer Basic及scoped Bearer路径，审计token仍不能用于registry认证。
+
+本轮public策略本地验证：`python3 -B -m unittest discover -s scripts -p 'test_*.py'`
+通过1093项测试；固定Go1.27.4的CI合同检查、`TestReleaseGates`和差异检查均退出0。
+匿名200与401认证路径共用完整身份验证的正反例均通过；
+这不代表已执行真实发布或独立确认两包远端状态。
 
 ### 本次失败证据及处置边界
 
@@ -30,9 +44,9 @@ migrate未尝试。摘要`push_attempted_roles=["app"]`、
 但缺少包设置变更审计，不能据此声称已经排除外部操作。
 当前策略不再以任何首次默认可见性假设批准创建。
 
-本轮只修改前置门禁、回归和说明，不删除或重建现有public包，
-不改变源码仓库可见性，不扩大审计token权限，不新增写入PAT，
-不执行初始化、发布或部署。public包不能直接改回private；
+此前normal-only修复只修改前置门禁、回归和说明，没有删除或重建现有public包。
+本轮可见性策略调整不改变源码仓库可见性、不扩大审计token权限、不新增写入PAT，
+也不授权创建缺失包、初始化、发布或部署。public包不能直接改回private；
 保留原名删除重建、更名及独立初始化均须另行明确授权和验证，
 不能靠重跑工作流试探。后续初始化必须使用真实已验收的配对镜像，
 不可用占位镜像冒充；当前未实现或批准此恢复路径。
@@ -43,12 +57,61 @@ migrate未尝试。摘要`push_attempted_roles=["app"]`、
 出现部分成功或未知副作用时继续停止并人工核对，不自动重试、删除或回滚。
 本节覆盖下文历史初始化授权和首次创建步骤；当前不存在可用的自动创建模式。
 
-本轮本地验证：`python3 -B -m unittest discover -s scripts -p 'test_*.py'`
+此前private目标下的normal-only本地验证：`python3 -B -m unittest discover -s scripts -p 'test_*.py'`
 通过1088项测试；固定Go1.27.4执行的CI合同检查、
 `go test -mod=readonly -run '^TestReleaseGates$' -count=1 -p=1 -timeout=90s ./tests`
 和差异检查均退出0。回归覆盖兼容开关开/关、两包全缺失/仅一包缺失、
 空清单`last=0`、首次Docker操作前拒绝，以及两包有效时的正常更新。
-这些是离线/fake验证，未据此重跑真实发布，也未验证任何新的初始化方式。
+这些是历史离线/fake验证，不能代替本轮public策略验证；未据此重跑真实发布，也未验证任何新的初始化方式。
+
+### 现有包可见性操作
+
+仅对已存在的目标包执行本次已授权的private到public调整，不因包缺失自动创建。
+登录GitHub后，在owner的Packages列表进入目标包的Package settings，
+选择Danger Zone中的Change visibility，再选Public并确认。
+如果包已是public，无需重复改动；如果列表中不存在，不创建、不推送试探。
+匿名页面404不能单独证明包不存在；缺少管理权限时必须明确保留“未核实/未修改”状态。
+
+本轮只读核查中，app公开页面显示Public，未重复更改其设置。
+owner确认migrate原本为Public，但独立匿名页面返回404、
+匿名registry token请求返回403，尚未独立验证其公开读取状态；
+这些响应不能单独区分缺失、私有、名称不符或访问限制。
+本地CLI缺少`read:packages`且没有可用的已登录管理浏览器，因此本轮未写入任何远端包设置。
+恢复发布前仍需核对准确包名、public属性及仓库关联，不能用本地测试代替。
+
+### 公开镜像对的消费门禁
+
+两个GHCR仓库的push不是原子事务。app推送成功而migrate或后续验证失败时，
+app标签仍可能已经被匿名读取；失败不会隐藏、撤销或自动删除已公开内容。
+源码标签、单个包页面、一个digest可拉取或某次push成功，
+都不是“完整镜像对已发布”的承诺，不得据此部署或更新。
+
+消费者（包括人工部署操作者和后续自动化）必须先满足以下全部条件：
+
+1. 从受信仓库取得对应发布run及attempt的`release-summary.json`，
+   核对该run的源码SHA和预期交付SHA一致；不拼接不同run、attempt或源码的两份结果。
+   发布工作流必须全部结束且结论为success；仅prepare、PR CI或单个job成功不够。
+2. 摘要必须为`payment-hub.release-summary.v1`、`stage=publish`、
+   `outcome=pass`、`published=true`、`failure=null`，
+   且`credentials_removed=true`、`cleanup_failed=false`。
+   缺失、未知、矛盾或任何失败状态均拒绝消费，不默认成功。
+3. `descriptor_sha256`必须匹配该run受信交接值，descriptor源码SHA也须一致。
+   `pushed_roles`必须包含且仅包含app和migrate，二者的`push_side_effects`均为`verified`；
+   两role的`push.exit`均为0，且各自`push.candidate_digest`、`remote.digest`
+   与descriptor中的对应`root_descriptor.digest`一致；
+   两role的`pull.exit`均为0、`pull.id`与descriptor中的对应`local_id`一致。
+   两包`packages_postcheck`元数据必须完整且符合public、owner、仓库及原ID要求，
+   `revalidation.result`必须为`pass`。
+   单role完成或`unknown`副作用均不是可用发布对；
+   即使两项都为`verified`，也不能跳过pull、重新验收及整体成功判断。
+4. 使用该摘要中经验证、属于相同源码及交接描述的两个registry digest固定镜像引用，
+   不用可移动tag代替digest，也不与历史版本的另一个角色混配。
+   公开下载权限本身不代表这些镜像已获验收或部署授权。
+
+目前没有自动阻止匿名用户下载半成品标签的机制，任意外部读者不受文档技术约束。
+本消费门禁定义受控消费者何时可将镜像对视为完成，不声称在两包验证前隐藏镜像，
+也不新增自动部署或原子发布服务。
+不满足上述条件时只能保留诊断和部分副作用记录，等待负责人另行处置。
 
 ### 暂停创建策略的上线与发布检查清单
 
@@ -75,7 +138,8 @@ migrate未尝试。摘要`push_attempted_roles=["app"]`、
 2. 禁止通过重跑旧run、旧job或选择旧源码SHA恢复发布。后续确有发布授权时，
    从已包含本门禁的当前main新建运行，核对该run的实际源码SHA，
    不复用旧运行的bundle或旧源码候选。
-3. 两包必须事先均有效且private。现有public app及缺失migrate未处置完成前保持停止；
+3. 两包必须事先均有效且public；仅有app公开不代表migrate已存在或符合要求。
+   任一包状态未核实、缺失或元数据不符时保持停止；
    删除、重建、更名及独立初始化不包含在本检查清单的授权中。
 4. 从最后一次包状态检查直到发布结束，owner及其他有权限的操作者不得删除、
    替换目标包或更改可见性、关联和访问权限；存在外部写者或无法保证维护窗口时，
@@ -163,7 +227,8 @@ HTTP适配器同时保留全部重复Link字段，按逗号合并后交给完整
 
 空清单只证明审计读取结果；正常发布仍因目标缺失而拒绝，
 不自动获得初始化许可。当时保留的显式bootstrap创建路径现已按上方当前策略暂停；
-owner、private、仓库关联、镜像内容和推送前后验证门禁保持。
+owner、包可见性、仓库关联、镜像内容和推送前后验证门禁保持；
+包可见性目标以本文件顶部当前策略为准。
 只读成功不等于GHCR上传、
 首次创建、仓库关联或按digest拉回已通过。
 
@@ -184,10 +249,10 @@ owner、private、仓库关联、镜像内容和推送前后验证门禁保持�
 
 ### 正常更新与兼容输入
 
-- **正常发布**：默认`bootstrap_packages=false`；两个目标包必须已存在、为private、属于`xtianxx`并关联`xtianxx/payment-hub`。任一缺失、不可见、元数据不符均失败。
+- **正常发布**：默认`bootstrap_packages=false`；两个目标包必须已存在、为public、属于`xtianxx`并关联`xtianxx/payment-hub`。任一缺失、不可见、元数据不符均失败。
 - **兼容开关**：`bootstrap_packages=true`及publish阶段的`--bootstrap-packages`不再允许创建。两包全缺失或仅一个缺失都失败；两包已存在且有效时仅正常更新。原`publish_authorized=true`、`packages_verified=true`及两个CLI确认参数仍必须满足。
-- 不为public、未关联仓库、owner或名称不符的现存包提供豁免。
-- **包与源码仓库的可见性独立**：必须为private的是GHCR包，不是关联的源码仓库。私有包关联公开的`xtianxx/payment-hub`属于允许状态；`repository.private=false`不构成拒绝理由，仓库身份仍必须精确匹配。
+- 不为private、internal、未关联仓库、owner或名称不符的现存包提供豁免。
+- **包与源码仓库的可见性独立**：当前要求GHCR包为public；源码仓库的`repository.private`不决定包自身是否公开，仓库身份仍必须精确匹配。
 - prepare不读取包审计Secret、不查询包，也不接收初始化CLI参数。PR和定时检查不获得包凭据或写权限。
 - main/SHA/clean checkout、同提交CI成功、原产物交接、load/tag身份、registry manifest、按digest拉回及重新验收保持原有严格要求，不重构建或改用另一对镜像绕过。
 
@@ -217,10 +282,10 @@ prepare首个前置检查明确失败；upload在job条件中复核两项身份�
 ### 已存在包判断与每次push后的验证
 
 1. 用审计token查询`GET /user`核对owner，再完整分页读取`GET /user/packages?package_type=container&per_page=100`，不按visibility过滤。
-2. 对清单内目标，使用authenticated-user接口`GET /user/packages/container/<name>`严格校验private、仓库关联、owner、name、type和package ID。不得退回public-only接口。
+2. 对清单内目标，使用authenticated-user接口`GET /user/packages/container/<name>`严格校验public、仓库关联、owner、name、type和package ID。继续使用完整owner清单，不因目标公开而退回public-only接口判断不存在。
 3. 两包都必须已有有效元数据和稳定ID，才能继续发布准备；任一缺失即拒绝。403、404、超时、分页不完整、畸形响应及任何未知状态均失败。
 4. 每个role push前刷新清单；已存在包消失或ID改变都停止，不自动把更新切换为创建。push后继续核对原ID，不将缺失状态提升为新创建包。
-5. 每次push后立即复查private及仓库关联等元数据；失败即停止，不继续第二个包。最终再次核对两包，并保留原digest/拉回/验收链路，全部通过才记为发布成功。
+5. 每次push后立即复查public及仓库关联等元数据；失败即停止，不继续第二个包。最终再次核对两包，并保留原digest/拉回/验收链路，全部通过才记为发布成功。
 
 分页结束遵循GitHub的`Link`契约：无后续链接可表示终页，恰好100条的终页也合法，不能仅凭返回数量认定缺页。已声明未来last却缺少续链、畸形链接或跨页last不一致会失败；这不保证检测到服务端违反契约或所有并发位移。
 
@@ -240,6 +305,15 @@ push后检查只能检测问题，不能保证阻止首次暴露；包一旦publ
 `payment-hub.release-summary.v1`的对象字段允许向后兼容地追加；消费者应读取其需要的已知字段，并忽略未知字段，不把旧字段集合当作封闭schema。本次新增审计、初始包状态、push尝试及副作用字段，不删除或改变原有字段的类型与含义；不能只检查旧`pushed_roles`就推断没有远端副作用。
 
 后续若需删除既有字段、改变其类型或含义，应评估并升级schema版本及迁移方式。历史v1摘要不重写；仅新增字段不自动升级为v2。仓内当前消费者按字段读取，未发现release-summary封闭字段集消费者；此检索不保证仓外不存在自行实现的严格消费者。
+
+`limits`是描述当前实现边界的开放风险标识列表，不是封闭枚举、成功状态或授权条件；
+标识可随实际策略更新，消费者应保留未知项用于风险审阅，
+不能据某项缺失或出现未知项就将失败当作成功。
+当前公开包策略用`package-visibility-check-not-atomic`描述可见性检查的非原子性，
+并用`pair-publication-not-atomic`明确成对发布不是原子事务，
+不再生成已过时的`initial-default-private-contract-not-atomic`。
+历史摘要及其风险标识不改写；保持v1不等于保证仓外精确匹配旧列表的实现完全不受影响。
+完整发布的成功判断以顶部消费门禁为准，不以`limits`列表推断。
 
 ### 官方依据
 

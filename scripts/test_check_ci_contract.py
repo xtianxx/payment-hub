@@ -83,7 +83,7 @@ PUBLISH_ACTION_COUNTS = {
 }
 PUBLISH_BOOTSTRAP_INPUT_BLOCK = (
     "      bootstrap_packages:\n"
-    "        description: 兼容开关：自动创建已暂停；仍要求两包已存在且为private；"
+    "        description: 兼容开关：自动创建已暂停；仍要求两包已存在且为public；"
     "不替代 publish_authorized 或 packages_verified\n"
     "        required: true\n"
     "        default: false\n"
@@ -1522,7 +1522,7 @@ class PublishWorkflowContractTests(unittest.TestCase):
                 self.assertEqual(body["type"], "boolean")
                 self.assertTrue(body["description"].strip())
 
-    def test_manual_input_descriptions_do_not_authorize_package_creation(self):
+    def test_manual_input_descriptions_require_existing_public_packages(self):
         inputs = self.workflow["on"]["workflow_dispatch"]["inputs"]
         for name in MOD.PUBLISH_INPUT_NAMES:
             with self.subTest(input=name):
@@ -1537,7 +1537,7 @@ class PublishWorkflowContractTests(unittest.TestCase):
         normal = inputs["packages_verified"]["description"].lower()
         for token in (
             "normal",
-            "private",
+            "public",
             "linked",
             "bootstrap",
             "owner",
@@ -1546,11 +1546,13 @@ class PublishWorkflowContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, normal)
         self.assertIn("creation is suspended", normal)
+        self.assertNotIn("private", normal)
         self.assertNotIn("missing creation", normal)
         bootstrap = inputs["bootstrap_packages"]["description"]
-        for token in ("兼容开关", "自动创建已暂停", "两包已存在", "private"):
+        for token in ("兼容开关", "自动创建已暂停", "两包已存在", "public"):
             with self.subTest(token=token):
                 self.assertIn(token, bootstrap)
+        self.assertNotIn("private", bootstrap)
         self.assertNotIn("Third confirmation", bootstrap)
         self.assertNotIn("never replaces", bootstrap)
 
@@ -2731,6 +2733,43 @@ class PublishWorkflowMutationTests(unittest.TestCase):
             "Package preconditions verified for normal runs (existing private "
             "and linked packages) and bootstrap runs (owner inventory, missing "
             "creation scope, risk)"
+        )
+        text = self.text.replace(
+            f"        description: {current}\n",
+            f"        description: {legacy}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "publish-workflow-trigger-inputs",
+            {issue.kind for issue in issues},
+        )
+
+    def test_mutation_bootstrap_description_restores_private_is_rejected(self):
+        current = MOD.PUBLISH_INPUT_DESCRIPTIONS["bootstrap_packages"]
+        legacy = (
+            "兼容开关：自动创建已暂停；仍要求两包已存在且为private；"
+            "不替代 publish_authorized 或 packages_verified"
+        )
+        text = self.text.replace(
+            f"        description: {current}\n",
+            f"        description: {legacy}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        issues = self._issues_for_mutation(text)
+        self.assertIn(
+            "publish-workflow-trigger-inputs",
+            {issue.kind for issue in issues},
+        )
+
+    def test_mutation_packages_verified_restores_private_is_rejected(self):
+        current = MOD.PUBLISH_INPUT_DESCRIPTIONS["packages_verified"]
+        legacy = (
+            "Package preconditions verified for normal updates (both existing "
+            "private linked packages) and bootstrap compatibility (owner "
+            "inventory, risk); automatic package creation is suspended"
         )
         text = self.text.replace(
             f"        description: {current}\n",

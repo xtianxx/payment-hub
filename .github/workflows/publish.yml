@@ -9,12 +9,12 @@ on:
         default: false
         type: boolean
       packages_verified:
-        description: Package preconditions verified for normal updates (both existing private linked packages) and bootstrap compatibility (owner inventory, risk); automatic package creation is suspended
+        description: Package preconditions verified for normal updates (both existing public linked packages) and bootstrap compatibility (owner inventory, risk); automatic package creation is suspended
         required: true
         default: false
         type: boolean
       bootstrap_packages:
-        description: 兼容开关：自动创建已暂停；仍要求两包已存在且为private；不替代 publish_authorized 或 packages_verified
+        description: 兼容开关：自动创建已暂停；仍要求两包已存在且为public；不替代 publish_authorized 或 packages_verified
         required: true
         default: false
         type: boolean
