@@ -1,4 +1,4 @@
-name: Manual paired image publish / 人工配对镜像发布
+name: Manual paired image release / 人工配对镜像发布
 
 on:
   workflow_dispatch:
@@ -35,18 +35,19 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  prepare:
-    name: Prepare release handoff (linux/amd64)
+  resolve-candidate:
+    name: Resolve release candidate (linux/amd64)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
       actions: read
     outputs:
-      artifact_id: ${{ steps.bundle.outputs.artifact-id }}
-      artifact_digest: ${{ steps.bundle.outputs.artifact-digest }}
-      source_sha: ${{ steps.handoff.outputs.source_sha }}
-      descriptor_sha256: ${{ steps.handoff.outputs.descriptor_sha256 }}
+      ci_run_id: ${{ steps.select-candidate.outputs.ci_run_id }}
+      ci_run_attempt: ${{ steps.select-candidate.outputs.ci_run_attempt }}
+      bundle_artifact_id: ${{ steps.verify-candidate.outputs.bundle_artifact_id }}
+      descriptor_sha256: ${{ steps.verify-candidate.outputs.descriptor_sha256 }}
+      bundle_artifact_digest: ${{ steps.verify-candidate.outputs.bundle_artifact_digest }}
 
     steps:
       - name: Verify manual publish preconditions
@@ -87,35 +88,6 @@ jobs:
             exit 1
           fi
 
-      - name: Isolate release Go config and caches
-        shell: bash
-        run: |
-          set -euo pipefail
-          base="$RUNNER_TEMP/payment-hub-release-cache"
-          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp"
-          export XDG_CONFIG_HOME="$base/config"
-          export GOPATH="$base/gopath"
-          export GOMODCACHE="$base/gomod"
-          export GOCACHE="$base/gobuild"
-          export TMPDIR="$base/tmp"
-
-          if ! command -v go >/dev/null 2>&1; then
-            echo "::error::runner-provided Go is missing; release prepare cannot continue"
-            exit 1
-          fi
-          if ! go telemetry off; then
-            echo "::error::failed to disable Go telemetry in the isolated config"
-            exit 1
-          fi
-
-          {
-            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
-            echo "GOPATH=$GOPATH"
-            echo "GOMODCACHE=$GOMODCACHE"
-            echo "GOCACHE=$GOCACHE"
-            echo "TMPDIR=$TMPDIR"
-          } >> "$GITHUB_ENV"
-
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,110 +95,39 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Require successful main CI
+      - name: Select release candidate
+        id: select-candidate
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          python3 -B scripts/check-main-ci.py --source-sha "$SOURCE_SHA" --summary "$RUNNER_TEMP/payment-hub-ci-gate/ci-preflight.json"
+          python3 -B scripts/select-release-candidate.py select --source-sha "$SOURCE_SHA" --summary "$RUNNER_TEMP/payment-hub-release-selection/selection.json" --github-output "$GITHUB_OUTPUT"
 
-      - name: Set up Go 1.27.4
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - name: Download release candidate pointer
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          go-version: "1.27.4"
-          check-latest: false
-          cache: false
+          artifact-ids: ${{ steps.select-candidate.outputs.pointer_artifact_id }}
+          run-id: ${{ steps.select-candidate.outputs.ci_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: ${{ runner.temp }}/payment-hub-release-pointer
+          merge-multiple: true
+          digest-mismatch: error
 
-      - name: Set up Docker 29.9.3 with containerd image store
-        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
-        with:
-          version: v29.9.3
-          context: payment-hub-release
-          set-host: true
-          runtime-basedir: ${{ runner.temp }}/payment-hub-docker
-          daemon-config: '{"features":{"containerd-snapshotter":true}}'
-          github-token: ""
-
-      - name: Verify Docker image store
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${DOCKER_HOST:-}" ]]; then
-            echo "::error::DOCKER_HOST is not set; DOCKER_CONFIG overrides would bypass the dedicated daemon"
-            exit 1
-          fi
-          if [[ "$(docker version --format '{{.Server.Version}}')" != "29.9.3" ]]; then
-            echo "::error::unexpected Docker server version"
-            exit 1
-          fi
-          driver_status="$(docker info --format '{{range .DriverStatus}}{{index . 0}}={{index . 1}}{{"\n"}}{{end}}')"
-          if ! grep -Fxq 'driver-type=io.containerd.snapshotter.v1' <<<"$driver_status"; then
-            echo "::error::Docker image store is not the containerd snapshotter"
-            exit 1
-          fi
-          daemon_id="$(docker info --format '{{.ID}}')"
-          auth_dir="$(mktemp -d)"
-          trap 'rm -rf "$auth_dir"' EXIT
-          if [[ "$(DOCKER_CONFIG="$auth_dir" docker info --format '{{.ID}}')" != "$daemon_id" ]]; then
-            echo "::error::empty DOCKER_CONFIG reaches a different Docker daemon"
-            exit 1
-          fi
-
-      - name: Prepare release handoff
+      - name: Verify release candidate
+        id: verify-candidate
         shell: bash
         env:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          bash scripts/release.sh --stage prepare \
-            --source-sha "$SOURCE_SHA" \
-            --go "$(command -v go)" \
-            --cache-dir "$RUNNER_TEMP/payment-hub-release-cache" \
-            --artifact-root "$RUNNER_TEMP/payment-hub-release-prepare" \
-            --prepare-inputs
-
-      - name: Read trusted prepare outputs
-        id: handoff
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -B - <<'PY'
-          import json
-          import os
-          import re
-          path = os.path.join(os.environ["RUNNER_TEMP"], "payment-hub-release-prepare", "handoff.json")
-          with open(path, "r", encoding="utf-8") as handle:
-              data = json.load(handle)
-          source_sha = data.get("source_sha")
-          descriptor_sha256 = data.get("descriptor_sha256")
-          if not isinstance(source_sha, str) or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
-              raise SystemExit("invalid source_sha")
-          if not isinstance(descriptor_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", descriptor_sha256) is None:
-              raise SystemExit("invalid descriptor_sha256")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
-              handle.write(f"source_sha={source_sha}\n")
-              handle.write(f"descriptor_sha256={descriptor_sha256}\n")
-          PY
-
-      - name: Upload release bundle
-        id: bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-bundle-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/payment-hub-release-prepare/bundle/pair.tar
-            ${{ runner.temp }}/payment-hub-release-prepare/bundle/descriptor.json
-            ${{ runner.temp }}/payment-hub-release-prepare/bundle/build-record.json
-            ${{ runner.temp }}/payment-hub-release-prepare/bundle/accepted-images.json
-          if-no-files-found: error
-          retention-days: 30
-          include-hidden-files: false
+          python3 -B scripts/select-release-candidate.py verify --source-sha "$SOURCE_SHA" --selection "$RUNNER_TEMP/payment-hub-release-selection/selection.json" --pointer "$RUNNER_TEMP/payment-hub-release-pointer/pointer.json" --github-output "$GITHUB_OUTPUT"
 
   upload:
     name: Publish paired images (linux/amd64)
-    needs: prepare
+    needs: resolve-candidate
     if: ${{ github.actor == 'xtianxx' && github.triggering_actor == 'xtianxx' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -236,16 +137,26 @@ jobs:
       packages: write
 
     steps:
-      - name: Verify release handoff identity
+      - name: Verify resolved candidate identity
         shell: bash
         env:
-          SOURCE_SHA: ${{ github.sha }}
-          PREPARED_SHA: ${{ needs.prepare.outputs.source_sha }}
-          EXPECTED_DESCRIPTOR_SHA: ${{ needs.prepare.outputs.descriptor_sha256 }}
+          CI_RUN_ID: ${{ needs.resolve-candidate.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ needs.resolve-candidate.outputs.ci_run_attempt }}
+          BUNDLE_ARTIFACT_ID: ${{ needs.resolve-candidate.outputs.bundle_artifact_id }}
+          BUNDLE_ARTIFACT_DIGEST: ${{ needs.resolve-candidate.outputs.bundle_artifact_digest }}
+          EXPECTED_DESCRIPTOR_SHA: ${{ needs.resolve-candidate.outputs.descriptor_sha256 }}
         run: |
           set -euo pipefail
-          if [[ "$PREPARED_SHA" != "$SOURCE_SHA" ]]; then
-            echo "::error::prepared source SHA does not match github.sha"
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::resolved candidate must bind a positive CI run id and attempt"
+            exit 1
+          fi
+          if [[ ! "$BUNDLE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::resolved candidate bundle artifact id is invalid"
+            exit 1
+          fi
+          if [[ ! "$BUNDLE_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::resolved candidate bundle artifact digest is not canonical sha256:64-hex"
             exit 1
           fi
           if [[ ! "$EXPECTED_DESCRIPTOR_SHA" =~ ^[0-9a-f]{64}$ ]]; then
@@ -335,13 +246,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          install -d -m 0700 "$RUNNER_TEMP/payment-hub-release-handoff"
+          install -d -m 0700 "$RUNNER_TEMP/payment-hub-release-bundle"
 
       - name: Download release bundle
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
-          path: ${{ runner.temp }}/payment-hub-release-handoff
+          artifact-ids: ${{ needs.resolve-candidate.outputs.bundle_artifact_id }}
+          run-id: ${{ needs.resolve-candidate.outputs.ci_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: ${{ runner.temp }}/payment-hub-release-bundle
           merge-multiple: true
           digest-mismatch: error
 
@@ -350,25 +264,39 @@ jobs:
         run: |
           set -euo pipefail
           chmod 0600 \
-            "$RUNNER_TEMP/payment-hub-release-handoff/pair.tar" \
-            "$RUNNER_TEMP/payment-hub-release-handoff/descriptor.json" \
-            "$RUNNER_TEMP/payment-hub-release-handoff/build-record.json" \
-            "$RUNNER_TEMP/payment-hub-release-handoff/accepted-images.json"
+            "$RUNNER_TEMP/payment-hub-release-bundle/pair.tar" \
+            "$RUNNER_TEMP/payment-hub-release-bundle/descriptor.json" \
+            "$RUNNER_TEMP/payment-hub-release-bundle/build-record.json" \
+            "$RUNNER_TEMP/payment-hub-release-bundle/accepted-images.json"
+
+      - name: Verify release handoff
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_DESCRIPTOR_SHA: ${{ needs.resolve-candidate.outputs.descriptor_sha256 }}
+        run: |
+          set -euo pipefail
+          bash scripts/release.sh --stage verify-handoff \
+            --source-sha "$SOURCE_SHA" \
+            --bundle-dir "$RUNNER_TEMP/payment-hub-release-bundle" \
+            --expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA"
 
       - name: Require successful main CI
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.sha }}
+          CI_RUN_ID: ${{ needs.resolve-candidate.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ needs.resolve-candidate.outputs.ci_run_attempt }}
         run: |
           set -euo pipefail
-          python3 -B scripts/check-main-ci.py --source-sha "$SOURCE_SHA" --summary "$RUNNER_TEMP/payment-hub-ci-gate/ci-preflight.json"
+          python3 -B scripts/check-main-ci.py --source-sha "$SOURCE_SHA" --summary "$RUNNER_TEMP/payment-hub-ci-gate/ci-preflight.json" --expected-run-id "$CI_RUN_ID" --expected-run-attempt "$CI_RUN_ATTEMPT"
 
       - name: Publish paired images
         shell: bash
         env:
           SOURCE_SHA: ${{ github.sha }}
-          EXPECTED_DESCRIPTOR_SHA: ${{ needs.prepare.outputs.descriptor_sha256 }}
+          EXPECTED_DESCRIPTOR_SHA: ${{ needs.resolve-candidate.outputs.descriptor_sha256 }}
           GITHUB_TOKEN: ${{ github.token }}
           GHCR_PACKAGE_AUDIT_TOKEN: ${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}
           BOOTSTRAP_PACKAGES: ${{ inputs.bootstrap_packages }}
@@ -391,7 +319,7 @@ jobs:
             --go "$(command -v go)" \
             --cache-dir "$RUNNER_TEMP/payment-hub-release-cache" \
             --artifact-root "$RUNNER_TEMP/payment-hub-release-publish" \
-            --bundle-dir "$RUNNER_TEMP/payment-hub-release-handoff" \
+            --bundle-dir "$RUNNER_TEMP/payment-hub-release-bundle" \
             --expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA" \
             --approve-external \
             --package-preconditions-verified \

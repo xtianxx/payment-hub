@@ -1,5 +1,10 @@
 # 本地镜像与受控发布
 
+> 本分支工作流入口调整为`ci.yml`、`nightly.yml`、`release.yml`，
+> CI构建验收一次，CD发布只消费同SHA可信CI候选，不重新构建镜像。
+> 来源绑定、四文件交接及本轮未实现的nightly实验见[CI/CD说明](ci-cd.md)。
+> 下方历史运行保留原文件名和证据，不代表旧入口仍用于当前发布。
+
 ## 当前策略：仅更新已存在的public包（2026-11-15）
 
 负责人已确认暂停工作流自动创建缺失包。无论源码仓库公开或私有，
@@ -122,7 +127,7 @@ app标签仍可能已经被匿名读取；失败不会隐藏、撤销或自动�
 
 1. 由owner安排维护窗口，停止新增手动发布及历史发布重跑；确认没有其他仓库、
    本地客户端或外部自动化正在写入两个目标包。
-2. 在Actions中检查`publish.yml`的全部未结束运行，包括排队、执行中、等待审批
+2. 在Actions中检查`release.yml`及历史`publish.yml`的全部未结束运行，包括排队、执行中、等待审批
    或待启动状态。逐一记录run ID、attempt、源码SHA、状态及核查时间；
    不能仅按分支名或最近一次运行判断，也不能把取消请求已受理当作已经停止。
 3. 如果存在仍使用旧创建逻辑的运行，暂停合并；获得明确取消授权后取消，
@@ -335,13 +340,26 @@ push后检查只能检测问题，不能保证阻止首次暴露；包一旦publ
 
 ### 合并前预检与正式发布的分工
 
-`check.yml`在目标为main的PR及push main时自动运行：先构建并验收原始配对镜像，再调用`check-image-handoff.py`验证save、归档结构、导入前缺席、load后镜像内容身份保持。它与发布使用相同固定Docker环境，不登录GHCR、不申请包写权限、不上传镜像归档，也不将PR产物标记为已批准发布。为避免load命中现存镜像而产生假阳性，仅允许在显式隔离的临时daemon内移除本次无共享引用、无容器使用的配对镜像，禁止影响普通本地daemon及无关资源。
+`ci.yml`在目标为main的PR及push main时运行配对镜像作业：先构建并验收原始配对镜像，
+main在镜像标签仍存在时从同一对镜像导出四文件bundle，
+再调用`check-image-handoff.py`验证save/load内容身份；
+预检成功后才上传bundle及pointer，供完整CI成功后选取。PR只上传安全摘要。
+它不登录GHCR、不申请包写权限，也不将PR产物当作发布候选。
+镜像移除仅限确认归属的隔离临时daemon，禁止影响普通本地daemon及无关资源。
 
-`publish.yml`仍为main人工发布。prepare开始耗时工作前，以及upload真正发布入口之前，`check-main-ci.py`查询同一源码SHA的两个必要工作流：`setup-check.yml`、`check.yml`。按工作流路径识别，只接受该SHA最新push/main运行的成功结果；旧成功不能掩盖最新失败、取消或运行中状态。查询失败、没有匹配运行或权限不足都停止，不降级为人工勾选通过。查询步骤只读使用`GITHUB_TOKEN`，各发布job增加`actions: read`；包写权限仍只属于upload job，凭据不写摘要。
+`release.yml`仍为main人工发布，但不执行镜像builder。
+候选解析和真正发布入口前均由`check-main-ci.py`核验同SHA的`ci.yml`最新push/main成功运行，
+并锁定run ID和attempt。精确选取并校验该运行的pointer及bundle artifact ID/digest，
+再用受信descriptor SHA执行`verify-handoff`，不取全仓最新同名产物，
+不从PR、nightly、旧成功或旧attempt回退。产物缺失、过期或来源不符直接停止。
+查询和下载只读使用`GITHUB_TOKEN`及`actions: read`；
+包写权限只属于upload job，audit Secret只在publish步骤注入，不写摘要。
 
 建议顺序：修复分支开PR → 两项自动工作流通过 → 合并main → 对合并后SHA的两项工作流通过 → 核实包权限并人工发布。PR绿灯不能代替main合并提交绿灯；发布门禁不会自动等待、重跑CI或改变远端规则。
 
-每日漏洞扫描通过`setup-check.yml`的`schedule`事件运行，不触发正式发布，也不替代上述同SHA push/main检查。发布门禁仍只查询push事件：定时扫描成功不是发布绿灯，定时失败也未新增为单独的发布阻断条件；push/main原有漏洞检查继续保留。每日扫描配置合并main后才会启用，GitHub调度可能延迟，不保证准点。
+每日漏洞扫描通过`nightly.yml`的schedule运行，不触发发布、不生成候选，
+也不替代上述同SHA push/main检查。CI原有漏洞门禁继续保留。
+定时扫描成功不是发布绿灯；GitHub调度可能延迟，不保证准点。
 
 本轮只读确认main已有active ruleset，但未设置必需状态检查。管理员仍需单独配置`CI gate`与`Paired image acceptance (linux/amd64)`为必需检查；本次未修改远端规则。配置后的正式Actions执行、29.9.3真实归档往返、跨job交接及GHCR全链验证仍分别保留证据，不以本地fake测试替代。
 
@@ -415,7 +433,12 @@ PG-only基础文件为`deploy/compose.yaml`与`deploy/compose.test.yaml`。应�
 
 当前已核的远端只有`setup-check.yml`，其三处上传配置仍为14天。本地T077配置已把这三处及新增`check.yml`的安全摘要设为30天，但未推送/运行，不能宣称远端已生效或既有产物保存30天；实际Actions运行后仍须用artifact的`expires_at`复核。仅修改本地YAML不改变已有对象的到期日。构建/发布产物及诊断都不是永久存储。
 
-普通检查job只上传白名单重建的报告。手动发布草案的只读prepare job另有固定的原镜像交接bundle（两镜像的单一归档、descriptor、原构建与验收记录），这是跨job移交原产物，不是放宽诊断日志归档；必须排除运行时凭据并限制为同轮精确artifact ID。它会占用额外artifact存储，只有后续获授权的人工工作流实际运行才产生该占用。两类产物都不包含原始stdout/stderr、全量配置/环境、DSN、Authorization、完整报文或数据库导出；采集失败应导致门禁失败，而不是扩展敏感归档范围。
+普通检查job只上传白名单重建的报告。main CI还生成固定原镜像交接bundle
+（两镜像单一归档、descriptor、原构建与验收记录）及小型pointer；
+release只下载这些已验收产物，不重新构建。它们会占用artifact存储，按30天请求保留，
+真实有效期仍须核实API的`expires_at`。来源限定精确run/attempt/artifact ID，
+两类产物都排除凭据、原始stdout/stderr、全量环境、DSN、Authorization和数据库导出；
+采集或核验失败即停止，不扩大归档范围，也不在release重建补救。
 
 ## 官方依据与停止条件
 
@@ -437,5 +460,9 @@ PG-only基础文件为`deploy/compose.yaml`与`deploy/compose.test.yaml`。应�
 ### 实现入口与尚未执行项
 
 已实现`release.sh --stage prepare|verify-handoff|publish --source-sha <40hex>`；它不是本地任意工作树的一键发布。prepare要求受信workflow_dispatch、main、固定SHA与clean checkout一致，并串行运行必要检查后调用共同builder。当前未提交工作树不能通过该受信门禁，不得提交代码或伪造CI环境来绕过它。
+
+该prepare入口保留为历史受控接口，不由新的`release.yml`调用。
+当前CI通过`ci-candidate.py`从本轮builder原产物导出bundle，
+CD通过`select-release-candidate.py`绑定可信来源后调用verify-handoff及publish。
 
 verify-handoff只验证固定四文件bundle，必须另传来自可信prepare输出的`--expected-descriptor-sha256`，不能使用下载包自身提供的expected值。publish还要求显式`--approve-external --package-preconditions-verified`、真实包前提检查及受信上下文；这些参数是程序门禁，不替代用户对外部动作的授权。当前真实prepare全链、GHCR认证/上传/按digest拉回均未执行，受控回归不能解除上述未验证状态。

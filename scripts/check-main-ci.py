@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """Fail-closed read-only GitHub Actions preflight for main release gates.
 
-The release workflow invokes this checker before publishing.  By default it
-checks the latest push run for the supplied SHA in the legacy
-``setup-check.yml`` and ``check.yml`` pair.  The release candidate selector
-explicitly opts in to ``CI_WORKFLOW_PATHS`` (``ci.yml``) so selection never
-falls back to an older legacy success.  The upload job repeats the check with
-the selected run lock before any registry write.  The checker verifies that
-the workflow_dispatch context is the trusted main branch of
-``xtianxx/payment-hub``, that ``GITHUB_SHA`` equals ``--source-sha``, and that
-the latest push run for that SHA in every checked workflow is ``completed``
-with conclusion ``success``.  A newer failed, queued, cancelled, or running
-run is never hidden by an older success.
+The release workflow invokes this checker before publishing.  The release
+candidate selector reuses the same preflight to choose the CI run, and the
+upload job repeats the check with the selected run lock before any registry
+write.  It verifies that the workflow_dispatch context is the trusted main
+branch of ``xtianxx/payment-hub``, that ``GITHUB_SHA`` equals ``--source-sha``,
+and that the latest push run for that SHA in ``.github/workflows/ci.yml`` is
+``completed`` with conclusion ``success``.  A newer failed, queued, cancelled,
+or running run is never hidden by an older success.
 
 ``--expected-run-id`` and ``--expected-run-attempt`` may be supplied together
 to lock the exact CI run that supplied a release candidate.  If the latest run
@@ -49,15 +46,7 @@ BRANCH = "main"
 REF = "refs/heads/main"
 TRIGGER_EVENT = "workflow_dispatch"
 PUSH_EVENT = "push"
-WORKFLOW_PATHS = (
-    ".github/workflows/setup-check.yml",
-    ".github/workflows/check.yml",
-)
-# The release candidate selector opts in to the consolidated CI workflow
-# explicitly.  PR2 keeps the legacy default pair for the existing publish
-# gate; the final migration removes WORKFLOW_PATHS and makes this the only
-# path.
-CI_WORKFLOW_PATHS = (".github/workflows/ci.yml",)
+WORKFLOW_PATHS = (".github/workflows/ci.yml",)
 
 API_HOST = "api.github.com"
 API_BASE = f"https://{API_HOST}"
@@ -915,11 +904,8 @@ class WorkflowState:
         }
 
 
-def default_workflow_states(
-    paths: Sequence[str] | None = None,
-) -> list[WorkflowState]:
-    resolved = WORKFLOW_PATHS if paths is None else paths
-    return [WorkflowState(path=path) for path in resolved]
+def default_workflow_states() -> list[WorkflowState]:
+    return [WorkflowState(path=path) for path in WORKFLOW_PATHS]
 
 
 def build_summary(
@@ -1210,7 +1196,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         allow_abbrev=False,
         description=(
             "Fail-closed read-only check that the latest main push run for "
-            "the supplied source SHA succeeded in the approved workflows."
+            "the supplied source SHA succeeded in the approved CI workflow."
         ),
     )
     parser.add_argument("--source-sha", required=True)

@@ -414,49 +414,6 @@ class SelectSuccessTests(SelectorTestCase):
         )
         self.assertTrue(all(url.startswith("https://api.github.com/") for url in self.fake.requests))
 
-    def test_select_uses_only_ci_workflow_path(self):
-        self.assertEqual(MOD.WORKFLOW_PATH, CI.CI_WORKFLOW_PATHS[0])
-        self.assertEqual(MOD.WORKFLOW_PATH, ".github/workflows/ci.yml")
-        self.add_ci_success()
-        self.add_default_artifacts()
-        self.assertEqual(self.run_select()[0], 0)
-        self.assertTrue(
-            any(
-                url.endswith("/actions/workflows/ci.yml")
-                for url in self.fake.requests
-            )
-        )
-        self.assertFalse(
-            any("setup-check.yml" in url for url in self.fake.requests)
-        )
-        self.assertFalse(
-            any(
-                url.endswith("/actions/workflows/check.yml")
-                for url in self.fake.requests
-            )
-        )
-
-    def test_selector_default_states_remain_legacy_pair(self):
-        # PR2 transition proof: the selector opts into ci.yml explicitly and
-        # never relies on the production default legacy pair.
-        self.assertEqual(
-            tuple(state.path for state in CI.default_workflow_states()),
-            (
-                ".github/workflows/setup-check.yml",
-                ".github/workflows/check.yml",
-            ),
-        )
-        self.assertEqual(
-            CI.WORKFLOW_PATHS,
-            (
-                ".github/workflows/setup-check.yml",
-                ".github/workflows/check.yml",
-            ),
-        )
-        self.assertEqual(
-            CI.CI_WORKFLOW_PATHS, (".github/workflows/ci.yml",)
-        )
-
     def test_select_accepts_artifact_without_workflow_run(self):
         self.add_ci_success()
         self.add_artifacts(
@@ -534,20 +491,6 @@ class SelectSuccessTests(SelectorTestCase):
 
 
 class SelectFailureTests(SelectorTestCase):
-    def test_select_does_not_fall_back_to_legacy_success(self):
-        self.fake.workflow_responses["ci.yml"] = raw_response(404, b"{}")
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
-            make_workflow(".github/workflows/setup-check.yml", 101)
-        )
-        self.fake.workflow_responses["check.yml"] = json_response(
-            make_workflow(".github/workflows/check.yml", 202)
-        )
-        self.add_default_artifacts()
-        self.assert_select_failure("workflow", "not-found")
-        self.assertFalse(
-            any("setup-check.yml" in url for url in self.fake.requests)
-        )
-
     def assert_select_failure(self, stage, kind, environment=None):
         code, stdout, stderr = self.run_select(environment)
         self.assertEqual(code, 1)

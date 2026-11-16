@@ -1,0 +1,173 @@
+name: Nightly vulnerability scan / 每日漏洞扫描
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+
+concurrency:
+  group: "${{ github.workflow }}-nightly"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOENV: "off"
+  GOWORK: "off"
+  GOFLAGS: ""
+  GOTELEMETRY: "off"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  vulnerability-check:
+    name: Vulnerability scan (linux/amd64, read-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Isolate vulnerability Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-vulnerability"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp" "$base/tools" "$base/reports"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; vulnerability scan cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+          check-latest: false
+          cache: false
+
+      - name: Run pinned vulnerability scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "vulnerability-scan: source/symbol/integration/test; test participation does not equal production exposure"
+          python3 -B scripts/check-vulnerabilities.py \
+            --go "$(command -v go)" \
+            --cache-dir "$RUNNER_TEMP/payment-hub-vulnerability" \
+            --tool-dir "$RUNNER_TEMP/payment-hub-vulnerability/tools" \
+            --artifact-root "$RUNNER_TEMP/payment-hub-vulnerability/reports" \
+            --prepare-tool
+
+      - name: Summarize vulnerability scan results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/payment-hub-vulnerability/reports/vulnerability-report.json"
+          {
+            echo "## Vulnerability scan / 漏洞扫描"
+            echo ""
+            echo "本 job 为独立只读扫描，不运行应用、PostgreSQL、Docker 或发布步骤；Go 配置/缓存/工具/报告均在 $RUNNER_TEMP/payment-hub-vulnerability。固定 govulncheck v1.9.0 由 scripts/check-vulnerabilities.py 控制，使用 source/symbol/integration/test 模式、CGO_ENABLED=1、linux/amd64，并通过 HTTPS 获取漏洞库；test 参与扫描不等同于 production exposure。"
+            echo "退出码语义：0=无 symbol 可达 GO-ID；1=存在可达 GO-ID（阻断）；2=工具、网络、协议或配置失败。是否阻断仅以本次实际报告与退出码为准；此前本机发现不替代本次结果。不会把 vulnerable 改成 warning，也不会自动升级依赖。"
+            echo "扫描报告只写入 $RUNNER_TEMP/payment-hub-vulnerability/reports/vulnerability-report.json；安全导出只保留白名单字段，不上传原始日志或任意报告内容。"
+            if [[ -f "$report" ]]; then
+              python3 -B - "$report" <<'PY' || echo "reportinvalid"
+          import ast
+          import json
+          import pathlib
+          import sys
+
+          try:
+              script = pathlib.Path("scripts/check-vulnerabilities.py")
+              tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+              allowed = None
+              for node in tree.body:
+                  if isinstance(node, ast.Assign) and any(
+                      isinstance(target, ast.Name) and target.id == "FAILURE_CLASSES"
+                      for target in node.targets
+                  ):
+                      allowed = ast.literal_eval(node.value)
+                      break
+              if not isinstance(allowed, set) or not all(
+                  isinstance(value, str) for value in allowed
+              ):
+                  raise SystemExit(2)
+
+              data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+              result = data.get("result")
+              reachable = data.get("reachable_count")
+              unreachable = data.get("unreachable_count")
+              failure = data.get("failure_class")
+
+              if result not in {"pass", "vulnerable", "failure"}:
+                  raise SystemExit(2)
+              if result == "failure" and failure is None:
+                  raise SystemExit(2)
+              if result in {"pass", "vulnerable"} and failure is not None:
+                  raise SystemExit(2)
+              if type(reachable) is not int or reachable < 0:
+                  raise SystemExit(2)
+              if type(unreachable) is not int or unreachable < 0:
+                  raise SystemExit(2)
+              if result == "pass" and reachable != 0:
+                  raise SystemExit(2)
+              if result == "vulnerable" and reachable == 0:
+                  raise SystemExit(2)
+              if failure is not None and failure not in allowed:
+                  raise SystemExit(2)
+
+              print(f"vulnerability-result: {result}")
+              print(f"reachable-count: {reachable}")
+              print(f"unreachable-count: {unreachable}")
+              print(f"error-class: {failure if failure is not None else 'none'}")
+          except Exception:
+              raise SystemExit(2)
+          PY
+            else
+              echo "vulnerability-report: missing (scan did not write a report)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Export safe vulnerability report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/ci_checks.py export-reports \
+            --report-dir "$RUNNER_TEMP/payment-hub-vulnerability/reports" \
+            --db-artifact-root "$RUNNER_TEMP/payment-hub-vulnerability/unused-db" \
+            --expect vulnerability
+
+      - name: Upload safe vulnerability reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vulnerability-check-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/payment-hub-vulnerability/reports/upload/vulnerability.safe.json
+            ${{ runner.temp }}/payment-hub-vulnerability/reports/upload/provenance.json
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false

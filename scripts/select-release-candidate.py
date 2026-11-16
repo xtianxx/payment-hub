@@ -51,7 +51,7 @@ def _load_check_main_ci() -> Any:
 CI = _load_check_main_ci()
 
 REPOSITORY = CI.REPOSITORY
-WORKFLOW_PATH = CI.CI_WORKFLOW_PATHS[0]
+WORKFLOW_PATH = CI.WORKFLOW_PATHS[0]
 PLATFORM = "linux/amd64"
 POINTER_PREFIX = "ci-release-pointer-"
 BUNDLE_PREFIX = "ci-release-bundle-"
@@ -346,7 +346,7 @@ def _select_artifact(
 
 
 def select_candidate(source_sha: str, api: Any) -> Selection:
-    states = CI.default_workflow_states(CI.CI_WORKFLOW_PATHS)
+    states = CI.default_workflow_states()
     config = CI.Config(
         source_sha=source_sha,
         summary_path=Path("/unused-release-selection"),

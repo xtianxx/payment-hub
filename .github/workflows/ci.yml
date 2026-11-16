@@ -1,4 +1,4 @@
-name: Setup and unit checks / 准备与单元检查
+name: CI / 持续集成
 
 on:
   push:
@@ -7,11 +7,9 @@ on:
   pull_request:
     branches:
       - main
-  schedule:
-    - cron: '17 2 * * *'
 
 concurrency:
-  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-daily' || '' }}"
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
   cancel-in-progress: false
 
 permissions:
@@ -22,12 +20,185 @@ env:
   GOENV: "off"
   GOWORK: "off"
   GOFLAGS: ""
+  GOTELEMETRY: "off"
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  setup-check:
-    name: Setup and foundation units (linux/amd64)
-    if: ${{ github.event_name != 'schedule' }}
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Isolate format Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-format"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; format check cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+          check-latest: false
+          cache: false
+
+      - name: Check tracked Go formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t go_files < <(git ls-files -z -- '*.go')
+          if [[ "${#go_files[@]}" -eq 0 ]]; then
+            echo "::error::no tracked Go files found; refusing to report success"
+            exit 1
+          fi
+          unformatted="$(gofmt -l -- "${go_files[@]}")"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::tracked Go files need gofmt"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+  vet:
+    name: Vet
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Isolate vet Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-vet"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; vet check cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+          check-latest: false
+          cache: false
+
+      - name: Run go vet
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet -mod=readonly -p=1 ./...
+          go vet -mod=readonly -p=1 -tags=integration ./...
+
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Isolate build Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-build"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; build check cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+          check-latest: false
+          cache: false
+
+      - name: Run explicit Go build
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -mod=readonly -p=1 ./...
+
+  unit-tests:
+    name: Unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -111,33 +282,21 @@ jobs:
           GOSUMDB: "off"
         run: |
           set -euo pipefail
-          mapfile -d '' -t go_files < <(git ls-files -z -- '*.go')
-          if [[ "${#go_files[@]}" -eq 0 ]]; then
-            echo "::error::no tracked Go files found; refusing to report success"
-            exit 1
-          fi
-          unformatted="$(gofmt -l -- "${go_files[@]}")"
-          if [[ -n "$unformatted" ]]; then
-            echo "::error::tracked Go files need gofmt"
-            printf '%s\n' "$unformatted"
-            exit 1
-          fi
-          go vet -mod=readonly -p=1 ./...
           status=0
           python3 -B scripts/ci_checks.py run-default --go "$(command -v go)" --report-dir "$RUNNER_TEMP/payment-hub-setup/reports" || status=$?
           {
             echo "## Foundation unit checks / 基础包单元检查"
             echo ""
-            echo "所有已跟踪 Go 文件已通过 gofmt，默认非 integration 包（./...）已通过 go vet。scripts/ci_checks.py run-default 执行带 race、-count=1、-p=1、-timeout=90s 的 go test -json，覆盖真实私有 UDS、readyz/lifecycle 与短真实连接语义、显式空 Env 子进程隔离、leader 退出后的 Stop/Wait/lifetime 期限、有界且脱敏的启动诊断日志、Seal 失败后继续安全释放资源，以及只归档不可变终结 Observer 快照。整批外部监督预算为 ci_checks.GO_TEST_BATCH_TIMEOUT_SECONDS=570 秒，由构建、链接与串行测试共同消耗；这是共享整批预算，不保证每个包都拿满 90 秒，也不保证额外的 Go 强杀/输出等待时间，超时后的 kill/reap 与报告时间在 570 秒之外。"
+            echo "已跟踪 Go 文件的 gofmt 由独立 Format job 校验，默认与 integration tag 的 go vet 由独立 Vet job 校验；本步骤不重复这两项。scripts/ci_checks.py run-default 执行带 race、-count=1、-p=1、-timeout=90s 的 go test -json，覆盖真实私有 UDS、readyz/lifecycle 与短真实连接语义、显式空 Env 子进程隔离、leader 退出后的 Stop/Wait/lifetime 期限、有界且脱敏的启动诊断日志、Seal 失败后继续安全释放资源，以及只归档不可变终结 Observer 快照。整批外部监督预算为 ci_checks.GO_TEST_BATCH_TIMEOUT_SECONDS=570 秒，由构建、链接与串行测试共同消耗；这是共享整批预算，不保证每个包都拿满 90 秒，也不保证额外的 Go 强杀/输出等待时间，超时后的 kill/reap 与报告时间在 570 秒之外。"
             echo "该 helper 只按完整 Package/Test/Action 判定；下列默认必需项由 scripts/check-ci-contract.py --summary default 从 ci_checks.DEFAULT_REQUIRED_TESTS 动态生成（包含焦点子测试的完整名字），必须全部 pass；缺失、skip、fail、重复或错包均不能为绿，cmd 包无测试文件单列为 no-test-files 而非静默通过。run-default-exit-code: $status（0 才表示该默认门禁通过）。"
             echo ""
             python3 -B scripts/check-ci-contract.py --summary default
             echo ""
             echo "其中 US1 默认根覆盖 core/查询/HTTP 合同与私有结果指令协议/客户端/observer/mock/app 消费封口及 app/router wiring unit，不代表真实失败 POST 或应用重启已完成。"
             echo "US2 默认根覆盖相同支付意图重放、提交冲突优先级与 HTTP 业务值委派分层 unit，不代表真实并发、跨代重启或数据库防重已验收。"
-            echo "setup job 的 20 分钟是整个 job 上限，由准备、检查与上传共用，不保证各步骤最大值叠加，也不是对 570 秒整批预算的替代或额外预留。"
+            echo "unit-tests job 的 20 分钟是整个 job 上限，由准备、检查与上传共用，不保证各步骤最大值叠加，也不是对 570 秒整批预算的替代或额外预留。"
             echo "这些是 unit/默认包结果，不代表支付 HTTP、业务重启防重、应用镜像、默认全时长实测或完整 MVP 已验收。"
-            echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture、迁移工具镜像、必需 commit-hook 提交实验、工具 helper 两代父 Observer/真实 PG 保留、当前应用二进制 readyz/SIGTERM/坏配置/缺迁移启动失败与 startup 超时/取消/监听失败诊断，以及 US1 真实支付 HTTP/字节边界/成功与失败/两代重启，由 database-foundation job 在实际执行时逐项核对；US1 范围外的完整支付流程、扩展业务重启、应用镜像、完整 MVP/T072/T077/CD 不在本步骤，也不由该 job 验收。"
+            echo "真实 PostgreSQL 迁移、SQL 约束、integration fixture、迁移工具镜像、必需 commit-hook 提交实验、工具 helper 两代父 Observer/真实 PG 保留、当前应用二进制 readyz/SIGTERM/坏配置/缺迁移启动失败与 startup 超时/取消/监听失败诊断，以及 US1 真实支付 HTTP/字节边界/成功与失败/两代重启，由 integration-tests job 在实际执行时逐项核对；US1 范围外的完整支付流程、扩展业务重启、应用镜像、完整 MVP/T072/T077/CD 不在本步骤，也不由该 job 验收。"
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
@@ -189,9 +348,9 @@ jobs:
           retention-days: 30
           include-hidden-files: false
 
-  database-foundation:
-    name: PostgreSQL migration, constraints, and runtime harness (linux/amd64)
-    needs: setup-check
+  integration-tests:
+    name: Integration tests
+    needs: unit-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -336,6 +495,163 @@ jobs:
           retention-days: 30
           include-hidden-files: false
 
+  image-acceptance:
+    name: Paired image acceptance (linux/amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Isolate image acceptance Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-images"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; image acceptance cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+          check-latest: false
+          cache: false
+
+      - name: Set up Docker 29.9.3 with containerd image store
+        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
+        with:
+          version: v29.9.3
+          context: payment-hub-check
+          set-host: true
+          runtime-basedir: ${{ runner.temp }}/payment-hub-docker
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+          github-token: ""
+
+      - name: Verify Docker image store
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DOCKER_HOST:-}" ]]; then
+            echo "::error::DOCKER_HOST is not set; DOCKER_CONFIG overrides would bypass the dedicated daemon"
+            exit 1
+          fi
+          if [[ "$(docker version --format '{{.Server.Version}}')" != "29.9.3" ]]; then
+            echo "::error::unexpected Docker server version"
+            exit 1
+          fi
+          driver_status="$(docker info --format '{{range .DriverStatus}}{{index . 0}}={{index . 1}}{{"\n"}}{{end}}')"
+          if ! grep -Fxq 'driver-type=io.containerd.snapshotter.v1' <<<"$driver_status"; then
+            echo "::error::Docker image store is not the containerd snapshotter"
+            exit 1
+          fi
+          daemon_id="$(docker info --format '{{.ID}}')"
+          auth_dir="$(mktemp -d)"
+          trap 'rm -rf "$auth_dir"' EXIT
+          if [[ "$(DOCKER_CONFIG="$auth_dir" docker info --format '{{.ID}}')" != "$daemon_id" ]]; then
+            echo "::error::empty DOCKER_CONFIG reaches a different Docker daemon"
+            exit 1
+          fi
+
+      - name: Build and accept paired images
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOMAXPROCS: "2"
+        run: |
+          set -euo pipefail
+          python3 -B scripts/build-images.py \
+            --go "$(command -v go)" \
+            --cache-dir "$RUNNER_TEMP/payment-hub-images" \
+            --artifact-root "$RUNNER_TEMP/payment-hub-images/artifacts" \
+            --prepare-inputs
+
+      - name: Export release candidate
+        id: export-candidate
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'xtianxx/payment-hub' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/ci-candidate.py export --source-sha "$GITHUB_SHA" --build-root "$RUNNER_TEMP/payment-hub-images/artifacts" --artifact-root "$RUNNER_TEMP/payment-hub-ci-candidate" --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify image handoff without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/check-image-handoff.py --build-root "$RUNNER_TEMP/payment-hub-images/artifacts" --artifact-root "$RUNNER_TEMP/payment-hub-handoff-preflight" --isolated-daemon
+
+      - name: Upload release candidate bundle
+        id: upload-candidate
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'xtianxx/payment-hub' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-release-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.export-candidate.outputs.bundle_dir }}
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false
+
+      - name: Write release candidate pointer
+        id: write-candidate-pointer
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'xtianxx/payment-hub' }}
+        shell: bash
+        env:
+          DESCRIPTOR_SHA: ${{ steps.export-candidate.outputs.descriptor_sha256 }}
+          BUNDLE_ARTIFACT_ID: ${{ steps.upload-candidate.outputs.artifact-id }}
+          BUNDLE_ARTIFACT_DIGEST: ${{ steps.upload-candidate.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/ci-candidate.py pointer --source-sha "$GITHUB_SHA" --descriptor-sha256 "$DESCRIPTOR_SHA" --bundle-artifact-id "$BUNDLE_ARTIFACT_ID" --bundle-artifact-digest "$BUNDLE_ARTIFACT_DIGEST" --output "$RUNNER_TEMP/payment-hub-ci-candidate/pointer/pointer.json"
+
+      - name: Upload release candidate pointer
+        id: upload-candidate-pointer
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'xtianxx/payment-hub' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-release-pointer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/payment-hub-ci-candidate/pointer/pointer.json
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false
+
+      - name: Upload safe image acceptance summaries
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-acceptance-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/payment-hub-images/artifacts/upload/build-summary.json
+            ${{ runner.temp }}/payment-hub-images/artifacts/upload/images-summary.json
+            ${{ runner.temp }}/payment-hub-images/artifacts/upload/handoff-preflight.safe.json
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false
+
   vulnerability-check:
     name: Vulnerability scan (linux/amd64, read-only)
     runs-on: ubuntu-24.04
@@ -405,7 +721,7 @@ jobs:
           {
             echo "## Vulnerability scan / 漏洞扫描"
             echo ""
-            echo "本 job 为独立只读扫描，不依赖 setup-check/database-foundation，也不运行应用、PostgreSQL、Docker 或发布步骤；Go 配置/缓存/工具/报告均在 $RUNNER_TEMP/payment-hub-vulnerability。固定 govulncheck v1.9.0 由 scripts/check-vulnerabilities.py 控制，使用 source/symbol/integration/test 模式、CGO_ENABLED=1、linux/amd64，并通过 HTTPS 获取漏洞库；test 参与扫描不等同于 production exposure。"
+            echo "本 job 为独立只读扫描，不依赖 unit-tests/integration-tests，也不运行应用、PostgreSQL、Docker 或发布步骤；Go 配置/缓存/工具/报告均在 $RUNNER_TEMP/payment-hub-vulnerability。固定 govulncheck v1.9.0 由 scripts/check-vulnerabilities.py 控制，使用 source/symbol/integration/test 模式、CGO_ENABLED=1、linux/amd64，并通过 HTTPS 获取漏洞库；test 参与扫描不等同于 production exposure。"
             echo "退出码语义：0=无 symbol 可达 GO-ID；1=存在可达 GO-ID（阻断）；2=工具、网络、协议或配置失败。是否阻断仅以本次实际报告与退出码为准；此前本机发现不替代本次结果。不会把 vulnerable 改成 warning，也不会自动升级依赖。"
             echo "扫描报告只写入 $RUNNER_TEMP/payment-hub-vulnerability/reports/vulnerability-report.json；安全导出只保留白名单字段，不上传原始日志或任意报告内容。"
             if [[ -f "$report" ]]; then
@@ -490,20 +806,24 @@ jobs:
 
   ci-gate:
     name: CI gate
-    if: ${{ always() && github.event_name != 'schedule' }}
-    needs: [setup-check, database-foundation, vulnerability-check]
+    if: ${{ always() }}
+    needs: [format, vet, build, unit-tests, integration-tests, image-acceptance, vulnerability-check]
     runs-on: ubuntu-24.04
     timeout-minutes: 1
     env:
-      SETUP_RESULT: ${{ needs.setup-check.result }}
-      DATABASE_RESULT: ${{ needs.database-foundation.result }}
+      FORMAT_RESULT: ${{ needs.format.result }}
+      VET_RESULT: ${{ needs.vet.result }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      UNIT_RESULT: ${{ needs.unit-tests.result }}
+      INTEGRATION_RESULT: ${{ needs.integration-tests.result }}
+      IMAGE_RESULT: ${{ needs.image-acceptance.result }}
       VULNERABILITY_RESULT: ${{ needs.vulnerability-check.result }}
     steps:
       - name: Require all CI jobs to succeed
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${SETUP_RESULT:-}" != "success" || "${DATABASE_RESULT:-}" != "success" || "${VULNERABILITY_RESULT:-}" != "success" ]]; then
+          if [[ "${FORMAT_RESULT:-}" != "success" || "${VET_RESULT:-}" != "success" || "${BUILD_RESULT:-}" != "success" || "${UNIT_RESULT:-}" != "success" || "${INTEGRATION_RESULT:-}" != "success" || "${IMAGE_RESULT:-}" != "success" || "${VULNERABILITY_RESULT:-}" != "success" ]]; then
             echo "ci-gate: one or more required jobs did not succeed"
             exit 1
           fi
