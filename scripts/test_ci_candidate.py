@@ -38,6 +38,9 @@ FIXTURE_SPEC.loader.exec_module(fixtures)
 
 release = ci_candidate.release
 SOURCE_SHA = fixtures.SOURCE_SHA
+WORKFLOW_REF = (
+    "xtianxx/payment-hub/.github/workflows/ci.yml@refs/heads/main"
+)
 WRITER_TOKEN = "FAKE-ci-candidate-writer-token"
 AUDIT_TOKEN = "FAKE-ci-candidate-audit-token"
 
@@ -68,13 +71,14 @@ def make_build_root(
     return root
 
 
-def build_env(**overrides: str) -> dict[str, str]:
+def build_env(**overrides: str | None) -> dict[str, str]:
     env = {
         "GITHUB_ACTIONS": "true",
         "GITHUB_EVENT_NAME": "push",
         "GITHUB_REF": "refs/heads/main",
         "GITHUB_REPOSITORY": release.REPOSITORY,
         "GITHUB_SHA": SOURCE_SHA,
+        "GITHUB_WORKFLOW_REF": WORKFLOW_REF,
         "GITHUB_ACTOR": "github-actions[bot]",
         "GITHUB_TRIGGERING_ACTOR": "github-actions[bot]",
         "GITHUB_RUN_ID": "12345",
@@ -82,7 +86,11 @@ def build_env(**overrides: str) -> dict[str, str]:
         "GITHUB_TOKEN": WRITER_TOKEN,
         release.AUDIT_TOKEN_ENV: AUDIT_TOKEN,
     }
-    env.update(overrides)
+    for key, value in overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     return env
 
 
@@ -145,6 +153,9 @@ class ExportTests(unittest.TestCase):
             self.assertNotIn(WRITER_TOKEN, text)
             self.assertNotIn(AUDIT_TOKEN, text)
 
+    def test_workflow_ref_constant_matches_producer_contract(self):
+        self.assertEqual(ci_candidate.WORKFLOW_REF, WORKFLOW_REF)
+
     def test_export_success_writes_only_four_bundle_files(self):
         args = self._export_args(name="candidate")
         with mock.patch.object(
@@ -172,15 +183,34 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(self.fake.login_calls, 0)
         self.assertEqual(self.fake.push_calls, [])
         self.assertEqual(self.fake.pull_calls, [])
-        docker_verbs = [
-            call["argv"][1]
+        docker_calls = [
+            call["argv"]
             for call in self.fake.calls
-            if len(call["argv"]) > 1
-            and Path(call["argv"][0]).name == "docker"
+            if call["argv"] and Path(call["argv"][0]).name == "docker"
         ]
-        for forbidden in ("load", "login", "push", "tag", "pull"):
-            self.assertNotIn(forbidden, docker_verbs)
-        self.assertIn("image", docker_verbs)
+        self.assertEqual(
+            [argv[1:3] for argv in docker_calls],
+            [
+                ["image", "inspect"],
+                ["image", "inspect"],
+                ["image", "save"],
+            ],
+        )
+        self.assertEqual(
+            [argv[-1] for argv in docker_calls[:2]],
+            [fixtures.APP_REF, fixtures.MIGRATE_REF],
+        )
+        save = docker_calls[2]
+        self.assertEqual(save[3], "--output")
+        self.assertEqual(
+            Path(save[4]),
+            Path(args.artifact_root)
+            / release.DEFAULT_BUNDLE
+            / release.PAIR_FILE,
+        )
+        self.assertEqual(
+            save[5:], [fixtures.APP_REF, fixtures.MIGRATE_REF]
+        )
         self._assert_no_tokens(self.fake)
         self.instance.http.assert_not_called()
         for call in self.fake.calls:
@@ -190,9 +220,12 @@ class ExportTests(unittest.TestCase):
             self.assertNotIn("check-vulnerabilities.py", text)
             self.assertNotIn("check-db-foundation.py", text)
         output = Path(args.github_output)
+        output_text = output.read_text(encoding="utf-8")
+        self.assertEqual(len(output_text.splitlines()), 3)
+        self.assertNotIn("<<", output_text)
         values = dict(
             line.split("=", 1)
-            for line in output.read_text(encoding="utf-8").splitlines()
+            for line in output_text.splitlines()
             if line
         )
         self.assertEqual(
@@ -217,6 +250,28 @@ class ExportTests(unittest.TestCase):
             (bundle / release.DESCRIPTOR_FILE).read_text()
         )
         self.assertEqual(descriptor["source_sha"], SOURCE_SHA)
+        self.assertEqual(
+            descriptor["builder"]["build_record_sha256"],
+            fixtures.sha256(
+                (bundle / release.BUILD_RECORD_FILE).read_bytes()
+            ),
+        )
+        self.assertEqual(
+            descriptor["builder"]["accepted_report_sha256"],
+            fixtures.sha256(
+                (bundle / release.ACCEPTED_BUNDLE_FILE).read_bytes()
+            ),
+        )
+        self.assertEqual(
+            (bundle / release.BUILD_RECORD_FILE).read_bytes(),
+            (self.build_root / release.BUILD_RECORD_FILE).read_bytes(),
+        )
+        self.assertEqual(
+            (bundle / release.ACCEPTED_BUNDLE_FILE).read_bytes(),
+            next(
+                (self.build_root / "validation").glob("*/images.json")
+            ).read_bytes(),
+        )
         self.assertEqual(
             values["descriptor_sha256"],
             fixtures.sha256(
@@ -283,6 +338,56 @@ class ExportTests(unittest.TestCase):
                 "repository",
             ),
             (
+                "workflow-ref-missing",
+                {"GITHUB_WORKFLOW_REF": None},
+                None,
+                "context",
+                "workflow-ref",
+            ),
+            (
+                "workflow-ref-other-workflow",
+                {
+                    "GITHUB_WORKFLOW_REF": (
+                        "xtianxx/payment-hub/.github/workflows/"
+                        "release.yml@refs/heads/main"
+                    )
+                },
+                None,
+                "context",
+                "workflow-ref",
+            ),
+            (
+                "workflow-ref-other-repo",
+                {
+                    "GITHUB_WORKFLOW_REF": (
+                        "other/payment-hub/.github/workflows/"
+                        "ci.yml@refs/heads/main"
+                    )
+                },
+                None,
+                "context",
+                "workflow-ref",
+            ),
+            (
+                "workflow-ref-other-ref",
+                {
+                    "GITHUB_WORKFLOW_REF": (
+                        "xtianxx/payment-hub/.github/workflows/"
+                        "ci.yml@refs/heads/dev"
+                    )
+                },
+                None,
+                "context",
+                "workflow-ref",
+            ),
+            (
+                "workflow-ref-display-name",
+                {"GITHUB_WORKFLOW_REF": "CI"},
+                None,
+                "context",
+                "workflow-ref",
+            ),
+            (
                 "github-sha",
                 {"GITHUB_SHA": "b" * 40},
                 None,
@@ -325,6 +430,14 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual(fake.save_calls, 0)
                 self.assertEqual(fake.login_calls, 0)
                 self.assertEqual(fake.push_calls, [])
+                self.assertEqual(fake.pull_calls, [])
+                docker_calls = [
+                    call["argv"]
+                    for call in fake.calls
+                    if call["argv"]
+                    and Path(call["argv"][0]).name == "docker"
+                ]
+                self.assertEqual(docker_calls, [])
                 self._assert_no_tokens(fake)
 
     def test_record_and_tar_rejections(self):
@@ -477,6 +590,327 @@ class ExportTests(unittest.TestCase):
             (caught.exception.stage, caught.exception.kind),
             ("cancelled", "signal"),
         )
+
+
+    def _docker_calls(self, fake):
+        return [
+            call["argv"]
+            for call in fake.calls
+            if call["argv"] and Path(call["argv"][0]).name == "docker"
+        ]
+
+    def _helper_export(self, root):
+        return self.instance._export_release_bundle(
+            root=root,
+            build_root=self.build_root,
+            trusted=release.TrustedContext(
+                source_sha=SOURCE_SHA,
+                repo=self.repo,
+            ),
+        )
+
+    def test_github_output_value_injection_is_rejected_before_open(self):
+        cases = [
+            (
+                "descriptor-newline",
+                {
+                    "bundle_dir": Path("/tmp/ok"),
+                    "descriptor_sha256": "a" * 64 + "\ninjected=1",
+                    "source_sha": SOURCE_SHA,
+                },
+            ),
+            (
+                "source-carriage-return",
+                {
+                    "bundle_dir": Path("/tmp/ok"),
+                    "descriptor_sha256": "a" * 64,
+                    "source_sha": SOURCE_SHA + "\r",
+                },
+            ),
+            (
+                "bundle-newline",
+                {
+                    "bundle_dir": Path("/tmp/bad\npath"),
+                    "descriptor_sha256": "a" * 64,
+                    "source_sha": SOURCE_SHA,
+                },
+            ),
+        ]
+        for label, values in cases:
+            with self.subTest(label=label):
+                output = self.base / f"value-{label}.out"
+                with self.assertRaises(release.ReleaseError) as caught:
+                    ci_candidate._write_github_output(output, **values)
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("artifact", "github-output"),
+                )
+                self.assertFalse(output.exists())
+
+    def test_artifact_root_newline_is_rejected_before_writes(self):
+        for label, name in (
+            ("newline", "bad\nroot"),
+            ("carriage-return", "bad\rroot"),
+        ):
+            with self.subTest(label=label):
+                fake = fixtures.FakeRunner(self.pair)
+                fake.tar_source = self.pair.tar_path
+                instance = self._instance(fake)
+                root = self.base / name
+                output = self.base / f"root-{label}.out"
+                args = self._export_args(
+                    name=f"root-{label}",
+                    artifact_root=root,
+                    output=output,
+                )
+                with self.assertRaises(release.ReleaseError) as caught:
+                    ci_candidate._export(args, self.env, instance)
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("artifact", "github-output"),
+                )
+                self.assertFalse(root.exists())
+                self.assertFalse(output.exists())
+                self.assertEqual(self._docker_calls(fake), [])
+
+    def test_github_output_path_precheck_rejects_artifact_overlap(self):
+        cases = [
+            ("handoff", "handoff", False),
+            ("descriptor", "descriptor", True),
+            ("inside-root", "inside-root", False),
+            ("root-itself", "root-itself", False),
+        ]
+        for label, output_kind, make_bundle in cases:
+            with self.subTest(label=label):
+                root = self.base / f"overlap-{label}-root"
+                root.mkdir()
+                bundle = root / release.DEFAULT_BUNDLE
+                if output_kind == "handoff":
+                    output = root / release.HANDOFF_FILE
+                elif output_kind == "descriptor":
+                    output = bundle / release.DESCRIPTOR_FILE
+                elif output_kind == "inside-root":
+                    output = root / "github-output.txt"
+                else:
+                    output = root
+                if make_bundle:
+                    bundle.mkdir()
+                fake = fixtures.FakeRunner(self.pair)
+                fake.tar_source = self.pair.tar_path
+                instance = self._instance(fake)
+                args = self._export_args(
+                    name=f"overlap-{label}",
+                    artifact_root=root,
+                    output=output,
+                )
+                with self.assertRaises(release.ReleaseError) as caught:
+                    ci_candidate._export(args, self.env, instance)
+                self.assertEqual(
+                    (caught.exception.stage, caught.exception.kind),
+                    ("artifact", "github-output"),
+                )
+                self.assertEqual(self._docker_calls(fake), [])
+                self.assertFalse(output.is_file())
+                if make_bundle:
+                    self.assertEqual(list(bundle.iterdir()), [])
+                else:
+                    self.assertEqual(list(root.iterdir()), [])
+
+    def test_github_output_path_rejects_symlink_and_non_regular(self):
+        root = self.base / "path-root"
+        root.mkdir()
+        target = self.base / "target.out"
+        target.write_text("untouched\n")
+
+        output = self.base / "output-link.out"
+        output.symlink_to(target)
+        args = self._export_args(
+            name="output-symlink", artifact_root=root, output=output
+        )
+        with self.assertRaises(release.ReleaseError) as caught:
+            ci_candidate._export(args, self.env, self.instance)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("artifact", "github-output"),
+        )
+        self.assertEqual(target.read_text(), "untouched\n")
+
+        linked_parent = self.base / "linked-parent"
+        linked_parent.symlink_to(root, target_is_directory=True)
+        args = self._export_args(
+            name="parent-symlink",
+            artifact_root=root,
+            output=linked_parent / "out.txt",
+        )
+        with self.assertRaises(release.ReleaseError) as caught:
+            ci_candidate._export(args, self.env, self.instance)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("artifact", "github-output"),
+        )
+
+        directory = self.base / "output-directory"
+        directory.mkdir()
+        args = self._export_args(
+            name="output-directory", artifact_root=root, output=directory
+        )
+        with self.assertRaises(release.ReleaseError) as caught:
+            ci_candidate._export(args, self.env, self.instance)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("artifact", "github-output"),
+        )
+        self.assertEqual(self._docker_calls(self.instance.runner), [])
+        self.assertEqual(list(root.iterdir()), [])
+
+    def test_github_output_appends_to_existing_external_file(self):
+        output = self.base / "external.out"
+        output.write_text("existing=1\n")
+        output.chmod(0o644)
+        args = self._export_args(name="append", output=output)
+        code = ci_candidate._export(args, self.env, self.instance)
+        self.assertEqual(code, 0)
+        lines = output.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "existing=1")
+        self.assertEqual(len(lines), 4)
+        values = dict(line.split("=", 1) for line in lines[1:])
+        self.assertEqual(
+            set(values),
+            {"bundle_dir", "descriptor_sha256", "source_sha"},
+        )
+        self.assertEqual(
+            Path(values["bundle_dir"]),
+            Path(args.artifact_root) / release.DEFAULT_BUNDLE,
+        )
+        self.assertEqual(values["source_sha"], SOURCE_SHA)
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+
+    def test_export_helper_detects_record_change_after_validation(self):
+        root = self.base / "snapshot-record"
+        root.mkdir()
+        record = json.loads(fixtures.build_record_bytes(self.pair))
+        record["source_manifest_digest"] = "e" * 64
+        original = release.Release._verify_local_images
+
+        def verify_then_mutate(instance, record_value):
+            inspected = original(instance, record_value)
+            (self.build_root / release.BUILD_RECORD_FILE).write_bytes(
+                fixtures.json_bytes(record)
+            )
+            return inspected
+
+        with mock.patch.object(
+            release.Release,
+            "_verify_local_images",
+            new=verify_then_mutate,
+        ):
+            with self.assertRaises(release.ReleaseError) as caught:
+                self._helper_export(root)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("builder", "record-changed"),
+        )
+        self.assertEqual(self.fake.save_calls, 0)
+        self.assertEqual(list(root.iterdir()), [])
+
+    def test_export_helper_detects_accepted_change_after_validation(self):
+        root = self.base / "snapshot-accepted"
+        root.mkdir()
+        accepted_path = next(
+            (self.build_root / "validation").glob("*/images.json")
+        )
+        accepted = json.loads(fixtures.accepted_bytes(self.pair))
+        accepted["generated_at"] = "2026-11-13T00:00:00+00:00"
+        original = release.Release._verify_local_images
+
+        def verify_then_mutate(instance, record_value):
+            inspected = original(instance, record_value)
+            accepted_path.write_bytes(fixtures.json_bytes(accepted))
+            return inspected
+
+        with mock.patch.object(
+            release.Release,
+            "_verify_local_images",
+            new=verify_then_mutate,
+        ):
+            with self.assertRaises(release.ReleaseError) as caught:
+                self._helper_export(root)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("builder", "accepted-changed"),
+        )
+        self.assertEqual(self.fake.save_calls, 0)
+        self.assertEqual(list(root.iterdir()), [])
+
+    def test_export_helper_same_bytes_succeeds_at_validation_seam(self):
+        root = self.base / "snapshot-ok"
+        root.mkdir()
+        seen = []
+        original = release.Release._verify_local_images
+
+        def observe(instance, record_value):
+            inspected = original(instance, record_value)
+            seen.append(True)
+            self.assertEqual(self.fake.save_calls, 0)
+            self.assertEqual(
+                len(
+                    [
+                        call
+                        for call in self.fake.calls
+                        if call["argv"][1:3] == ["image", "inspect"]
+                    ]
+                ),
+                2,
+            )
+            return inspected
+
+        with mock.patch.object(
+            release.Release,
+            "_verify_local_images",
+            new=observe,
+        ):
+            exported = self._helper_export(root)
+        self.assertEqual(seen, [True])
+        bundle = root / release.DEFAULT_BUNDLE
+        record_path = self.build_root / release.BUILD_RECORD_FILE
+        accepted_path = next(
+            (self.build_root / "validation").glob("*/images.json")
+        )
+        record_bytes = record_path.read_bytes()
+        accepted_bytes = accepted_path.read_bytes()
+        self.assertEqual(
+            (bundle / release.BUILD_RECORD_FILE).read_bytes(),
+            record_bytes,
+        )
+        self.assertEqual(
+            (bundle / release.ACCEPTED_BUNDLE_FILE).read_bytes(),
+            accepted_bytes,
+        )
+        self.assertEqual(
+            exported["record_sha"], fixtures.sha256(record_bytes)
+        )
+        self.assertEqual(
+            exported["accepted_sha"], fixtures.sha256(accepted_bytes)
+        )
+        descriptor = json.loads(
+            (bundle / release.DESCRIPTOR_FILE).read_text()
+        )
+        self.assertEqual(
+            descriptor["builder"]["build_record_sha256"],
+            exported["record_sha"],
+        )
+        self.assertEqual(
+            descriptor["builder"]["accepted_report_sha256"],
+            exported["accepted_sha"],
+        )
+        handoff = json.loads((root / release.HANDOFF_FILE).read_text())
+        self.assertEqual(
+            handoff["descriptor_sha256"],
+            fixtures.sha256(
+                (bundle / release.DESCRIPTOR_FILE).read_bytes()
+            ),
+        )
+        self.assertEqual(self.fake.save_calls, 1)
 
 
 class PointerTests(unittest.TestCase):
@@ -704,6 +1138,49 @@ class PointerTests(unittest.TestCase):
                 {"GITHUB_REPOSITORY": "other/repo"},
                 "context",
                 "repository",
+            ),
+            (
+                "context-workflow-ref-missing",
+                {},
+                {"GITHUB_WORKFLOW_REF": None},
+                "context",
+                "workflow-ref",
+            ),
+            (
+                "context-workflow-ref-other-workflow",
+                {},
+                {
+                    "GITHUB_WORKFLOW_REF": (
+                        "xtianxx/payment-hub/.github/workflows/"
+                        "release.yml@refs/heads/main"
+                    )
+                },
+                "context",
+                "workflow-ref",
+            ),
+            (
+                "context-workflow-ref-other-repo",
+                {},
+                {
+                    "GITHUB_WORKFLOW_REF": (
+                        "other/payment-hub/.github/workflows/"
+                        "ci.yml@refs/heads/main"
+                    )
+                },
+                "context",
+                "workflow-ref",
+            ),
+            (
+                "context-workflow-ref-other-ref",
+                {},
+                {
+                    "GITHUB_WORKFLOW_REF": (
+                        "xtianxx/payment-hub/.github/workflows/"
+                        "ci.yml@refs/heads/dev"
+                    )
+                },
+                "context",
+                "workflow-ref",
             ),
             (
                 "context-sha",

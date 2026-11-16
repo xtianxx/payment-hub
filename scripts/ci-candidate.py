@@ -17,6 +17,7 @@ import argparse
 import importlib.util
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -33,6 +34,9 @@ _RELEASE_SPEC.loader.exec_module(release)
 
 CANDIDATE_SCHEMA = "payment-hub.ci-candidate.v1"
 WORKFLOW_PATH = ".github/workflows/ci.yml"
+WORKFLOW_REF = (
+    "xtianxx/payment-hub/.github/workflows/ci.yml@refs/heads/main"
+)
 
 
 def _validate_main_push_context(
@@ -46,6 +50,8 @@ def _validate_main_push_context(
         raise release.ReleaseError("context", "ref")
     if env.get("GITHUB_REPOSITORY") != release.REPOSITORY:
         raise release.ReleaseError("context", "repository")
+    if env.get("GITHUB_WORKFLOW_REF") != WORKFLOW_REF:
+        raise release.ReleaseError("context", "workflow-ref")
     github_sha = release._source_sha(
         env.get("GITHUB_SHA"), "context", "github-sha"
     )
@@ -92,6 +98,56 @@ def _normalize_artifact_digest(value: Any) -> str:
     return "sha256:" + digest
 
 
+def _validate_output_value(value: str) -> str:
+    """Reject values that could inject extra GITHUB_OUTPUT lines."""
+    if not isinstance(value, str) or not value:
+        raise release.ReleaseError("artifact", "github-output")
+    if "\r" in value or "\n" in value:
+        raise release.ReleaseError("artifact", "github-output")
+    return value
+
+
+def _validate_github_output_path(path: Path, root: Path) -> None:
+    """Precheck the output file before any candidate artifact is written.
+
+    The output may be an existing regular file outside the artifact root so
+    later workflow steps can append their own keys.  It may not be a symlink,
+    a non-regular file, or an alias/descendant of the artifact root (which
+    contains the bundle, descriptor, and handoff pointer).
+    """
+    try:
+        if path.is_symlink():
+            raise release.ReleaseError("artifact", "github-output")
+        if path.exists():
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise release.ReleaseError("artifact", "github-output")
+        parent_info = path.parent.lstat()
+    except release.ReleaseError:
+        raise
+    except OSError as exc:
+        raise release.ReleaseError("artifact", "github-output") from exc
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(
+        parent_info.st_mode
+    ):
+        raise release.ReleaseError("artifact", "github-output")
+    canonical = Path(os.path.realpath(path))
+    canonical_root = Path(os.path.realpath(root))
+    forbidden = {
+        canonical_root,
+        canonical_root / release.DEFAULT_BUNDLE,
+        canonical_root / release.DEFAULT_BUNDLE / release.DESCRIPTOR_FILE,
+        canonical_root / release.HANDOFF_FILE,
+    }
+    if canonical in forbidden:
+        raise release.ReleaseError("artifact", "github-output")
+    try:
+        canonical.relative_to(canonical_root)
+    except ValueError:
+        return
+    raise release.ReleaseError("artifact", "github-output")
+
+
 def _write_github_output(
     path: Path,
     *,
@@ -99,13 +155,35 @@ def _write_github_output(
     descriptor_sha256: str,
     source_sha: str,
 ) -> None:
-    if path.is_symlink() or not path.parent.is_dir():
-        raise release.ReleaseError("artifact", "github-output")
+    lines = [
+        ("bundle_dir", str(bundle_dir)),
+        ("descriptor_sha256", descriptor_sha256),
+        ("source_sha", source_sha),
+    ]
+    for name, value in lines:
+        _validate_output_value(value)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"bundle_dir={bundle_dir}\n")
-            handle.write(f"descriptor_sha256={descriptor_sha256}\n")
-            handle.write(f"source_sha={source_sha}\n")
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise release.ReleaseError("artifact", "github-output") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise release.ReleaseError("artifact", "github-output")
+        os.fchmod(descriptor, 0o600)
+    except release.ReleaseError:
+        os.close(descriptor)
+        raise
+    except OSError as exc:
+        os.close(descriptor)
+        raise release.ReleaseError("artifact", "github-output") from exc
+    try:
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            handle.write(
+                "".join(f"{name}={value}\n" for name, value in lines)
+            )
     except OSError as exc:
         raise release.ReleaseError("artifact", "github-output") from exc
 
@@ -122,6 +200,8 @@ def _export_impl(
     build_root = _absolute_path(args.build_root, "cli", "build-root")
     output = _absolute_path(args.github_output, "cli", "github-output")
     _validate_main_push_context(env, source_sha)
+    _validate_github_output_path(output, root)
+    _validate_output_value(str(root / release.DEFAULT_BUNDLE))
     instance.env = dict(env)
     _validate_git_context(instance, source_sha)
     if build_root.is_symlink():
