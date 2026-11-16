@@ -30,6 +30,20 @@ MOD = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MOD
 SPEC.loader.exec_module(MOD)
 
+
+def load_pristine_check_main_ci():
+    """Load production check-main-ci.py in an isolated module namespace."""
+    name = "check_main_ci_pristine"
+    spec = importlib.util.spec_from_file_location(
+        name,
+        REPO / "scripts" / "check-main-ci.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 TOKEN = "ghs_test_token_1234567890"
 SHA = "a" * 40
 OLDER = "2026-01-01T00:00:00Z"
@@ -897,8 +911,29 @@ class GateTests(GateTestCase):
         self.assertEqual(self.gate(), ("runs", "identity"))
 
     def test_workflow_paths_has_only_ci_workflow(self):
+        pristine = load_pristine_check_main_ci()
         self.assertEqual(
-            MOD.WORKFLOW_PATHS, (".github/workflows/ci.yml",)
+            pristine.CANDIDATE_WORKFLOW_PATH,
+            ".github/workflows/ci.yml",
+        )
+        self.assertEqual(
+            pristine.WORKFLOW_PATHS,
+            (pristine.CANDIDATE_WORKFLOW_PATH,),
+        )
+        states = pristine.default_workflow_states()
+        self.assertEqual(
+            tuple(state.path for state in states),
+            (pristine.CANDIDATE_WORKFLOW_PATH,),
+        )
+        summary = pristine.build_summary(
+            result="pass",
+            failure=None,
+            source_sha=SHA,
+            workflows=states,
+        )
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            [".github/workflows/ci.yml"],
         )
 
     def test_older_success_does_not_mask_latest_failure(self):
@@ -1636,6 +1671,134 @@ class EnvironmentAndMainTests(GateTestCase):
         self.assertEqual(
             stdout,
             "ci-preflight: fail stage=summary kind=write\n",
+        )
+
+
+class LockWorkflowPreconditionTests(unittest.TestCase):
+    """A run lock is valid only for the fixed candidate CI workflow."""
+
+    LEGACY = (
+        ".github/workflows/setup-check.yml",
+        ".github/workflows/check.yml",
+    )
+
+    def make_api(self, fake):
+        return MOD.GitHubApi(TOKEN, transport=fake.transport)
+
+    def add_success(self, fake, path, workflow_id, run_id):
+        fake.workflow_responses[path.rsplit("/", 1)[-1]] = json_response(
+            make_workflow(path, workflow_id)
+        )
+        run = make_run(run_id, workflow_id, path)
+        fake.page_responses[(workflow_id, 1)] = json_response(
+            make_runs(1, [run])
+        )
+        fake.attempt_responses[(run_id, 1)] = json_response(run)
+
+    def add_legacy_success(self, fake, path, workflow_id, run_id):
+        self.add_success(fake, path, workflow_id, run_id)
+
+    def locked_config(self):
+        return MOD.Config(
+            source_sha=SHA,
+            summary_path=Path("/unused-lock-workflow"),
+            expected_run_id=1001,
+            expected_run_attempt=1,
+        )
+
+    def test_lock_single_candidate_succeeds_when_defaults_are_legacy(self):
+        fake = FakeGitHub()
+        self.add_success(fake, MOD.CANDIDATE_WORKFLOW_PATH, 101, 1001)
+        states = [MOD.WorkflowState(path=MOD.CANDIDATE_WORKFLOW_PATH)]
+        with mock.patch.object(MOD, "WORKFLOW_PATHS", self.LEGACY):
+            self.assertIsNone(
+                MOD.run_gate(
+                    self.locked_config(), self.make_api(fake), states
+                )
+            )
+        self.assertTrue(any("ci.yml" in url for url in fake.requests))
+
+    def test_lock_rejects_single_legacy_when_defaults_are_legacy(self):
+        fake = FakeGitHub()
+        states = [MOD.WorkflowState(path=self.LEGACY[0])]
+        with mock.patch.object(MOD, "WORKFLOW_PATHS", self.LEGACY):
+            self.assertEqual(
+                MOD.run_gate(
+                    self.locked_config(), self.make_api(fake), states
+                ),
+                ("cli", "lock-workflow"),
+            )
+        self.assertEqual(fake.requests, [])
+
+    def test_lock_rejects_legacy_pair_when_defaults_are_legacy(self):
+        fake = FakeGitHub()
+        states = [
+            MOD.WorkflowState(path=self.LEGACY[0]),
+            MOD.WorkflowState(path=self.LEGACY[1]),
+        ]
+        with mock.patch.object(MOD, "WORKFLOW_PATHS", self.LEGACY):
+            self.assertEqual(
+                MOD.run_gate(
+                    self.locked_config(), self.make_api(fake), states
+                ),
+                ("cli", "lock-workflow"),
+            )
+        self.assertEqual(fake.requests, [])
+
+    def test_lock_rejects_two_legacy_states_before_api(self):
+        fake = FakeGitHub()
+        states = [
+            MOD.WorkflowState(path=self.LEGACY[0]),
+            MOD.WorkflowState(path=self.LEGACY[1]),
+        ]
+        self.assertEqual(
+            MOD.run_gate(self.locked_config(), self.make_api(fake), states),
+            ("cli", "lock-workflow"),
+        )
+        self.assertEqual(fake.requests, [])
+
+    def test_lock_rejects_single_non_candidate_workflow_before_api(self):
+        fake = FakeGitHub()
+        states = [MOD.WorkflowState(path=self.LEGACY[0])]
+        self.assertEqual(
+            MOD.run_gate(self.locked_config(), self.make_api(fake), states),
+            ("cli", "lock-workflow"),
+        )
+        self.assertEqual(fake.requests, [])
+
+    def test_default_no_lock_legacy_pair_still_runs(self):
+        fake = FakeGitHub()
+        self.add_legacy_success(fake, self.LEGACY[0], 101, 1001)
+        self.add_legacy_success(fake, self.LEGACY[1], 202, 2002)
+        states = [
+            MOD.WorkflowState(path=self.LEGACY[0]),
+            MOD.WorkflowState(path=self.LEGACY[1]),
+        ]
+        config = MOD.Config(
+            source_sha=SHA,
+            summary_path=Path("/unused-legacy-gate"),
+        )
+        with mock.patch.object(MOD, "WORKFLOW_PATHS", self.LEGACY):
+            self.assertIsNone(
+                MOD.run_gate(config, self.make_api(fake), states)
+            )
+        self.assertTrue(
+            any("setup-check.yml" in url for url in fake.requests)
+        )
+        self.assertTrue(
+            any("/actions/workflows/202/runs" in url for url in fake.requests)
+        )
+
+    def test_lock_workflow_failure_is_whitelisted(self):
+        summary = MOD.build_summary(
+            result="fail",
+            failure=("cli", "lock-workflow"),
+            source_sha=SHA,
+            workflows=MOD.default_workflow_states(),
+        )
+        self.assertEqual(
+            summary["failure"],
+            {"stage": "cli", "kind": "lock-workflow"},
         )
 
 
