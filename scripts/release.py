@@ -468,8 +468,7 @@ def _read_bounded_bytes(path: Path, stage: str, kind: str, maximum: int) -> byte
         raise ReleaseError(stage, kind) from exc
 
 
-def _read_json(path: Path, stage: str, kind: str, maximum: int) -> dict[str, Any]:
-    data = _read_bounded_bytes(path, stage, kind, maximum)
+def _parse_json_object(data: bytes, stage: str, kind: str) -> dict[str, Any]:
     try:
         value = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -477,6 +476,12 @@ def _read_json(path: Path, stage: str, kind: str, maximum: int) -> dict[str, Any
     if not isinstance(value, dict):
         raise ReleaseError(stage, kind)
     return value
+
+
+def _read_json(path: Path, stage: str, kind: str, maximum: int) -> dict[str, Any]:
+    return _parse_json_object(
+        _read_bounded_bytes(path, stage, kind, maximum), stage, kind
+    )
 
 
 def _write_bytes_exclusive(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -1779,30 +1784,25 @@ class Release:
         self, build_root: Path, trusted: TrustedContext
     ) -> tuple[dict[str, Any], Path, Path, str, str]:
         record_path = build_root / BUILD_RECORD_FILE
-        record = _read_json(
+        record_bytes = _read_bounded_bytes(
             record_path, "builder", "build-record", BUILD_RECORD_MAX_BYTES
         )
+        record = _parse_json_object(record_bytes, "builder", "build-record")
         reports = sorted((build_root / "validation").glob("*/images.json"))
         if len(reports) != 1:
             raise ReleaseError("builder", "accepted-report")
         accepted_path = reports[0]
-        accepted = _read_json(
-            accepted_path,
-            "builder",
-            "accepted-report",
-            ACCEPTED_REPORT_MAX_BYTES,
-        )
-        self._validate_build_record(record, trusted)
-        self._validate_accepted_report(accepted, record)
-        record_bytes = _read_bounded_bytes(
-            record_path, "builder", "build-record", BUILD_RECORD_MAX_BYTES
-        )
         accepted_bytes = _read_bounded_bytes(
             accepted_path,
             "builder",
             "accepted-report",
             ACCEPTED_REPORT_MAX_BYTES,
         )
+        accepted = _parse_json_object(
+            accepted_bytes, "builder", "accepted-report"
+        )
+        self._validate_build_record(record, trusted)
+        self._validate_accepted_report(accepted, record)
         return (
             record,
             record_path,
@@ -2236,41 +2236,20 @@ class Release:
         with self._cancel_handlers():
             return self._prepare_impl(args)
 
-    def _prepare_impl(self, args: argparse.Namespace) -> int:
-        root = Path(args.artifact_root).expanduser()
-        if not root.is_absolute():
-            raise ReleaseError("cli", "artifact-root")
-        _fresh_root(root)
-        # prepare never needs the publish credentials and must not pass either
-        # token to builder or check subprocesses.
-        self.env.pop("GITHUB_TOKEN", None)
-        self.env.pop(AUDIT_TOKEN_ENV, None)
+    def _export_release_bundle(
+        self,
+        *,
+        root: Path,
+        build_root: Path,
+        trusted: TrustedContext,
+    ) -> dict[str, Any]:
+        """Export the verified local build artifacts as one release bundle.
 
-        trusted = self.trusted_context(args.source_sha)
-        gates = self._run_local_gates(args, root)
-
-        build_root = root / "build"
-        _mkdir_private(build_root)
-        builder_argv = [
-            sys.executable,
-            "-B",
-            str(SCRIPT_DIR / "build-images.py"),
-            "--go",
-            args.go,
-            "--cache-dir",
-            args.cache_dir,
-            "--artifact-root",
-            str(build_root),
-        ]
-        if args.prepare_inputs:
-            builder_argv.append("--prepare-inputs")
-        builder_result = self._run_delegated(
-            builder_argv,
-            cwd=self.repo,
-            timeout=BUILDER_TIMEOUT_SECONDS,
-        )
-        if builder_result.timed_out or builder_result.exit_code != 0:
-            raise ReleaseError("builder", "failed")
+        This is the shared deep helper for manual prepare and CI candidate
+        export.  It reads the existing builder outputs, verifies the local
+        images, saves/parses the pair archive, and writes the four-file bundle
+        plus the internal handoff pointer.  It never runs gates or the builder.
+        """
         (
             record,
             record_path,
@@ -2279,6 +2258,21 @@ class Release:
             accepted_sha,
         ) = self._read_builder_outputs(build_root, trusted)
         inspected = self._verify_local_images(record)
+        # Read the validated bytes once and write exactly these bytes later so
+        # the descriptor hashes always match the bundled record/report.
+        record_bytes = _read_bounded_bytes(
+            record_path, "builder", "build-record", BUILD_RECORD_MAX_BYTES
+        )
+        accepted_bytes = _read_bounded_bytes(
+            accepted_path,
+            "builder",
+            "accepted-report",
+            ACCEPTED_REPORT_MAX_BYTES,
+        )
+        if _sha256_bytes(record_bytes) != record_sha:
+            raise ReleaseError("builder", "record-changed")
+        if _sha256_bytes(accepted_bytes) != accepted_sha:
+            raise ReleaseError("builder", "accepted-changed")
 
         bundle = root / DEFAULT_BUNDLE
         _mkdir_private(bundle)
@@ -2313,15 +2307,6 @@ class Release:
             ):
                 raise ReleaseError("tar", "actual-root")
 
-        record_bytes = _read_bounded_bytes(
-            record_path, "builder", "build-record", BUILD_RECORD_MAX_BYTES
-        )
-        accepted_bytes = _read_bounded_bytes(
-            accepted_path,
-            "builder",
-            "accepted-report",
-            ACCEPTED_REPORT_MAX_BYTES,
-        )
         _write_bytes_exclusive(bundle / BUILD_RECORD_FILE, record_bytes)
         _write_bytes_exclusive(bundle / ACCEPTED_BUNDLE_FILE, accepted_bytes)
         archive_sha, archive_size = _stream_sha256(
@@ -2369,6 +2354,64 @@ class Release:
             "tag": descriptor["tag"],
         }
         _write_json_exclusive(root / HANDOFF_FILE, handoff)
+        return {
+            "bundle": bundle,
+            "record": record,
+            "record_sha": record_sha,
+            "accepted_sha": accepted_sha,
+            "archive_sha": archive_sha,
+            "archive_size": archive_size,
+            "descriptor": descriptor,
+            "descriptor_sha": descriptor_sha,
+        }
+
+    def _prepare_impl(self, args: argparse.Namespace) -> int:
+        root = Path(args.artifact_root).expanduser()
+        if not root.is_absolute():
+            raise ReleaseError("cli", "artifact-root")
+        _fresh_root(root)
+        # prepare never needs the publish credentials and must not pass either
+        # token to builder or check subprocesses.
+        self.env.pop("GITHUB_TOKEN", None)
+        self.env.pop(AUDIT_TOKEN_ENV, None)
+
+        trusted = self.trusted_context(args.source_sha)
+        gates = self._run_local_gates(args, root)
+
+        build_root = root / "build"
+        _mkdir_private(build_root)
+        builder_argv = [
+            sys.executable,
+            "-B",
+            str(SCRIPT_DIR / "build-images.py"),
+            "--go",
+            args.go,
+            "--cache-dir",
+            args.cache_dir,
+            "--artifact-root",
+            str(build_root),
+        ]
+        if args.prepare_inputs:
+            builder_argv.append("--prepare-inputs")
+        builder_result = self._run_delegated(
+            builder_argv,
+            cwd=self.repo,
+            timeout=BUILDER_TIMEOUT_SECONDS,
+        )
+        if builder_result.timed_out or builder_result.exit_code != 0:
+            raise ReleaseError("builder", "failed")
+        exported = self._export_release_bundle(
+            root=root,
+            build_root=build_root,
+            trusted=trusted,
+        )
+        record = exported["record"]
+        record_sha = exported["record_sha"]
+        accepted_sha = exported["accepted_sha"]
+        archive_sha = exported["archive_sha"]
+        archive_size = exported["archive_size"]
+        descriptor = exported["descriptor"]
+        descriptor_sha = exported["descriptor_sha"]
         summary = {
             "schema": SUMMARY_SCHEMA,
             "stage": "prepare",
