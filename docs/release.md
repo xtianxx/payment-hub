@@ -355,13 +355,22 @@ main在镜像标签仍存在时从同一对镜像导出四文件bundle，
 查询和下载只读使用`GITHUB_TOKEN`及`actions: read`；
 包写权限只属于upload job，audit Secret只在publish步骤注入，不写摘要。
 
-建议顺序：修复分支开PR → 两项自动工作流通过 → 合并main → 对合并后SHA的两项工作流通过 → 核实包权限并人工发布。PR绿灯不能代替main合并提交绿灯；发布门禁不会自动等待、重跑CI或改变远端规则。
+建议顺序：修复分支开PR → `ci.yml`及其全部必需检查通过 → 合并main →
+合并后SHA的push/main `ci.yml`及其全部必需检查通过 → 核实包权限并在另行授权后人工发布。
+两个精确必需检查名称仍为`CI gate`与`Paired image acceptance (linux/amd64)`，
+不是要求两个自动工作流；nightly定时运行，release人工触发。
+PR绿灯不能代替main合并提交绿灯；发布门禁不会自动等待、重跑CI或改变远端规则。
 
 每日漏洞扫描通过`nightly.yml`的schedule运行，不触发发布、不生成候选，
 也不替代上述同SHA push/main检查。CI原有漏洞门禁继续保留。
 定时扫描成功不是发布绿灯；GitHub调度可能延迟，不保证准点。
 
-本轮只读确认main已有active ruleset，但未设置必需状态检查。管理员仍需单独配置`CI gate`与`Paired image acceptance (linux/amd64)`为必需检查；本次未修改远端规则。配置后的正式Actions执行、29.9.3真实归档往返、跨job交接及GHCR全链验证仍分别保留证据，不以本地fake测试替代。
+历史环境修复记录当时发现main缺少必需状态检查，不代表当前服务端状态。
+2026-11-16合并前已只读核对active ruleset：
+`CI gate`与`Paired image acceptance (linux/amd64)`均为必需检查，
+严格最新main基线要求已启用；本次没有修改远端规则。
+合并时仍须重新核验这些保护及精确head的检查结果。
+真实归档往返、跨run交接与GHCR全链分别保留证据，不能用本地fake相互替代。
 
 ### 交接预检的取消边界
 
@@ -415,7 +424,7 @@ PG-only基础文件为`deploy/compose.yaml`与`deploy/compose.test.yaml`。应�
 
 ## 受控发布必须具备的门禁
 
-以下为待实施/验证的发布约束，不表示当前已有可执行发布命令：
+以下为受控发布必须保留的约束；实现入口见下文，是否完成真实发布须另有执行证据：
 
 - 只允许默认分支受信ref的人工触发，固定并复核源码SHA；`workflow_dispatch`本身不保证main-only。
 - 在job内拒绝非`refs/heads/main`，不执行不可信PR代码的`pull_request_target`，不接受任意ref替换固定SHA。
@@ -429,9 +438,20 @@ PG-only基础文件为`deploy/compose.yaml`与`deploy/compose.test.yaml`。应�
 
 只读API`repos/xtianxx/payment-hub/actions/permissions/artifact-and-log-retention`返回`days=90`、`maximum_allowed_days=400`。这是当前仓库有效配置/上限，未独立核实其他企业级限制。30天目标在已知上限内。
 
-已固定的upload-artifact版本还声明1–90天的action参数范围；仓库上限与action参数上限是不同限制，30天同时满足两者。后续同轮交接使用已核验的`actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333`（v8.0.2），与现upload v7兼容。按本轮精确artifact ID下载，不指定跨run/repo或PAT；同run使用平台runtime token，不增加`actions: read`。下载校验与prepare可信输出的descriptor/归档哈希校验都必须通过，不能仅相信下载包内自报摘要。
+已固定的upload-artifact版本还声明1–90天的action参数范围；
+仓库上限与action参数上限是不同限制，30天同时满足两者。
+下载使用已固定的`actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333`
+（v8.0.2），与upload v7兼容。
+当前release按选定main CI的run ID和精确artifact ID跨run下载，使用`actions: read`
+及`GITHUB_TOKEN`，不使用PAT或跨仓库来源。
+下载完整性与可信pointer给出的descriptor SHA、归档和镜像身份校验均须通过，
+不能仅相信下载bundle内自报的expected值。旧prepare到upload的同run交接属于历史接口，
+不代表当前候选流程的权限、来源或哈希取得方式。
 
-当前已核的远端只有`setup-check.yml`，其三处上传配置仍为14天。本地T077配置已把这三处及新增`check.yml`的安全摘要设为30天，但未推送/运行，不能宣称远端已生效或既有产物保存30天；实际Actions运行后仍须用artifact的`expires_at`复核。仅修改本地YAML不改变已有对象的到期日。构建/发布产物及诊断都不是永久存储。
+历史T077记录当时只核对了远端`setup-check.yml`的14天配置，
+其本地30天改动尚未推送/运行；这是当时的验证边界，不代表当前工作流仍只有旧文件。
+新工作流请求保留30天，实际Actions运行后仍须用artifact的`expires_at`复核；
+修改YAML不改变已有对象的到期日。构建/发布产物及诊断都不是永久存储。
 
 普通检查job只上传白名单重建的报告。main CI还生成固定原镜像交接bundle
 （两镜像单一归档、descriptor、原构建与验收记录）及小型pointer；
@@ -465,4 +485,12 @@ release只下载这些已验收产物，不重新构建。它们会占用artifac
 当前CI通过`ci-candidate.py`从本轮builder原产物导出bundle，
 CD通过`select-release-candidate.py`绑定可信来源后调用verify-handoff及publish。
 
-verify-handoff只验证固定四文件bundle，必须另传来自可信prepare输出的`--expected-descriptor-sha256`，不能使用下载包自身提供的expected值。publish还要求显式`--approve-external --package-preconditions-verified`、真实包前提检查及受信上下文；这些参数是程序门禁，不替代用户对外部动作的授权。当前真实prepare全链、GHCR认证/上传/按digest拉回均未执行，受控回归不能解除上述未验证状态。
+verify-handoff只验证固定四文件bundle，必须另传受信来源的
+`--expected-descriptor-sha256`。当前`release.yml`从选定main CI运行的可信pointer取得该值，
+经selector核对run/attempt、源码与bundle artifact身份后再使用；
+不能取下载bundle自身提供的expected值，也不应寻找当前流程未生成的prepare输出。
+仅在使用保留的历史prepare接口时，expected值才来自该次可信prepare输出。
+publish仍要求显式`--approve-external --package-preconditions-verified`、
+真实包前提检查及受信上下文；程序门禁不替代用户对外部动作的授权。
+历史prepare结果或本地受控回归均不能替代当前跨run候选交接、
+GHCR认证/上传及按digest拉回的实际证据。
