@@ -2236,41 +2236,20 @@ class Release:
         with self._cancel_handlers():
             return self._prepare_impl(args)
 
-    def _prepare_impl(self, args: argparse.Namespace) -> int:
-        root = Path(args.artifact_root).expanduser()
-        if not root.is_absolute():
-            raise ReleaseError("cli", "artifact-root")
-        _fresh_root(root)
-        # prepare never needs the publish credentials and must not pass either
-        # token to builder or check subprocesses.
-        self.env.pop("GITHUB_TOKEN", None)
-        self.env.pop(AUDIT_TOKEN_ENV, None)
+    def _export_release_bundle(
+        self,
+        *,
+        root: Path,
+        build_root: Path,
+        trusted: TrustedContext,
+    ) -> dict[str, Any]:
+        """Export the verified local build artifacts as one release bundle.
 
-        trusted = self.trusted_context(args.source_sha)
-        gates = self._run_local_gates(args, root)
-
-        build_root = root / "build"
-        _mkdir_private(build_root)
-        builder_argv = [
-            sys.executable,
-            "-B",
-            str(SCRIPT_DIR / "build-images.py"),
-            "--go",
-            args.go,
-            "--cache-dir",
-            args.cache_dir,
-            "--artifact-root",
-            str(build_root),
-        ]
-        if args.prepare_inputs:
-            builder_argv.append("--prepare-inputs")
-        builder_result = self._run_delegated(
-            builder_argv,
-            cwd=self.repo,
-            timeout=BUILDER_TIMEOUT_SECONDS,
-        )
-        if builder_result.timed_out or builder_result.exit_code != 0:
-            raise ReleaseError("builder", "failed")
+        This is the shared deep helper for manual prepare and CI candidate
+        export.  It reads the existing builder outputs, verifies the local
+        images, saves/parses the pair archive, and writes the four-file bundle
+        plus the internal handoff pointer.  It never runs gates or the builder.
+        """
         (
             record,
             record_path,
@@ -2369,6 +2348,64 @@ class Release:
             "tag": descriptor["tag"],
         }
         _write_json_exclusive(root / HANDOFF_FILE, handoff)
+        return {
+            "bundle": bundle,
+            "record": record,
+            "record_sha": record_sha,
+            "accepted_sha": accepted_sha,
+            "archive_sha": archive_sha,
+            "archive_size": archive_size,
+            "descriptor": descriptor,
+            "descriptor_sha": descriptor_sha,
+        }
+
+    def _prepare_impl(self, args: argparse.Namespace) -> int:
+        root = Path(args.artifact_root).expanduser()
+        if not root.is_absolute():
+            raise ReleaseError("cli", "artifact-root")
+        _fresh_root(root)
+        # prepare never needs the publish credentials and must not pass either
+        # token to builder or check subprocesses.
+        self.env.pop("GITHUB_TOKEN", None)
+        self.env.pop(AUDIT_TOKEN_ENV, None)
+
+        trusted = self.trusted_context(args.source_sha)
+        gates = self._run_local_gates(args, root)
+
+        build_root = root / "build"
+        _mkdir_private(build_root)
+        builder_argv = [
+            sys.executable,
+            "-B",
+            str(SCRIPT_DIR / "build-images.py"),
+            "--go",
+            args.go,
+            "--cache-dir",
+            args.cache_dir,
+            "--artifact-root",
+            str(build_root),
+        ]
+        if args.prepare_inputs:
+            builder_argv.append("--prepare-inputs")
+        builder_result = self._run_delegated(
+            builder_argv,
+            cwd=self.repo,
+            timeout=BUILDER_TIMEOUT_SECONDS,
+        )
+        if builder_result.timed_out or builder_result.exit_code != 0:
+            raise ReleaseError("builder", "failed")
+        exported = self._export_release_bundle(
+            root=root,
+            build_root=build_root,
+            trusted=trusted,
+        )
+        record = exported["record"]
+        record_sha = exported["record_sha"]
+        accepted_sha = exported["accepted_sha"]
+        archive_sha = exported["archive_sha"]
+        archive_size = exported["archive_size"]
+        descriptor = exported["descriptor"]
+        descriptor_sha = exported["descriptor_sha"]
         summary = {
             "schema": SUMMARY_SCHEMA,
             "stage": "prepare",
