@@ -2344,9 +2344,10 @@ class SharedSetupLauncherConfigurationTests(unittest.TestCase):
 
 
 class SetupWorkflowBatchBudgetTests(unittest.TestCase):
-    """Static PyYAML and bash -n checks for the frozen workflow contract."""
+    """Static PyYAML and bash -n checks for the frozen ci/nightly workflow contract."""
 
-    WORKFLOW = REPO / ".github" / "workflows" / "setup-check.yml"
+    WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+    NIGHTLY_WORKFLOW = REPO / ".github" / "workflows" / "nightly.yml"
     CHECKOUT = (
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
     )
@@ -2356,6 +2357,9 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
     UPLOAD = (
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
     )
+    SETUP_DOCKER = (
+        "docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6"
+    )
 
     @classmethod
     def setUpClass(cls):
@@ -2363,6 +2367,8 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
             raise unittest.SkipTest("PyYAML is unavailable")
         cls.text = cls.WORKFLOW.read_text(encoding="utf-8")
         cls.data = yaml.safe_load(cls.text)
+        cls.nightly_text = cls.NIGHTLY_WORKFLOW.read_text(encoding="utf-8")
+        cls.nightly_data = yaml.safe_load(cls.nightly_text)
 
     def _job(self, name):
         return self.data["jobs"][name]
@@ -2382,48 +2388,98 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
                 return step
         self.fail(f"missing upload step in {job_name}")
 
-    def test_job_timeouts_are_20_20_10(self):
-        self.assertEqual(self._job("setup-check")["timeout-minutes"], 20)
-        self.assertEqual(
-            self._job("database-foundation")["timeout-minutes"], 20
-        )
-        self.assertEqual(
-            self._job("vulnerability-check")["timeout-minutes"], 10
-        )
+    def test_job_timeouts_are_10_10_10_20_20_30_10_1(self):
+        for job_id, timeout in {
+            "format": 10,
+            "vet": 10,
+            "build": 10,
+            "unit-tests": 20,
+            "integration-tests": 20,
+            "image-acceptance": 30,
+            "vulnerability-check": 10,
+            "ci-gate": 1,
+        }.items():
+            with self.subTest(job=job_id):
+                self.assertEqual(
+                    self._job(job_id)["timeout-minutes"], timeout
+                )
+        nightly = self.nightly_data["jobs"]["vulnerability-check"]
+        self.assertEqual(nightly["timeout-minutes"], 10)
 
-    def test_ci_gate_timeout_is_one_minute_separate_from_original_three(self):
+    def test_ci_gate_timeout_is_one_minute(self):
         self.assertEqual(self._job("ci-gate")["timeout-minutes"], 1)
 
-    def test_permissions_needs_pins_preserved_and_daily_concurrency_isolated(self):
+    def test_permissions_needs_pins_preserved_and_nightly_isolated(self):
         self.assertEqual(self.data["permissions"], {"contents": "read"})
         self.assertEqual(
             self.data["concurrency"],
             {
                 "group": (
                     "${{ github.workflow }}-${{ github.event.pull_request.number "
-                    "|| github.ref }}${{ github.event_name == 'schedule' "
-                    "&& '-daily' || '' }}"
+                    "|| github.ref }}"
                 ),
                 "cancel-in-progress": False,
             },
         )
-        self.assertEqual(self._job("database-foundation")["needs"], "setup-check")
-        self.assertNotIn("needs", self._job("setup-check"))
-        self.assertNotIn("needs", self._job("vulnerability-check"))
+        self.assertEqual(self._job("integration-tests")["needs"], "unit-tests")
+        for job_id in (
+            "format",
+            "vet",
+            "build",
+            "unit-tests",
+            "image-acceptance",
+            "vulnerability-check",
+        ):
+            self.assertNotIn("needs", self._job(job_id))
+        self.assertEqual(
+            self._job("ci-gate")["needs"],
+            [
+                "format",
+                "vet",
+                "build",
+                "unit-tests",
+                "integration-tests",
+                "image-acceptance",
+                "vulnerability-check",
+            ],
+        )
         uses = [
             step["uses"]
             for job in self.data["jobs"].values()
             for step in job.get("steps", [])
             if "uses" in step
         ]
-        self.assertEqual(set(uses), {self.CHECKOUT, self.SETUP_GO, self.UPLOAD})
-        self.assertEqual(uses.count(self.CHECKOUT), 3)
-        self.assertEqual(uses.count(self.SETUP_GO), 3)
-        self.assertEqual(uses.count(self.UPLOAD), 3)
+        self.assertEqual(
+            set(uses),
+            {self.CHECKOUT, self.SETUP_GO, self.UPLOAD, self.SETUP_DOCKER},
+        )
+        self.assertEqual(uses.count(self.CHECKOUT), 7)
+        self.assertEqual(uses.count(self.SETUP_GO), 7)
+        self.assertEqual(uses.count(self.UPLOAD), 6)
+        self.assertEqual(uses.count(self.SETUP_DOCKER), 1)
+        nightly_uses = [
+            step["uses"]
+            for job in self.nightly_data["jobs"].values()
+            for step in job.get("steps", [])
+            if "uses" in step
+        ]
+        self.assertEqual(
+            set(nightly_uses), {self.CHECKOUT, self.SETUP_GO, self.UPLOAD}
+        )
+        self.assertEqual(nightly_uses.count(self.CHECKOUT), 1)
+        self.assertEqual(nightly_uses.count(self.SETUP_GO), 1)
+        self.assertEqual(nightly_uses.count(self.UPLOAD), 1)
+        self.assertEqual(
+            self.nightly_data["concurrency"],
+            {
+                "group": "${{ github.workflow }}-nightly",
+                "cancel-in-progress": False,
+            },
+        )
 
     def test_safe_upload_paths_and_exports_unchanged(self):
         expected = {
-            "setup-check": (
+            "unit-tests": (
                 "Upload safe setup reports",
                 "setup-check-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}",
                 [
@@ -2432,7 +2488,7 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
                 ],
                 "--expect default",
             ),
-            "database-foundation": (
+            "integration-tests": (
                 "Upload safe database reports",
                 "database-foundation-safe-reports-${{ github.run_id }}-${{ github.run_attempt }}",
                 [
@@ -2479,9 +2535,9 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
                 self.assertIn(expect, export_steps[0].get("run", ""))
 
     def test_summaries_share_honest_570_batch_contract(self):
-        default = self._run("setup-check", "Run foundation unit checks")
+        default = self._run("unit-tests", "Run foundation unit checks")
         database = self._run(
-            "database-foundation", "Summarize database foundation results"
+            "integration-tests", "Summarize database foundation results"
         )
         for label, text in (("default", default), ("database", database)):
             with self.subTest(summary=label):
@@ -2503,16 +2559,17 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
                 for forbidden in ("3×120", "3 * 120", "3个120", "三个 120"):
                     self.assertNotIn(forbidden, text)
 
-    def test_all_16_bash_blocks_parse_with_bash_n(self):
+    def test_all_32_bash_blocks_parse_with_bash_n(self):
         bash = shutil.which("bash")
         self.assertIsNotNone(bash)
         scripts = [
             step.get("run", "")
-            for job in self.data["jobs"].values()
+            for data in (self.data, self.nightly_data)
+            for job in data["jobs"].values()
             for step in job.get("steps", [])
             if step.get("shell") == "bash"
         ]
-        self.assertEqual(len(scripts), 16)
+        self.assertEqual(len(scripts), 32)
         for index, script in enumerate(scripts):
             result = subprocess.run(
                 [bash, "-n"],

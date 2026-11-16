@@ -512,27 +512,47 @@ builder各构建一次配对镜像并验收原产物，不认证、上传或部�
 
 **失败诊断与兼容性边界**：`TestApplicationLifecycleIntegration`包含真实二进制缺迁移、启动timeout/cancel/listen失败的停止及脱敏诊断断言，历史fresh PG证据已存在，当前树仍需复验。镜像迁移命令失败后的停止/清理目前有受控runner回归，不冒称已做真实镜像故障实验。遇迁移或启动失败应停止，保存固定分类并收割本次进程，再单独核对本轮资源归属；不清演示卷、不自动重付。当前镜像核对schema版本1/2/3及源码身份，只能证明当前配对适配；没有旧版本镜像兼容实验，不能宣称旧镜像可直接使用新schema。旧构建记录与当前源码失配应拒绝，而不是放宽检查。
 
-### 工作流职责与运行时机（2026-11-14修订）
+### 工作流职责与运行时机（2026-11-15重构）
 
-仍保留三个工作流，不新增手动PR检查、不将正式发布搬到PR。交接预检与发布门禁已随PR #10合并；本次每日漏洞扫描配置仍在`ci/daily-vulnerability-scan`分支，合并main前不会启用定时任务。
+本分支保留三个工作流，按CI、nightly与CD发布重新分工，不新增手动PR检查、
+不将正式发布搬到PR。镜像交接设计、来源核验和未实现实验见[CI/CD说明](ci-cd.md)。
 
 | 工作流 | 用途 | 运行时机 | 权限与边界 |
 |---|---|---|---|
-| `setup-check.yml` | PR/main运行全部基础门禁；每日定时仅运行漏洞扫描 | 目标分支为main的PR创建/更新；push main；每日02:17 UTC（北京时间10:17） | `contents: read`；PR/main原有检查不变，定时跳过setup、数据库与`CI gate` |
-| `check.yml` | 同一对镜像构建一次、验收，再做真实save/load内容身份交接预检 | 目标分支为main的PR创建/更新；push main，不参与每日扫描 | `contents: read`；无GHCR登录、上传或部署 |
-| `publish.yml` | 检查当前main提交的必要CI成功，再受控构建、交接、上传与按摘要拉回复验 | 仅main的人工触发，仍需两项发布确认 | CI查询增加`actions: read`；仅upload job有`packages: write`；不自动部署 |
+| `ci.yml` | Format、Vet、Build、Unit、Integration、配对镜像验收、漏洞扫描及CI Gate；main产出候选 | 目标分支为main的PR创建/更新；push main | `contents: read`；仅本仓库push/main上传release候选，无GHCR登录或上传 |
+| `nightly.yml` | 每日漏洞扫描；其他长期实验另行定义 | 每日02:17 UTC（北京时间10:17） | `contents: read`；无候选产出、包凭据或发布 |
+| `release.yml` | 验证同SHA main CI及权限，获取并验证原CI镜像，再上传、拉回与重新验收 | 仅main人工触发，仍需两项发布确认 | 候选解析为只读；仅upload job有`packages: write`，audit Secret仅进入发布步骤；不重建镜像、不自动部署 |
 
-仅推送功能分支而未创建目标为main的PR，不触发前两项。`pull_request.branches: main`限制的是PR目标，不是源分支。每日扫描只在默认分支main最新提交上运行；不增加tag发布或merge queue触发。
+仅推送功能分支而未创建目标为main的PR，不触发CI。`pull_request.branches: main`
+限制的是PR目标，不是源分支。每日扫描只在默认分支main最新提交上运行；
+不增加tag发布或merge queue触发。
 
 每日任务复用现有`Vulnerability scan (linux/amd64, read-only)`作业和固定govulncheck v1.9.0，按source/symbol模式扫描所有Go包，包含integration标签与测试代码；不会每天执行数据库、构建镜像或发布。发现可达漏洞或扫描工具/网络失败均为失败，不吞错；只上传现有白名单安全报告，保留30天。测试代码可达不等于生产暴露，需结合报告判断。定时任务使用独立并发组，不替换main检查的待运行任务。
 
-GitHub定时调度为尽力运行，可能延迟，高负载时甚至丢弃待运行任务；10:17不是准点保证。可在Actions的`Setup and unit checks / 准备与单元检查`中查看事件为`schedule`的运行，只有漏洞作业实际执行，其余作业应为skipped。公开仓库连续60天无活动可能自动禁用定时任务；当前为私有仓库，仍需留意工作流禁用状态。每日扫描结果不会替代发布所需的同SHA push/main成功记录，也不会自动创建修复、升级依赖或发布。
+GitHub定时调度为尽力运行，可能延迟或丢弃待运行任务；10:17不是准点保证。
+应在`nightly.yml`中查看schedule运行；本轮不注册长并发、升级兼容或故障实验的空job。
+公开仓库长期无活动可能自动禁用定时任务，应留意禁用状态。
+每日扫描结果不会替代发布所需的同SHA push/main成功记录，
+也不会自动创建修复、升级依赖或发布。
 
-镜像预检与发布统一固定Docker 29.9.3/containerd环境。预检只消费本次builder已验收的配对产物，不重构建；在本次临时daemon中确认镜像无额外共享引用、无容器使用后，仅移除本次配对镜像，再确认缺席、从归档导入并核对内容身份。普通本地daemon禁止执行此移除路径；不prune、不清理无关镜像或卷。交接归档仅临时保存，CI只上传白名单安全摘要。这能验证本地归档往返，不等于跨job artifact传递、GHCR上传或真实渠道验证。
+镜像预检与发布统一固定Docker 29.9.3/containerd环境。预检只消费本次builder
+已验收的配对产物，不重构建；仅在确认归属的临时daemon内执行受控save/load。
+普通本地daemon禁止执行镜像移除路径，不prune、不清理无关资源。
+PR仅上传安全摘要；本仓库push/main在受控移除镜像标签前从同一对镜像导出四文件bundle，
+交接预检成功后才上传bundle及可信pointer。
+本地归档往返、跨运行artifact交接、GHCR上传与部署是不同验证层次，
+不能相互冒充已通过。
 
-正式发布检查精确源码SHA的`setup-check.yml`与`check.yml`最新push/main运行；缺失、运行中、失败、取消、API不可访问均停止，不能从历史记录挑一个成功结果。prepare提前检查，upload在真正发布入口前再次检查；门禁通过后到外部上传仍存在新运行开始的时间窗口，不声称与GitHub状态更新原子同步。
+正式发布只选取精确源码SHA的`ci.yml`最新成功push/main运行；
+缺失、运行中、失败、取消、API不可访问或artifact过期均停止。
+候选run/attempt、artifact ID及descriptor哈希锁定后不得静默换包，
+upload在真正发布入口前再次核验同一run/attempt；release不重新构建补救。
+门禁通过后到外部上传仍存在新运行开始的窗口，不声称原子同步。
 
-**远端保护现状**：本轮只读查询发现main有active ruleset（`main-branch-protection`），但没有`required_status_checks`规则；经典branch protection接口返回“Branch not protected”不代表没有ruleset。尚未改动远端规则。管理员应在新检查实际运行后，将`CI gate`与`Paired image acceptance (linux/amd64)`同时设为必需检查并验证阻断效果；只设置前者不会约束独立的镜像工作流。发布自己的CI门禁也不能替代合并保护。
+**远端保护要求**：保留`CI gate`与`Paired image acceptance (linux/amd64)`
+两个精确检查名及严格最新main基线保护，不在本次重构中修改远端规则。
+历史记录中的“尚未配置”不代表当前服务端状态；实际合并前必须重新查询和核对，
+不能仅依赖文档或发布自己的CI门禁。
 
 ### CI与代码防漂移（2026-11-10，历史记录）
 
