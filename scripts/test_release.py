@@ -2281,6 +2281,48 @@ class PackageAuditBoundaryTests(unittest.TestCase):
                 })
                 self.assertEqual(json.dumps(metadata, sort_keys=True), original)
 
+    def test_fetch_package_metadata_keeps_normal_public_gate_and_taxonomy(self):
+        metadata = package_metadata("app")
+        self.http.return_value = release.HttpResult(
+            200, {}, json.dumps(metadata).encode()
+        )
+        self.assertEqual(
+            self.instance._fetch_package_metadata("app", AUDIT_TOKEN), metadata
+        )
+        self.assertEqual(
+            self.instance._check_package("app", AUDIT_TOKEN),
+            {
+                "name": release.PACKAGE_NAMES["app"],
+                "id": APP_PACKAGE_ID,
+                "repository": release.REPOSITORY,
+                "visibility": "public",
+            },
+        )
+        private = package_metadata("app", visibility="private")
+        self.http.return_value = release.HttpResult(
+            200, {}, json.dumps(private).encode()
+        )
+        self.assertEqual(
+            self.instance._fetch_package_metadata("app", AUDIT_TOKEN), private
+        )
+        self.assert_error(
+            "app-visibility",
+            lambda: self.instance._check_package("app", AUDIT_TOKEN),
+        )
+        self.http.return_value = release.HttpResult(200, {}, b"[]")
+        self.assertEqual(
+            self.instance._fetch_package_metadata("app", AUDIT_TOKEN), []
+        )
+        self.assert_error(
+            "app-metadata",
+            lambda: self.instance._check_package("app", AUDIT_TOKEN),
+        )
+        self.http.return_value = release.HttpResult(403, {}, b"{}")
+        self.assert_error(
+            "app-forbidden",
+            lambda: self.instance._fetch_package_metadata("app", AUDIT_TOKEN),
+        )
+
     def test_inventory_rejects_malformed_unrelated_entries(self):
         cases = [None, [], {}, foreign_package(0) | {"package_type": "npm"}]
         for name in ("", "a" * 257, "has space", "tab\tname", "line\nname", "del\x7f"):
