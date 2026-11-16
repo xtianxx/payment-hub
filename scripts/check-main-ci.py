@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """Fail-closed read-only GitHub Actions preflight for main release gates.
 
-The publish workflow invokes this checker after checkout and before upload.
-It verifies that the workflow_dispatch context is the trusted main branch of
+The release workflow invokes this checker before publishing.  By default it
+checks the latest push run for the supplied SHA in the legacy
+``setup-check.yml`` and ``check.yml`` pair.  The release candidate selector
+explicitly opts in to ``CI_WORKFLOW_PATHS`` (``ci.yml``) so selection never
+falls back to an older legacy success.  The upload job repeats the check with
+the selected run lock before any registry write.  The checker verifies that
+the workflow_dispatch context is the trusted main branch of
 ``xtianxx/payment-hub``, that ``GITHUB_SHA`` equals ``--source-sha``, and that
-the latest push run for that SHA in both approved workflows is ``completed``
-with conclusion ``success``.  A newer failed, queued, cancelled, or running run
-is never hidden by an older success.
+the latest push run for that SHA in every checked workflow is ``completed``
+with conclusion ``success``.  A newer failed, queued, cancelled, or running
+run is never hidden by an older success.
+
+``--expected-run-id`` and ``--expected-run-attempt`` may be supplied together
+to lock the exact CI run that supplied a release candidate.  If the latest run
+or attempt changes, the check fails instead of silently selecting another
+candidate.
 
 Only bounded GET requests to ``api.github.com`` are made.  Redirects are not
 followed, retries and PAT fallbacks are absent, and the token or raw response
@@ -39,10 +49,12 @@ BRANCH = "main"
 REF = "refs/heads/main"
 TRIGGER_EVENT = "workflow_dispatch"
 PUSH_EVENT = "push"
+CANDIDATE_WORKFLOW_PATH = ".github/workflows/ci.yml"
 WORKFLOW_PATHS = (
     ".github/workflows/setup-check.yml",
     ".github/workflows/check.yml",
 )
+CI_WORKFLOW_PATHS = (CANDIDATE_WORKFLOW_PATH,)
 
 API_HOST = "api.github.com"
 API_BASE = f"https://{API_HOST}"
@@ -99,6 +111,8 @@ FAILURE_ENUM = {
         "summary-symlink",
         "summary-exists",
         "summary-not-fresh",
+        "expected-run",
+        "lock-workflow",
     },
     "env": {"event", "ref", "repository", "sha", "sha-mismatch", "token"},
     "workflow": {"not-found", "disabled", "schema", "path"},
@@ -112,7 +126,20 @@ FAILURE_ENUM = {
         "not-completed",
         "not-success",
     },
-    "run": {"not-found", "schema", "identity", "attempt-mismatch"},
+    "run": {
+        "not-found",
+        "schema",
+        "identity",
+        "attempt-mismatch",
+        "expected-mismatch",
+    },
+    "artifacts": {
+        "not-found",
+        "schema",
+        "identity",
+        "pagination",
+        "pagination-limit",
+    },
     "api": {
         "host",
         "unauthorized",
@@ -129,7 +156,7 @@ FAILURE_ENUM = {
         "body-too-large",
         "http-error",
     },
-    "summary": {"exists", "write"},
+    "summary": {"exists", "write", "scope"},
     "internal": {"unexpected"},
 }
 
@@ -158,6 +185,8 @@ def _safe_failure(stage: Any, kind: Any) -> tuple[str, str]:
 class Config:
     source_sha: str
     summary_path: Path
+    expected_run_id: int | None = None
+    expected_run_attempt: int | None = None
 
 
 @dataclass(frozen=True)
@@ -310,7 +339,7 @@ def _rate_limited(headers: Mapping[str, str], body: bytes) -> bool:
 
 
 class GitHubApi:
-    """Read-only workflow/run lookups with a fixed endpoint allowlist."""
+    """Read-only workflow/run/artifact lookups with a fixed endpoint allowlist."""
 
     def __init__(
         self,
@@ -472,6 +501,74 @@ class GitHubApi:
             raise PreflightError("runs", "pagination")
         return collected
 
+    def run_artifacts(self, run_id: int) -> list[dict[str, Any]]:
+        """List every artifact page for one run with bounded pagination."""
+        run_id = _positive_int(run_id, "artifacts")
+        endpoint = f"/repos/{REPOSITORY}/actions/runs/{run_id}/artifacts"
+        base_params = (("per_page", str(PER_PAGE)),)
+        first = self._get_json(
+            self._page_path(endpoint, base_params, 1),
+            "artifacts",
+            "not-found",
+        )
+        total = _nonnegative_int(first.data.get("total_count"), "artifacts")
+        first_artifacts = first.data.get("artifacts")
+        if not isinstance(first_artifacts, list):
+            raise PreflightError("artifacts", "schema")
+        if total == 0:
+            if first_artifacts:
+                raise PreflightError("artifacts", "schema")
+            return []
+
+        pages = (total + PER_PAGE - 1) // PER_PAGE
+        if pages > MAX_PAGES:
+            raise PreflightError("artifacts", "pagination-limit")
+
+        collected: list[dict[str, Any]] = []
+        for page in range(1, pages + 1):
+            if page == 1:
+                current = first
+                artifacts = first_artifacts
+            else:
+                current = self._get_json(
+                    self._page_path(endpoint, base_params, page),
+                    "artifacts",
+                    "not-found",
+                )
+                if _nonnegative_int(
+                    current.data.get("total_count"), "artifacts"
+                ) != total:
+                    raise PreflightError("artifacts", "pagination")
+                artifacts = current.data.get("artifacts")
+                if not isinstance(artifacts, list):
+                    raise PreflightError("artifacts", "schema")
+            expected = min(PER_PAGE, total - (page - 1) * PER_PAGE)
+            if len(artifacts) != expected:
+                raise PreflightError("artifacts", "pagination")
+            collected.extend(artifacts)
+
+            next_url = _next_link(_header(current.headers, "link"), "artifacts")
+            if next_url is not None:
+                next_page = _validate_artifacts_next_link(
+                    next_url,
+                    endpoint,
+                    page,
+                )
+                if next_page != page + 1 or next_page > pages:
+                    raise PreflightError("artifacts", "pagination")
+        if len(collected) != total:
+            raise PreflightError("artifacts", "pagination")
+
+        seen: set[int] = set()
+        for artifact in collected:
+            if not isinstance(artifact, Mapping):
+                raise PreflightError("artifacts", "schema")
+            artifact_id = _positive_int(artifact.get("id"), "artifacts")
+            if artifact_id in seen:
+                raise PreflightError("artifacts", "schema")
+            seen.add(artifact_id)
+        return collected
+
     def run_attempt(self, run_id: int, attempt: int) -> dict[str, Any]:
         path = (
             f"/repos/{REPOSITORY}/actions/runs/{run_id}"
@@ -480,7 +577,7 @@ class GitHubApi:
         return self._get_json(path, "run", "not-found").data
 
 
-def _next_link(header: Any) -> str | None:
+def _next_link(header: Any, stage: str = "runs") -> str | None:
     if not isinstance(header, str) or not header:
         return None
     parts: list[str] = []
@@ -499,12 +596,12 @@ def _next_link(header: Any) -> str | None:
         match = re.match(r"\s*<([^<>]*)>(.*)\Z", part, re.S)
         if match is None:
             if "next" in part:
-                raise PreflightError("runs", "pagination")
+                raise PreflightError(stage, "pagination")
             continue
         relation = re.search(r'rel\s*=\s*"([^"]*)"', match.group(2))
         if relation is None:
             if "next" in match.group(2):
-                raise PreflightError("runs", "pagination")
+                raise PreflightError(stage, "pagination")
             continue
         if "next" in relation.group(1).split():
             return match.group(1)
@@ -556,6 +653,46 @@ def _validate_next_link(
         raise PreflightError("runs", "pagination")
     if page > MAX_PAGES:
         raise PreflightError("runs", "pagination-limit")
+    return page
+
+
+def _validate_artifacts_next_link(
+    url: str,
+    endpoint: str,
+    current_page: int,
+) -> int:
+    if not isinstance(url, str):
+        raise PreflightError("artifacts", "pagination")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise PreflightError("artifacts", "pagination") from None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != API_HOST
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != endpoint
+    ):
+        raise PreflightError("artifacts", "pagination")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    if set(query) - {"page", "per_page"}:
+        raise PreflightError("artifacts", "pagination")
+    if "per_page" in query and query["per_page"] != [str(PER_PAGE)]:
+        raise PreflightError("artifacts", "pagination")
+    pages = query.get("page")
+    if pages is None or len(pages) != 1:
+        raise PreflightError("artifacts", "pagination")
+    try:
+        page = int(pages[0])
+    except ValueError:
+        raise PreflightError("artifacts", "pagination") from None
+    if page != current_page + 1:
+        raise PreflightError("artifacts", "pagination")
+    if page > MAX_PAGES:
+        raise PreflightError("artifacts", "pagination-limit")
     return page
 
 
@@ -611,6 +748,7 @@ class ParsedRun:
     status: str
     conclusion: str | None
     created_at: datetime.datetime
+    repository_id: int | None = None
 
 
 def _parse_run(
@@ -652,6 +790,11 @@ def _parse_run(
     full_name = repository.get("full_name")
     if not isinstance(full_name, str):
         raise PreflightError(stage, "schema")
+    raw_repository_id = repository.get("id")
+    if raw_repository_id is None:
+        repository_id = None
+    else:
+        repository_id = _positive_int(raw_repository_id, stage)
 
     if parent_id != workflow_id:
         raise PreflightError(stage, "identity")
@@ -677,6 +820,7 @@ def _parse_run(
         status=status,
         conclusion=conclusion,
         created_at=created_at,
+        repository_id=repository_id,
     )
 
 
@@ -718,6 +862,7 @@ class WorkflowState:
     latest_run_attempt: int | None = None
     latest_run_status: str | None = None
     latest_run_conclusion: str | None = None
+    latest_run_repository_id: int | None = None
 
     def to_summary(self) -> dict[str, Any]:
         workflow_id = (
@@ -768,8 +913,29 @@ class WorkflowState:
         }
 
 
-def default_workflow_states() -> list[WorkflowState]:
-    return [WorkflowState(path=path) for path in WORKFLOW_PATHS]
+def default_workflow_states(
+    paths: Sequence[str] | None = None,
+) -> list[WorkflowState]:
+    resolved = WORKFLOW_PATHS if paths is None else paths
+    return [WorkflowState(path=path) for path in resolved]
+
+
+def _approved_summary_scope(
+    scope: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Return one fixed approved summary scope or fail closed.
+
+    Only the legacy pair and the single candidate CI workflow are approved.
+    Arbitrary paths, reordered paths, duplicates, mixed scopes, and non-tuple
+    inputs are rejected; no union or user-selected scope is accepted.
+    """
+    if scope is None:
+        scope = WORKFLOW_PATHS
+    if not isinstance(scope, tuple):
+        raise PreflightError("summary", "scope")
+    if scope != WORKFLOW_PATHS and scope != CI_WORKFLOW_PATHS:
+        raise PreflightError("summary", "scope")
+    return scope
 
 
 def build_summary(
@@ -778,7 +944,9 @@ def build_summary(
     failure: tuple[str, str] | None,
     source_sha: Any,
     workflows: Sequence[WorkflowState],
+    scope: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    scope_paths = _approved_summary_scope(scope)
     safe_result = "pass" if result == "pass" else "fail"
     if safe_result == "pass" and failure is not None:
         safe_result = "fail"
@@ -800,11 +968,11 @@ def build_summary(
     by_path = {
         state.path: state
         for state in workflows
-        if isinstance(state, WorkflowState) and state.path in WORKFLOW_PATHS
+        if isinstance(state, WorkflowState) and state.path in scope_paths
     }
     entries = [
         by_path.get(path, WorkflowState(path=path)).to_summary()
-        for path in WORKFLOW_PATHS
+        for path in scope_paths
     ]
     return {
         "schema": SUMMARY_SCHEMA,
@@ -958,12 +1126,27 @@ def run_gate(
     workflows: Sequence[WorkflowState],
 ) -> tuple[str, str] | None:
     try:
+        if (
+            config.expected_run_id is not None
+            or config.expected_run_attempt is not None
+        ):
+            # A run lock identifies exactly one candidate CI run.  The lock
+            # path is fixed independently of WORKFLOW_PATHS so transitional
+            # legacy defaults cannot widen or misdirect it.  Applying the
+            # same lock to multiple workflows is rejected before any API
+            # request; no user-selectable workflow path is exposed.
+            if (
+                len(workflows) != 1
+                or workflows[0].path != CANDIDATE_WORKFLOW_PATH
+            ):
+                raise PreflightError("cli", "lock-workflow")
         for state in workflows:
             state.workflow_id = None
             state.latest_run_id = None
             state.latest_run_attempt = None
             state.latest_run_status = None
             state.latest_run_conclusion = None
+            state.latest_run_repository_id = None
         for state in workflows:
             workflow_data = api.workflow(state.path)
             state.workflow_id = _workflow_id(workflow_data, state.path)
@@ -1004,13 +1187,54 @@ def run_gate(
                 raise PreflightError("run", "attempt-mismatch")
             state.latest_run_status = attempt.status
             state.latest_run_conclusion = attempt.conclusion
+            state.latest_run_repository_id = (
+                attempt.repository_id
+                if attempt.repository_id is not None
+                else latest.repository_id
+            )
             if attempt.status != "completed":
                 raise PreflightError("runs", "not-completed")
             if attempt.conclusion != "success":
                 raise PreflightError("runs", "not-success")
+            if (
+                config.expected_run_id is not None
+                or config.expected_run_attempt is not None
+            ):
+                if (
+                    attempt.id != config.expected_run_id
+                    or attempt.attempt != config.expected_run_attempt
+                ):
+                    raise PreflightError("run", "expected-mismatch")
         return None
     except PreflightError as exc:
         return exc.stage, exc.kind
+
+
+def _positive_decimal_cli(value: Any) -> int:
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]*", value):
+        raise PreflightError("cli", "expected-run")
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise PreflightError("cli", "expected-run") from None
+    if parsed <= 0:
+        raise PreflightError("cli", "expected-run")
+    return parsed
+
+
+def parse_expected_run_lock(
+    run_id_raw: Any,
+    attempt_raw: Any,
+) -> tuple[int | None, int | None]:
+    """Require both lock flags together and reject bool-like CLI values."""
+    if run_id_raw is None and attempt_raw is None:
+        return None, None
+    if run_id_raw is None or attempt_raw is None:
+        raise PreflightError("cli", "expected-run")
+    return (
+        _positive_decimal_cli(run_id_raw),
+        _positive_decimal_cli(attempt_raw),
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1018,11 +1242,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         allow_abbrev=False,
         description=(
             "Fail-closed read-only check that the latest main push run for "
-            "the supplied source SHA succeeded in both approved workflows."
+            "the supplied source SHA succeeded in the approved workflows."
         ),
     )
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--summary", required=True)
+    parser.add_argument("--expected-run-id")
+    parser.add_argument("--expected-run-attempt")
     return parser.parse_args(argv)
 
 
@@ -1049,11 +1275,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         else None
     )
     workflows = default_workflow_states()
+    scope: tuple[str, ...] = WORKFLOW_PATHS
     failure: tuple[str, str] | None = None
     try:
+        expected_run_id, expected_run_attempt = parse_expected_run_lock(
+            getattr(args, "expected_run_id", None),
+            getattr(args, "expected_run_attempt", None),
+        )
+        if (
+            expected_run_id is not None
+            and expected_run_attempt is not None
+        ):
+            # A complete, valid lock selects the fixed single candidate CI
+            # workflow.  Partial or invalid locks fail in parse above before
+            # this scope switch and before any API call.
+            scope = CI_WORKFLOW_PATHS
+            workflows = default_workflow_states(scope)
         config = Config(
             source_sha=validate_source_sha(raw_source),
             summary_path=summary_path,
+            expected_run_id=expected_run_id,
+            expected_run_attempt=expected_run_attempt,
         )
         token = validate_environment(os.environ, config.source_sha)
         failure = run_gate(config, GitHubApi(token), workflows)
@@ -1069,16 +1311,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             failure=failure,
             source_sha=safe_source,
             workflows=workflows,
+            scope=scope,
         )
     except Exception:
         result = "fail"
         failure = ("internal", "unexpected")
-        summary = build_summary(
-            result="fail",
-            failure=failure,
-            source_sha=None,
-            workflows=default_workflow_states(),
-        )
+        try:
+            summary = build_summary(
+                result="fail",
+                failure=failure,
+                source_sha=None,
+                workflows=default_workflow_states(scope),
+                scope=scope,
+            )
+        except Exception:
+            _print_failure("summary", "write")
+            return 1
     try:
         write_summary(summary_path, summary)
     except PreflightError as exc:
