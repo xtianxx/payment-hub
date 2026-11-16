@@ -343,7 +343,10 @@ NIGHTLY_ALWAYS_IF_STEPS = frozenset({
     "Export safe vulnerability report",
     "Upload safe vulnerability reports",
 })
-RELEASE_ALWAYS_IF_STEPS = frozenset({"Upload release summary"})
+RELEASE_ALWAYS_IF_STEPS = frozenset({
+    "Upload release summary",
+    "Upload migration initialization summary",
+})
 
 NIGHTLY_WORKFLOW_NAME = "Nightly vulnerability scan / 每日漏洞扫描"
 NIGHTLY_TRIGGERS = {"schedule": [{"cron": "17 2 * * *"}]}
@@ -369,26 +372,45 @@ NIGHTLY_STEP_NAMES = (
 
 RELEASE_WORKFLOW_NAME = "Manual paired image release / 人工配对镜像发布"
 RELEASE_INPUT_NAMES = (
+    "operation",
     "publish_authorized",
     "packages_verified",
     "bootstrap_packages",
+    "initialize_authorized",
+    "initialization_preconditions_verified",
+    "public_creation_acknowledged",
 )
+RELEASE_OPERATION_OPTIONS = ("publish", "initialize-migrate")
 RELEASE_INPUT_DESCRIPTIONS = {
+    "operation": (
+        "Operation: normal paired publish, or migration package initialization only"
+    ),
     "publish_authorized": "Explicit authorization to publish the prepared pair",
     "packages_verified": (
-        "Package preconditions verified for normal updates (both existing "
-        "public linked packages) and bootstrap compatibility (owner inventory, "
-        "risk); automatic package creation is suspended"
+        "Package preconditions verified for normal publish only (both existing "
+        "public linked packages); not reused by migration initialization"
     ),
     "bootstrap_packages": (
         "兼容开关：自动创建已暂停；仍要求两包已存在且为public；"
         "不替代 publish_authorized 或 packages_verified"
     ),
+    "initialize_authorized": (
+        "Explicit authorization to initialize only the migration package"
+    ),
+    "initialization_preconditions_verified": (
+        "Initialization preconditions verified: app is already public and linked, "
+        "migrate is absent, and no other writer is active"
+    ),
+    "public_creation_acknowledged": (
+        "Acknowledge that first package creation may become public immediately "
+        "and is irreversible; this is not a private guarantee"
+    ),
 }
-RELEASE_JOBS = ("resolve-candidate", "upload")
+RELEASE_JOBS = ("resolve-candidate", "upload", "initialize-migrate")
 RELEASE_JOB_NAMES = {
     "resolve-candidate": "Resolve release candidate (linux/amd64)",
     "upload": "Publish paired images (linux/amd64)",
+    "initialize-migrate": "Initialize migration package (linux/amd64)",
 }
 RELEASE_TIMEOUT = 30
 RELEASE_CONCURRENCY = {
@@ -403,15 +425,25 @@ RELEASE_ACTION_PINS = {
     SETUP_DOCKER,
 }
 RELEASE_ACTION_COUNTS = {
-    CHECKOUT: 2,
-    SETUP_GO: 1,
-    UPLOAD: 1,
-    DOWNLOAD: 2,
-    SETUP_DOCKER: 1,
+    CHECKOUT: 3,
+    SETUP_GO: 2,
+    UPLOAD: 2,
+    DOWNLOAD: 3,
+    SETUP_DOCKER: 2,
 }
 RELEASE_OWNER_GUARD = (
     "${{ github.actor == 'xtianxx' && "
     "github.triggering_actor == 'xtianxx' }}"
+)
+RELEASE_PUBLISH_GUARD = (
+    "${{ github.actor == 'xtianxx' && "
+    "github.triggering_actor == 'xtianxx' && "
+    "inputs.operation == 'publish' }}"
+)
+RELEASE_INITIALIZE_GUARD = (
+    "${{ github.actor == 'xtianxx' && "
+    "github.triggering_actor == 'xtianxx' && "
+    "inputs.operation == 'initialize-migrate' }}"
 )
 RELEASE_GATE_ENV = {
     "SOURCE_SHA": "${{ github.sha }}",
@@ -420,8 +452,17 @@ RELEASE_GATE_ENV = {
     "REPOSITORY": "${{ github.repository }}",
     "RELEASE_ACTOR": "${{ github.actor }}",
     "RELEASE_TRIGGERING_ACTOR": "${{ github.triggering_actor }}",
+    "OPERATION": "${{ inputs.operation }}",
     "PUBLISH_AUTHORIZED": "${{ inputs.publish_authorized }}",
     "PACKAGES_VERIFIED": "${{ inputs.packages_verified }}",
+    "BOOTSTRAP_PACKAGES": "${{ inputs.bootstrap_packages }}",
+    "INITIALIZE_AUTHORIZED": "${{ inputs.initialize_authorized }}",
+    "INITIALIZATION_PRECONDITIONS_VERIFIED": (
+        "${{ inputs.initialization_preconditions_verified }}"
+    ),
+    "PUBLIC_CREATION_ACKNOWLEDGED": (
+        "${{ inputs.public_creation_acknowledged }}"
+    ),
 }
 RELEASE_GATE_RUN = """set -euo pipefail
 if [[ "$RELEASE_ACTOR" != "xtianxx" || "$RELEASE_TRIGGERING_ACTOR" != "xtianxx" ]]; then
@@ -444,10 +485,32 @@ if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "::error::publish requires a 40-hex source SHA"
   exit 1
 fi
-if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]; then
-  echo "::error::publish requires both manual authorizations"
-  exit 1
-fi
+case "$OPERATION" in
+  publish)
+    if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]; then
+      echo "::error::publish requires both manual authorizations"
+      exit 1
+    fi
+    if [[ "$INITIALIZE_AUTHORIZED" != "false" || "$INITIALIZATION_PRECONDITIONS_VERIFIED" != "false" || "$PUBLIC_CREATION_ACKNOWLEDGED" != "false" ]]; then
+      echo "::error::publish requires initialization flags to remain false"
+      exit 1
+    fi
+    ;;
+  initialize-migrate)
+    if [[ "$INITIALIZE_AUTHORIZED" != "true" || "$INITIALIZATION_PRECONDITIONS_VERIFIED" != "true" || "$PUBLIC_CREATION_ACKNOWLEDGED" != "true" ]]; then
+      echo "::error::initialize-migrate requires all three initialization authorizations"
+      exit 1
+    fi
+    if [[ "$PUBLISH_AUTHORIZED" != "false" || "$PACKAGES_VERIFIED" != "false" || "$BOOTSTRAP_PACKAGES" != "false" ]]; then
+      echo "::error::initialize-migrate requires publish and bootstrap flags to remain false"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "::error::OPERATION must be publish or initialize-migrate"
+    exit 1
+    ;;
+esac
 """
 RELEASE_BUNDLE_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 RELEASE_BUNDLE_DIGEST_ERROR = (
@@ -464,7 +527,7 @@ RELEASE_RESOLVE_OUTPUTS = {
     ),
 }
 RELEASE_RESOLVE_STEP_NAMES = (
-    "Verify manual publish preconditions",
+    "Verify manual operation preconditions",
     "Check out repository",
     "Select release candidate",
     "Download release candidate pointer",
@@ -485,6 +548,60 @@ RELEASE_UPLOAD_STEP_NAMES = (
     "Publish paired images",
     "Upload release summary",
 )
+RELEASE_AUDIT_SECRET_NAME = "GHCR_PACKAGE_AUDIT_TOKEN"
+RELEASE_AUDIT_SECRET_EXPRESSION = "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}"
+RELEASE_INIT_STEP_NAMES = (
+    "Verify resolved candidate identity",
+    "Isolate initialization Go config and caches",
+    "Check out repository",
+    "Set up Go 1.27.4",
+    "Set up Docker 29.9.3 with containerd image store",
+    "Verify Docker image store",
+    "Prepare initialization download directory",
+    "Download initialization bundle",
+    "Restrict initialization bundle permissions",
+    "Verify initialization handoff",
+    "Require successful main CI",
+    "Initialize migration package",
+    "Upload migration initialization summary",
+)
+RELEASE_INIT_DOWNLOAD_PATH = (
+    "${{ runner.temp }}/payment-hub-initialization-bundle"
+)
+RELEASE_INIT_SUMMARY_NAME = (
+    "migrate-initialization-summary-${{ github.run_id }}-${{ github.run_attempt }}"
+)
+RELEASE_INIT_SUMMARY_PATH = (
+    "${{ runner.temp }}/payment-hub-migrate-initialization/"
+    "initialization-summary.json"
+)
+RELEASE_INIT_ISOLATION_BASE = "payment-hub-initialization"
+RELEASE_INIT_DOCKER_CONTEXT = "payment-hub-initialization"
+RELEASE_INIT_ENV = {
+    "SOURCE_SHA": "${{ github.sha }}",
+    "CI_RUN_ID": "${{ needs.resolve-candidate.outputs.ci_run_id }}",
+    "CI_RUN_ATTEMPT": "${{ needs.resolve-candidate.outputs.ci_run_attempt }}",
+    "BUNDLE_ARTIFACT_ID": (
+        "${{ needs.resolve-candidate.outputs.bundle_artifact_id }}"
+    ),
+    "BUNDLE_ARTIFACT_DIGEST": (
+        "${{ needs.resolve-candidate.outputs.bundle_artifact_digest }}"
+    ),
+    "EXPECTED_DESCRIPTOR_SHA": (
+        "${{ needs.resolve-candidate.outputs.descriptor_sha256 }}"
+    ),
+    "PAYMENT_HUB_RELEASE_OPERATION": "${{ inputs.operation }}",
+    "GITHUB_TOKEN": "${{ github.token }}",
+    "GHCR_PACKAGE_AUDIT_TOKEN": RELEASE_AUDIT_SECRET_EXPRESSION,
+}
+RELEASE_INIT_VERIFY_HANDOFF_RUN = r'''set -euo pipefail
+bash scripts/release.sh --stage verify-handoff \
+  --source-sha "$SOURCE_SHA" \
+  --bundle-dir "$RUNNER_TEMP/payment-hub-initialization-bundle" \
+  --expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA"'''
+RELEASE_INIT_RUN = """set -euo pipefail
+python3 -B scripts/init-migrate-package.py --source-sha "$SOURCE_SHA" --ci-run-id "$CI_RUN_ID" --ci-run-attempt "$CI_RUN_ATTEMPT" --bundle-artifact-id "$BUNDLE_ARTIFACT_ID" --bundle-artifact-digest "$BUNDLE_ARTIFACT_DIGEST" --bundle-dir "$RUNNER_TEMP/payment-hub-initialization-bundle" --expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA" --artifact-root "$RUNNER_TEMP/payment-hub-migrate-initialization" --go "$(command -v go)" --cache-dir "$RUNNER_TEMP/payment-hub-initialization" --prepare-inputs --approve-initialization --acknowledge-public-creation --initialization-preconditions-verified"""
+
 RELEASE_SELECT_RUN = (
     'set -euo pipefail\npython3 -B scripts/select-release-candidate.py select --source-sha '
     '"$SOURCE_SHA" --summary '
@@ -508,8 +625,6 @@ bash scripts/release.sh --stage verify-handoff \\
 """
 RELEASE_CI_GATE_RUN = '''set -euo pipefail
 python3 -B scripts/check-main-ci.py --source-sha "$SOURCE_SHA" --summary "$RUNNER_TEMP/payment-hub-ci-gate/ci-preflight.json" --expected-run-id "$CI_RUN_ID" --expected-run-attempt "$CI_RUN_ATTEMPT"'''
-RELEASE_AUDIT_SECRET_NAME = "GHCR_PACKAGE_AUDIT_TOKEN"
-RELEASE_AUDIT_SECRET_EXPRESSION = "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}"
 RELEASE_PUBLISH_ENV = {
     "SOURCE_SHA": "${{ github.sha }}",
     "EXPECTED_DESCRIPTOR_SHA": "${{ needs.resolve-candidate.outputs.descriptor_sha256 }}",
@@ -763,7 +878,29 @@ def _parse_workflow_dispatch(
                 if body_indent != 8:
                     raise ContractError("workflow-syntax")
                 body_key, body_value = _split_kv(body_content, body_number)
-                if body_key in body or body_value is None:
+                if body_key in body:
+                    raise ContractError("workflow-syntax")
+                if body_key == "options":
+                    if body_value is not None:
+                        raise ContractError("workflow-syntax")
+                    index += 1
+                    options: list[str] = []
+                    while index < len(lines) and lines[index][0] > 8:
+                        option_indent, option_content, _ = lines[index]
+                        if option_indent != 10 or not option_content.startswith(
+                            "- "
+                        ):
+                            raise ContractError("workflow-syntax")
+                        option = _unquote(option_content[2:].strip())
+                        if not option:
+                            raise ContractError("workflow-syntax")
+                        options.append(option)
+                        index += 1
+                    if not options:
+                        raise ContractError("workflow-syntax")
+                    body[body_key] = options
+                    continue
+                if body_value is None:
                     raise ContractError("workflow-syntax")
                 if body_key == "required":
                     body[body_key] = _parse_bool(body_value)
@@ -1955,14 +2092,32 @@ def _release_inputs_ok(workflow: dict[str, Any]) -> bool:
         body = inputs.get(name)
         if not isinstance(body, dict):
             return False
-        if set(body) != {"description", "required", "default", "type"}:
-            return False
-        if body.get("required") is not True or body.get("default") is not False:
-            return False
-        if body.get("type") != "boolean":
+        if body.get("required") is not True:
             return False
         if body.get("description") != RELEASE_INPUT_DESCRIPTIONS[name]:
             return False
+        if name == "operation":
+            if set(body) != {
+                "description",
+                "required",
+                "default",
+                "type",
+                "options",
+            }:
+                return False
+            if body.get("default") != "publish":
+                return False
+            if body.get("type") != "choice":
+                return False
+            if body.get("options") != list(RELEASE_OPERATION_OPTIONS):
+                return False
+        else:
+            if set(body) != {"description", "required", "default", "type"}:
+                return False
+            if body.get("default") is not False:
+                return False
+            if body.get("type") != "boolean":
+                return False
     return True
 
 
@@ -1992,10 +2147,13 @@ def validate_release_workflow(
         add("release-workflow-jobs")
     resolve = jobs.get("resolve-candidate")
     upload = jobs.get("upload")
+    initialize = jobs.get("initialize-migrate")
     if not isinstance(resolve, dict):
         add("release-workflow-jobs", "resolve-candidate")
     if not isinstance(upload, dict):
         add("release-workflow-jobs", "upload")
+    if not isinstance(initialize, dict):
+        add("release-workflow-jobs", "initialize-migrate")
 
     uses = [
         step.get("uses")
@@ -2036,7 +2194,7 @@ def validate_release_workflow(
             prefix="release-resolve",
             allowed_always=frozenset(),
         )
-        gate = _find_step(resolve, "Verify manual publish preconditions")
+        gate = _find_step(resolve, "Verify manual operation preconditions")
         if gate is None:
             add("release-gate-missing")
         else:
@@ -2133,7 +2291,7 @@ def validate_release_workflow(
             add("release-upload-timeout")
         if upload.get("needs") != "resolve-candidate":
             add("release-upload-needs")
-        if upload.get("if") != RELEASE_OWNER_GUARD:
+        if upload.get("if") != RELEASE_PUBLISH_GUARD:
             add("release-upload-owner-guard")
         if upload.get("permissions") != {
             "contents": "read",
@@ -2421,6 +2579,332 @@ def validate_release_workflow(
             if "*" in str(summary_with.get("path", "")):
                 add("release-summary-wildcard")
 
+    if isinstance(initialize, dict):
+        if initialize.get("name") != RELEASE_JOB_NAMES["initialize-migrate"]:
+            add("release-init-name")
+        if initialize.get("runs-on") != "ubuntu-24.04":
+            add("release-init-runs-on")
+        if initialize.get("timeout-minutes") != RELEASE_TIMEOUT:
+            add("release-init-timeout")
+        if initialize.get("needs") != "resolve-candidate":
+            add("release-init-needs")
+        if initialize.get("if") != RELEASE_INITIALIZE_GUARD:
+            add("release-init-guard")
+        if initialize.get("permissions") != {
+            "contents": "read",
+            "actions": "read",
+            "packages": "write",
+        }:
+            add("release-init-permissions")
+        if "env" in initialize:
+            add("release-init-env")
+        if tuple(_step_names(initialize)) != RELEASE_INIT_STEP_NAMES:
+            add("release-init-steps")
+        _validate_step_if_policy(
+            "initialize-migrate",
+            initialize,
+            add,
+            prefix="release-init",
+            allowed_always=RELEASE_ALWAYS_IF_STEPS,
+        )
+        identity = _find_step(
+            initialize, "Verify resolved candidate identity"
+        )
+        if identity is None:
+            add("release-init-identity-missing")
+        else:
+            if identity.get("shell") != "bash":
+                add("release-init-identity-shell")
+            if "if" in identity or "continue-on-error" in identity:
+                add("release-init-identity-skip")
+            if identity.get("env") != {
+                "CI_RUN_ID": "${{ needs.resolve-candidate.outputs.ci_run_id }}",
+                "CI_RUN_ATTEMPT": (
+                    "${{ needs.resolve-candidate.outputs.ci_run_attempt }}"
+                ),
+                "BUNDLE_ARTIFACT_ID": (
+                    "${{ needs.resolve-candidate.outputs.bundle_artifact_id }}"
+                ),
+                "BUNDLE_ARTIFACT_DIGEST": (
+                    "${{ needs.resolve-candidate.outputs.bundle_artifact_digest }}"
+                ),
+                "EXPECTED_DESCRIPTOR_SHA": (
+                    "${{ needs.resolve-candidate.outputs.descriptor_sha256 }}"
+                ),
+            }:
+                add("release-init-identity-env")
+            run = identity.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                'if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$',
+                'if [[ ! "$BUNDLE_ARTIFACT_ID" =~ ^[1-9][0-9]*$',
+                (
+                    'if [[ ! "$BUNDLE_ARTIFACT_DIGEST" =~ '
+                    + RELEASE_BUNDLE_DIGEST_PATTERN
+                ),
+                RELEASE_BUNDLE_DIGEST_ERROR,
+                (
+                    'if [[ ! "$EXPECTED_DESCRIPTOR_SHA" =~ '
+                    + RELEASE_DESCRIPTOR_DIGEST_PATTERN
+                ),
+            ):
+                if token not in run:
+                    add("release-init-identity-run")
+            if (
+                'if [[ ! "$BUNDLE_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$'
+                in run
+            ):
+                add("release-init-identity-run")
+        _validate_isolation(
+            "initialize-migrate",
+            initialize,
+            add,
+            step_name="Isolate initialization Go config and caches",
+            base=RELEASE_INIT_ISOLATION_BASE,
+            prefix="release-init",
+        )
+        _validate_checkout(
+            "initialize-migrate",
+            initialize,
+            add,
+            ref=True,
+            prefix="release-init",
+        )
+        _validate_setup_go(
+            "initialize-migrate", initialize, add, prefix="release-init"
+        )
+        _validate_docker_steps(
+            "initialize-migrate",
+            initialize,
+            add,
+            context=RELEASE_INIT_DOCKER_CONTEXT,
+            prefix="release-init-docker",
+        )
+        prepare_dir = _find_step(
+            initialize, "Prepare initialization download directory"
+        )
+        if prepare_dir is None:
+            add("release-init-download-dir-missing")
+        else:
+            run = prepare_dir.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                "install -d -m 0700",
+                "payment-hub-initialization-bundle",
+            ):
+                if token not in run:
+                    add("release-init-download-dir-run")
+        bundle_download = _find_step(
+            initialize, "Download initialization bundle"
+        )
+        if bundle_download is None:
+            add("release-init-bundle-missing")
+        else:
+            if bundle_download.get("uses") != DOWNLOAD:
+                add("release-init-bundle-action")
+            download_with = bundle_download.get("with", {})
+            if set(download_with) != {
+                "artifact-ids",
+                "run-id",
+                "github-token",
+                "repository",
+                "path",
+                "merge-multiple",
+                "digest-mismatch",
+            }:
+                add("release-init-bundle-with")
+            if download_with.get("artifact-ids") != (
+                "${{ needs.resolve-candidate.outputs.bundle_artifact_id }}"
+            ):
+                add("release-init-bundle-artifact")
+            if download_with.get("run-id") != (
+                "${{ needs.resolve-candidate.outputs.ci_run_id }}"
+            ):
+                add("release-init-bundle-run")
+            if download_with.get("github-token") != "${{ github.token }}":
+                add("release-init-bundle-token")
+            if download_with.get("repository") != "${{ github.repository }}":
+                add("release-init-bundle-repository")
+            if download_with.get("path") != RELEASE_INIT_DOWNLOAD_PATH:
+                add("release-init-bundle-path")
+            if download_with.get("merge-multiple") is not True:
+                add("release-init-bundle-merge")
+            if download_with.get("digest-mismatch") != "error":
+                add("release-init-bundle-digest")
+            if "name" in download_with or "latest" in str(
+                download_with
+            ).lower():
+                add("release-init-bundle-floating")
+        restrict = _find_step(
+            initialize, "Restrict initialization bundle permissions"
+        )
+        if restrict is None:
+            add("release-init-chmod-missing")
+        else:
+            run = restrict.get("run", "")
+            if "chmod 0600" not in run:
+                add("release-init-chmod-run")
+            for name in (
+                "pair.tar",
+                "descriptor.json",
+                "build-record.json",
+                "accepted-images.json",
+            ):
+                if name not in run:
+                    add("release-init-chmod-run")
+            if "payment-hub-initialization-bundle" not in run:
+                add("release-init-chmod-run")
+        verify_handoff = _find_step(
+            initialize, "Verify initialization handoff"
+        )
+        if verify_handoff is None:
+            add("release-init-verify-handoff-missing")
+        else:
+            if verify_handoff.get("shell") != "bash":
+                add("release-init-verify-handoff-shell")
+            if verify_handoff.get("env") != {
+                "SOURCE_SHA": "${{ github.sha }}",
+                "EXPECTED_DESCRIPTOR_SHA": (
+                    "${{ needs.resolve-candidate.outputs.descriptor_sha256 }}"
+                ),
+            }:
+                add("release-init-verify-handoff-env")
+            if verify_handoff.get("run", "").strip() != (
+                RELEASE_INIT_VERIFY_HANDOFF_RUN.strip()
+            ):
+                add("release-init-verify-handoff-run")
+            run = verify_handoff.get("run", "")
+            for token in ("--stage prepare", "build-images.py", "secrets."):
+                if token in run:
+                    add("release-init-verify-handoff-unsafe")
+        ci_gate = _find_step(initialize, "Require successful main CI")
+        if ci_gate is None:
+            add("release-init-ci-gate-missing")
+        else:
+            if ci_gate.get("shell") != "bash":
+                add("release-init-ci-gate-shell")
+            if "if" in ci_gate or "continue-on-error" in ci_gate:
+                add("release-init-ci-gate-skip")
+            if ci_gate.get("env") != {
+                "GITHUB_TOKEN": "${{ github.token }}",
+                "SOURCE_SHA": "${{ github.sha }}",
+                "CI_RUN_ID": (
+                    "${{ needs.resolve-candidate.outputs.ci_run_id }}"
+                ),
+                "CI_RUN_ATTEMPT": (
+                    "${{ needs.resolve-candidate.outputs.ci_run_attempt }}"
+                ),
+            }:
+                add("release-init-ci-gate-env")
+            if ci_gate.get("run", "").strip() != RELEASE_CI_GATE_RUN.strip():
+                add("release-init-ci-gate-run")
+            run = ci_gate.get("run", "")
+            for token in (
+                "scripts/check-main-ci.py",
+                '--source-sha "$SOURCE_SHA"',
+                '--summary "$RUNNER_TEMP/payment-hub-ci-gate/ci-preflight.json"',
+                '--expected-run-id "$CI_RUN_ID"',
+                '--expected-run-attempt "$CI_RUN_ATTEMPT"',
+            ):
+                if token not in run:
+                    add("release-init-ci-gate-run")
+        initializer = _find_step(initialize, "Initialize migration package")
+        if initializer is None:
+            add("release-init-command-missing")
+        else:
+            if set(initializer) != {"name", "shell", "env", "run"}:
+                add("release-init-command-shape")
+            if initializer.get("shell") != "bash":
+                add("release-init-command-shell")
+            if initializer.get("env") != RELEASE_INIT_ENV:
+                add("release-init-command-env")
+            if initializer.get("run", "").strip() != RELEASE_INIT_RUN:
+                add("release-init-command-run")
+            run = initializer.get("run", "")
+            for token in (
+                "scripts/init-migrate-package.py",
+                '--source-sha "$SOURCE_SHA"',
+                '--ci-run-id "$CI_RUN_ID"',
+                '--ci-run-attempt "$CI_RUN_ATTEMPT"',
+                '--bundle-artifact-id "$BUNDLE_ARTIFACT_ID"',
+                '--bundle-artifact-digest "$BUNDLE_ARTIFACT_DIGEST"',
+                '--bundle-dir "$RUNNER_TEMP/payment-hub-initialization-bundle"',
+                '--expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA"',
+                '--artifact-root "$RUNNER_TEMP/payment-hub-migrate-initialization"',
+                '--go "$(command -v go)"',
+                '--cache-dir "$RUNNER_TEMP/payment-hub-initialization"',
+                "--prepare-inputs",
+                "--approve-initialization",
+                "--acknowledge-public-creation",
+                "--initialization-preconditions-verified",
+            ):
+                if token not in run:
+                    add("release-init-command-run")
+            for token in (
+                "scripts/release.sh",
+                "--stage publish",
+                "--stage prepare",
+                "build-images.py",
+                "--bootstrap-packages",
+                "--target",
+                "--tag",
+                "--role",
+                "set -x",
+                "printenv",
+                "docker push",
+                "docker login",
+                "docker build",
+                "ghcr.io",
+                "cosign",
+                "attest",
+                "deploy",
+            ):
+                if token in run:
+                    add("release-init-command-unsafe")
+        summary = _find_step(
+            initialize, "Upload migration initialization summary"
+        )
+        if summary is None:
+            add("release-init-summary-missing")
+        else:
+            if summary.get("if") != "always()":
+                add("release-init-summary-condition")
+            if summary.get("uses") != UPLOAD:
+                add("release-init-summary-action")
+            summary_with = summary.get("with", {})
+            if set(summary_with) != {
+                "name",
+                "path",
+                "if-no-files-found",
+                "retention-days",
+                "include-hidden-files",
+            }:
+                add("release-init-summary-with")
+            if summary_with.get("name") != RELEASE_INIT_SUMMARY_NAME:
+                add("release-init-summary-name")
+            if summary_with.get("path") != RELEASE_INIT_SUMMARY_PATH:
+                add("release-init-summary-path")
+            if summary_with.get("if-no-files-found") != "error":
+                add("release-init-summary-missing-policy")
+            if summary_with.get("retention-days") != 30:
+                add("release-init-summary-retention")
+            if summary_with.get("include-hidden-files") is not False:
+                add("release-init-summary-hidden")
+            if "*" in str(summary_with.get("path", "")):
+                add("release-init-summary-wildcard")
+        init_text = json.dumps(initialize)
+        for token in (
+            "--stage publish",
+            "--stage prepare",
+            "build-images.py",
+            "--bootstrap-packages",
+            "--target",
+            "--tag",
+            "--role",
+        ):
+            if token in init_text:
+                add("release-init-forbidden-token")
+
     _validate_common_forbidden_tokens(text, add, allow_secrets=True)
     for token in ("ci-candidate", "build-images.py", "check-image-handoff.py"):
         if token in text:
@@ -2430,8 +2914,13 @@ def validate_release_workflow(
         ("resolve-candidate", "Select release candidate"),
         ("upload", "Require successful main CI"),
         ("upload", "Publish paired images"),
+        ("initialize-migrate", "Require successful main CI"),
+        ("initialize-migrate", "Initialize migration package"),
     }
-    allowed_audit_steps = {("upload", "Publish paired images")}
+    allowed_audit_steps = {
+        ("upload", "Publish paired images"),
+        ("initialize-migrate", "Initialize migration package"),
+    }
     for job_id, job in jobs.items():
         if not isinstance(job, dict):
             continue
@@ -2499,9 +2988,9 @@ def validate_release_workflow(
                 allowed_expression_count += 1
             else:
                 add("release-secret-policy")
-        if allowed_expression_count != 1:
+        if allowed_expression_count != 2:
             add("release-secret-policy")
-    if text.count(RELEASE_AUDIT_SECRET_NAME + ":") != 1:
+    if text.count(RELEASE_AUDIT_SECRET_NAME + ":") != 2:
         add("release-token-location")
     if "--stage prepare" in text:
         add("release-forbidden-token")

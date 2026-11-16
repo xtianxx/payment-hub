@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | `ci.yml` | 目标main的PR、push main | Format、Vet、显式Go Build、Unit Tests、Integration Tests、配对镜像验收、漏洞扫描、CI Gate |
 | `nightly.yml` | 每日定时 | 漏洞扫描；不生成发布候选、不发布 |
-| `release.yml` | main人工触发 | 权限与同SHA main CI核验、获取原CI候选、交接与身份校验、受控GHCR发布、结果摘要 |
+| `release.yml` | main人工触发 | 默认正常发布；独立确认后可选择仅迁移包初始化；共用可信CI候选，写入job互斥 |
 
 `release.yml`属于CD的发布阶段，不是纯CI，也不自动部署。
 CI与nightly都保留漏洞扫描：定时成功不能替代当前源码的CI成功，
@@ -90,14 +90,20 @@ release不执行builder，也不重新构建镜像来替代丢失、过期或失
 下载的bundle摘要、源码SHA或运行来源不符时直接拒绝。
 
 解析与下载阶段仅使用仓库只读内容和Actions读取权限；
-包写权限只在上传job，审计Secret只注入发布步骤。
+包写权限只在正常上传job或独立初始化job，二者按operation互斥；
+审计Secret只显式注入相应执行步骤。`packages: write`是job级权限，
+不能声称其他action技术上无法取得同一job token。
 审计token不用于Docker或registry认证，发布凭据不传给构建及其他子进程。
 
 ## 未改变的发布边界
 
 - 两个固定目标必须已经存在、为public、owner和仓库关联正确，原包ID稳定。
 - 缺失包自动创建继续暂停；`bootstrap_packages`只作兼容输入。
-- 不修改包设置、不初始化迁移包、不用占位镜像创建包。
+- 独立`initialize-migrate`不是正常发布的自动缺包恢复；
+  需要额外初始化、前提及首次可能公开风险确认，仅允许固定迁移包，
+  不自动改可见性，摘要始终`published=false`。详见[初始化说明](migrate-initialization.md)。
+- 本轮不执行包设置变更或真实迁移包初始化；
+  即使后续独立授权，也不允许占位镜像。
 - 不把匿名可下载、单个标签存在或半次push成功当作完整发布成功。
 - 取消、失败或事后校验失败不撤销已产生的远端副作用，不自动重试或回滚。
 - 最后检查与外部写者操作、CI运行更新之间仍非原子；不声称本次拆分消除了竞态。
