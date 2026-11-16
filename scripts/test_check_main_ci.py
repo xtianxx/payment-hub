@@ -30,6 +30,24 @@ MOD = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MOD
 SPEC.loader.exec_module(MOD)
 
+# PR2 transition shim: final B tests exercise the single ci.yml path.  PR3
+# removes this line together with the legacy default pair.
+MOD.WORKFLOW_PATHS = MOD.CI_WORKFLOW_PATHS
+
+
+def load_pristine_check_main_ci():
+    """Load production check-main-ci.py without the transitional shim."""
+    name = "check_main_ci_pristine"
+    spec = importlib.util.spec_from_file_location(
+        name,
+        REPO / "scripts" / "check-main-ci.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 TOKEN = "ghs_test_token_1234567890"
 SHA = "a" * 40
 OLDER = "2026-01-01T00:00:00Z"
@@ -235,9 +253,8 @@ class GateTestCase(unittest.TestCase):
         self.fake.attempt_responses[(run_id, attempt)] = json_response(run)
         return run
 
-    def add_both_success(self):
+    def add_ci_success(self):
         self.add_success(MOD.WORKFLOW_PATHS[0], 101, 1001)
-        self.add_success(MOD.WORKFLOW_PATHS[1], 202, 2002)
 
     def run_main(self, environment, argv=None, transport=None):
         if argv is None:
@@ -276,7 +293,7 @@ class SummaryTests(GateTestCase):
         self.assertEqual(data["result"], "pass")
         self.assertIsNone(data["failure"])
         self.assertEqual(data["source_sha"], SHA)
-        self.assertEqual(len(data["workflows"]), 2)
+        self.assertEqual(len(data["workflows"]), 1)
         for entry in data["workflows"]:
             self.assertEqual(
                 set(entry), {"path", "workflow_id", "latest_run"}
@@ -796,8 +813,8 @@ class ApiTests(unittest.TestCase):
 
 
 class GateTests(GateTestCase):
-    def test_success_both_workflows(self):
-        self.add_both_success()
+    def test_success_ci_workflow(self):
+        self.add_ci_success()
         self.assertIsNone(self.gate())
         data = self.summary_data(None)
         self.assertEqual(data["result"], "pass")
@@ -817,7 +834,7 @@ class GateTests(GateTestCase):
         )
         self.assertTrue(
             any(
-                url.endswith("/actions/workflows/setup-check.yml")
+                url.endswith("/actions/workflows/ci.yml")
                 for url in self.fake.requests
             )
         )
@@ -832,9 +849,79 @@ class GateTests(GateTestCase):
             any("/actions/runs/1001/attempts/1" in url for url in self.fake.requests)
         )
 
+    def gate_locked(self, run_id, attempt):
+        config = MOD.Config(
+            source_sha=SHA,
+            summary_path=self.summary_path,
+            expected_run_id=run_id,
+            expected_run_attempt=attempt,
+        )
+        return MOD.run_gate(config, self.api, self.states)
+
+    def test_expected_run_lock_matches_success(self):
+        self.add_ci_success()
+        self.assertIsNone(self.gate_locked(1001, 1))
+
+    def test_expected_run_id_mismatch_fails_even_when_newer_run_succeeds(self):
+        path = MOD.WORKFLOW_PATHS[0]
+        self.fake.workflow_responses["ci.yml"] = json_response(
+            make_workflow(path, 101)
+        )
+        older = make_run(1001, 101, path, created_at=OLDER)
+        newer = make_run(1002, 101, path, created_at=LATEST)
+        self.fake.page_responses[(101, 1)] = json_response(
+            make_runs(2, [older, newer])
+        )
+        self.fake.attempt_responses[(1002, 1)] = json_response(newer)
+        self.assertEqual(
+            self.gate_locked(1001, 1), ("run", "expected-mismatch")
+        )
+
+    def test_expected_attempt_mismatch_fails_after_rerun(self):
+        path = MOD.WORKFLOW_PATHS[0]
+        self.add_success(path, 101, 1001, attempt=2)
+        self.assertEqual(
+            self.gate_locked(1001, 1), ("run", "expected-mismatch")
+        )
+
+    def test_expected_lock_does_not_mask_latest_failure(self):
+        path = MOD.WORKFLOW_PATHS[0]
+        self.fake.workflow_responses["ci.yml"] = json_response(
+            make_workflow(path, 101)
+        )
+        older = make_run(1001, 101, path, created_at=OLDER)
+        newer = make_run(
+            1002,
+            101,
+            path,
+            conclusion="failure",
+            created_at=LATEST,
+        )
+        self.fake.page_responses[(101, 1)] = json_response(
+            make_runs(2, [older, newer])
+        )
+        self.fake.attempt_responses[(1002, 1)] = json_response(newer)
+        self.assertEqual(
+            self.gate_locked(1001, 1), ("runs", "not-success")
+        )
+
+    def test_fork_run_is_rejected(self):
+        path = MOD.WORKFLOW_PATHS[0]
+        self.fake.workflow_responses["ci.yml"] = json_response(
+            make_workflow(path, 101)
+        )
+        run = make_run(1001, 101, path, repo="someone/payment-hub")
+        self.fake.page_responses[(101, 1)] = json_response(make_runs(1, [run]))
+        self.assertEqual(self.gate(), ("runs", "identity"))
+
+    def test_workflow_paths_has_only_ci_workflow(self):
+        self.assertEqual(
+            MOD.WORKFLOW_PATHS, (".github/workflows/ci.yml",)
+        )
+
     def test_older_success_does_not_mask_latest_failure(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         older = make_run(1001, 101, path, created_at=OLDER)
@@ -859,7 +946,7 @@ class GateTests(GateTestCase):
 
     def test_latest_in_progress_fails(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         latest = make_run(
@@ -877,7 +964,7 @@ class GateTests(GateTestCase):
 
     def test_latest_queued_fails(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         latest = make_run(
@@ -895,7 +982,7 @@ class GateTests(GateTestCase):
 
     def test_latest_cancelled_fails(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         latest = make_run(
@@ -913,7 +1000,7 @@ class GateTests(GateTestCase):
 
     def test_no_runs_fails(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         self.fake.page_responses[(101, 1)] = json_response(make_runs(0, []))
@@ -921,7 +1008,7 @@ class GateTests(GateTestCase):
 
     def test_disabled_workflow_fails_before_runs(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101, state="disabled_manually")
         )
         self.assertEqual(self.gate(), ("workflow", "disabled"))
@@ -931,18 +1018,18 @@ class GateTests(GateTestCase):
 
     def test_deleted_workflow_is_missing(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101, state="deleted")
         )
         self.assertEqual(self.gate(), ("workflow", "not-found"))
 
     def test_workflow_404_is_missing(self):
-        self.fake.workflow_responses["setup-check.yml"] = raw_response(404, b"{}")
+        self.fake.workflow_responses["ci.yml"] = raw_response(404, b"{}")
         self.assertEqual(self.gate(), ("workflow", "not-found"))
 
     def test_runs_404_is_explicit(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         self.fake.page_responses[(101, 1)] = raw_response(404, b"{}")
@@ -956,7 +1043,7 @@ class GateTests(GateTestCase):
 
     def test_failure_summary_keeps_known_workflow_id(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         self.fake.page_responses[(101, 1)] = raw_response(404, b"{}")
@@ -965,39 +1052,37 @@ class GateTests(GateTestCase):
         data = self.summary_data(failure)
         self.assertEqual(data["workflows"][0]["workflow_id"], 101)
         self.assertIsNone(data["workflows"][0]["latest_run"])
-        self.assertIsNone(data["workflows"][1]["workflow_id"])
+        self.assertEqual(len(data["workflows"]), 1)
 
     def test_workflow_path_mismatch_fails(self):
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
-            make_workflow(MOD.WORKFLOW_PATHS[1], 101)
+        self.fake.workflow_responses["ci.yml"] = json_response(
+            make_workflow(".github/workflows/other.yml", 101)
         )
         self.assertEqual(self.gate(), ("workflow", "path"))
 
     def test_workflow_path_at_main_is_accepted(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(f"{path}@main", 101)
         )
         run = make_run(1001, 101, path)
         self.fake.page_responses[(101, 1)] = json_response(make_runs(1, [run]))
         self.fake.attempt_responses[(1001, 1)] = json_response(run)
-        self.add_success(MOD.WORKFLOW_PATHS[1], 202, 2002)
         self.assertIsNone(self.gate())
 
     def test_run_path_without_ref_is_accepted(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(1001, 101, path, run_path=path)
         self.fake.page_responses[(101, 1)] = json_response(make_runs(1, [run]))
         self.fake.attempt_responses[(1001, 1)] = json_response(run)
-        self.add_success(MOD.WORKFLOW_PATHS[1], 202, 2002)
         self.assertIsNone(self.gate())
 
     def test_run_path_with_refs_heads_main_is_accepted(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(
@@ -1008,12 +1093,11 @@ class GateTests(GateTestCase):
         )
         self.fake.page_responses[(101, 1)] = json_response(make_runs(1, [run]))
         self.fake.attempt_responses[(1001, 1)] = json_response(run)
-        self.add_success(MOD.WORKFLOW_PATHS[1], 202, 2002)
         self.assertIsNone(self.gate())
 
     def test_run_path_with_other_ref_fails(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(1001, 101, path, run_path=f"{path}@dev")
@@ -1022,7 +1106,7 @@ class GateTests(GateTestCase):
 
     def test_pull_request_run_is_rejected(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(1001, 101, path, event="pull_request")
@@ -1031,7 +1115,7 @@ class GateTests(GateTestCase):
 
     def test_schedule_run_is_rejected_even_when_successful(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(
@@ -1042,7 +1126,7 @@ class GateTests(GateTestCase):
 
     def test_pull_requests_field_alone_does_not_reject_push_run(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(
@@ -1053,7 +1137,6 @@ class GateTests(GateTestCase):
         )
         self.fake.page_responses[(101, 1)] = json_response(make_runs(1, [run]))
         self.fake.attempt_responses[(1001, 1)] = json_response(run)
-        self.add_success(MOD.WORKFLOW_PATHS[1], 202, 2002)
         self.assertIsNone(self.gate())
 
     def test_wrong_sha_branch_repository_workflow_id_are_rejected(self):
@@ -1068,7 +1151,7 @@ class GateTests(GateTestCase):
         for name, overrides in cases:
             with self.subTest(name=name):
                 self.setUp()
-                self.fake.workflow_responses["setup-check.yml"] = json_response(
+                self.fake.workflow_responses["ci.yml"] = json_response(
                     make_workflow(path, 101)
                 )
                 run = make_run(1001, 101, path, **overrides)
@@ -1081,7 +1164,7 @@ class GateTests(GateTestCase):
 
     def test_pagination_older_failure_does_not_mask_newer_success(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         page_one = [
@@ -1102,7 +1185,6 @@ class GateTests(GateTestCase):
             make_runs(101, [latest])
         )
         self.fake.attempt_responses[(2000, 1)] = json_response(latest)
-        self.add_success(MOD.WORKFLOW_PATHS[1], 202, 2002)
         self.assertIsNone(self.gate())
         self.assertTrue(
             any("page=2" in url for url in self.fake.requests)
@@ -1110,7 +1192,7 @@ class GateTests(GateTestCase):
 
     def test_pagination_newer_failure_on_page_two_fails(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         page_one = [
@@ -1135,7 +1217,7 @@ class GateTests(GateTestCase):
 
     def test_foreign_next_link_fails_closed(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(1001, 101, path)
@@ -1149,7 +1231,7 @@ class GateTests(GateTestCase):
 
     def test_too_many_pages_fails_closed(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         self.fake.page_responses[(101, 1)] = json_response(make_runs(501, []))
@@ -1157,7 +1239,7 @@ class GateTests(GateTestCase):
 
     def test_page_count_mismatch_fails_closed(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(1001, 101, path)
@@ -1168,7 +1250,7 @@ class GateTests(GateTestCase):
 
     def test_duplicate_run_ids_fail_closed(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(1001, 101, path)
@@ -1180,7 +1262,6 @@ class GateTests(GateTestCase):
     def test_rerun_attempt_two_is_used(self):
         path = MOD.WORKFLOW_PATHS[0]
         self.add_success(path, 101, 1001, attempt=2)
-        self.add_success(MOD.WORKFLOW_PATHS[1], 202, 2002)
         self.assertIsNone(self.gate())
         self.assertTrue(
             any("/attempts/2" in url for url in self.fake.requests)
@@ -1212,7 +1293,7 @@ class GateTests(GateTestCase):
 
     def test_attempt_failure_matches_and_fails_not_success(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         run = make_run(
@@ -1240,7 +1321,7 @@ class GateTests(GateTestCase):
         for name, run in cases:
             with self.subTest(name=name):
                 self.setUp()
-                self.fake.workflow_responses["setup-check.yml"] = json_response(
+                self.fake.workflow_responses["ci.yml"] = json_response(
                     make_workflow(path, 101)
                 )
                 self.fake.page_responses[(101, 1)] = json_response(
@@ -1258,7 +1339,7 @@ class GateTests(GateTestCase):
         for name, workflow in cases:
             with self.subTest(name=name):
                 self.setUp()
-                self.fake.workflow_responses["setup-check.yml"] = json_response(
+                self.fake.workflow_responses["ci.yml"] = json_response(
                     workflow
                 )
                 self.assertEqual(self.gate(), ("workflow", "schema"))
@@ -1271,7 +1352,7 @@ class GateTests(GateTestCase):
 
     def test_total_count_schema_failure(self):
         path = MOD.WORKFLOW_PATHS[0]
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
+        self.fake.workflow_responses["ci.yml"] = json_response(
             make_workflow(path, 101)
         )
         self.fake.page_responses[(101, 1)] = json_response(
@@ -1309,8 +1390,94 @@ class EnvironmentAndMainTests(GateTestCase):
         self.assertEqual((raised.exception.stage, raised.exception.kind),
                          ("env", "token"))
 
+    def test_expected_run_lock_requires_pair_and_positive_decimal(self):
+        self.assertEqual(MOD.parse_expected_run_lock(None, None), (None, None))
+        self.assertEqual(MOD.parse_expected_run_lock("7", "2"), (7, 2))
+        invalid_pairs = (
+            ("7", None),
+            (None, "2"),
+            ("0", "1"),
+            ("-1", "1"),
+            ("+1", "1"),
+            ("01", "1"),
+            (" 1", "1"),
+            ("1\n", "1"),
+            ("True", "1"),
+            ("1.0", "1"),
+            ("", "1"),
+            (1, 1),
+        )
+        for run_id, attempt in invalid_pairs:
+            with self.subTest(run_id=run_id, attempt=attempt):
+                with self.assertRaises(MOD.PreflightError) as raised:
+                    MOD.parse_expected_run_lock(run_id, attempt)
+                self.assertEqual(
+                    (raised.exception.stage, raised.exception.kind),
+                    ("cli", "expected-run"),
+                )
+
+    def test_main_expected_run_lock_mismatch_writes_summary(self):
+        path = MOD.WORKFLOW_PATHS[0]
+        self.fake.workflow_responses["ci.yml"] = json_response(
+            make_workflow(path, 101)
+        )
+        older = make_run(1001, 101, path, created_at=OLDER)
+        newer = make_run(1002, 101, path, created_at=LATEST)
+        self.fake.page_responses[(101, 1)] = json_response(
+            make_runs(2, [older, newer])
+        )
+        self.fake.attempt_responses[(1002, 1)] = json_response(newer)
+        code, stdout, _ = self.run_main(
+            base_env(),
+            argv=[
+                "--source-sha",
+                SHA,
+                "--summary",
+                str(self.summary_path),
+                "--expected-run-id",
+                "1001",
+                "--expected-run-attempt",
+                "1",
+            ],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "ci-preflight: fail stage=run kind=expected-mismatch\n",
+        )
+        data = json.loads(self.summary_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            data["failure"],
+            {"stage": "run", "kind": "expected-mismatch"},
+        )
+        self.assertEqual(
+            data["workflows"][0]["latest_run"]["run_id"], 1002
+        )
+
+    def test_main_incomplete_expected_run_lock_writes_summary(self):
+        code, stdout, _ = self.run_main(
+            base_env(),
+            argv=[
+                "--source-sha",
+                SHA,
+                "--summary",
+                str(self.summary_path),
+                "--expected-run-id",
+                "1001",
+            ],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "ci-preflight: fail stage=cli kind=expected-run\n",
+        )
+        data = json.loads(self.summary_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            data["failure"], {"stage": "cli", "kind": "expected-run"}
+        )
+
     def test_main_success_writes_summary_and_short_stdout(self):
-        self.add_both_success()
+        self.add_ci_success()
         code, stdout, stderr = self.run_main(base_env())
         self.assertEqual(code, 0)
         self.assertEqual(stdout, "ci-preflight: pass\n")
@@ -1320,7 +1487,7 @@ class EnvironmentAndMainTests(GateTestCase):
         self.assertIsNone(data["failure"])
 
     def test_main_http_failure_writes_summary_without_secret(self):
-        self.fake.workflow_responses["setup-check.yml"] = raw_response(
+        self.fake.workflow_responses["ci.yml"] = raw_response(
             500,
             b"RAW_SECRET_BODY " + TOKEN.encode("utf-8"),
         )
@@ -1343,7 +1510,7 @@ class EnvironmentAndMainTests(GateTestCase):
         )
 
     def test_main_401_is_not_reported_as_missing(self):
-        self.fake.workflow_responses["setup-check.yml"] = raw_response(
+        self.fake.workflow_responses["ci.yml"] = raw_response(
             401,
             b'{"message":"Bad credentials"}',
         )
@@ -1355,7 +1522,7 @@ class EnvironmentAndMainTests(GateTestCase):
         )
 
     def test_main_403_rate_limit_is_not_reported_as_missing(self):
-        self.fake.workflow_responses["setup-check.yml"] = raw_response(
+        self.fake.workflow_responses["ci.yml"] = raw_response(
             403,
             b"API rate limit exceeded",
             {"x-ratelimit-remaining": "0"},
@@ -1375,7 +1542,7 @@ class EnvironmentAndMainTests(GateTestCase):
         for status, expected in cases:
             with self.subTest(status=status):
                 self.setUp()
-                self.fake.workflow_responses["setup-check.yml"] = raw_response(
+                self.fake.workflow_responses["ci.yml"] = raw_response(
                     status,
                     b"{}",
                 )
@@ -1384,7 +1551,7 @@ class EnvironmentAndMainTests(GateTestCase):
                 self.assertEqual(stdout, expected)
 
     def test_main_bad_json_and_schema_are_distinct(self):
-        self.fake.workflow_responses["setup-check.yml"] = MOD.HttpResponse(
+        self.fake.workflow_responses["ci.yml"] = MOD.HttpResponse(
             status=200,
             headers={"content-type": "application/json"},
             body=b"{bad",
@@ -1397,7 +1564,7 @@ class EnvironmentAndMainTests(GateTestCase):
         )
 
         self.setUp()
-        self.fake.workflow_responses["setup-check.yml"] = json_response([])
+        self.fake.workflow_responses["ci.yml"] = json_response([])
         code, stdout, _ = self.run_main(base_env())
         self.assertEqual(code, 1)
         self.assertEqual(
@@ -1476,7 +1643,7 @@ class EnvironmentAndMainTests(GateTestCase):
         self.assertNotIn("RAW_SECRET_BODY", text)
 
     def test_main_summary_write_failure_is_reported(self):
-        self.add_both_success()
+        self.add_ci_success()
         with mock.patch.object(
             MOD,
             "write_summary",
@@ -1488,6 +1655,174 @@ class EnvironmentAndMainTests(GateTestCase):
             stdout,
             "ci-preflight: fail stage=summary kind=write\n",
         )
+
+
+class TransitionalLegacyDefaultTests(unittest.TestCase):
+    """PR2-only proof that the production default still gates the legacy pair."""
+
+    def setUp(self):
+        self.pristine = load_pristine_check_main_ci()
+        self.legacy = (
+            ".github/workflows/setup-check.yml",
+            ".github/workflows/check.yml",
+        )
+
+    def add_legacy_success(self, fake, path, workflow_id, run_id):
+        fake.workflow_responses[path.rsplit("/", 1)[-1]] = json_response(
+            make_workflow(path, workflow_id)
+        )
+        run = make_run(run_id, workflow_id, path)
+        fake.page_responses[(workflow_id, 1)] = json_response(
+            make_runs(1, [run])
+        )
+        fake.attempt_responses[(run_id, 1)] = json_response(run)
+        return run
+
+    def gate(self, fake):
+        api = self.pristine.GitHubApi(TOKEN, transport=fake.transport)
+        config = self.pristine.Config(
+            source_sha=SHA,
+            summary_path=Path("/unused-transition"),
+        )
+        states = self.pristine.default_workflow_states()
+        return self.pristine.run_gate(config, api, states), states
+
+    def run_pristine_main(self, fake):
+        api = self.pristine.GitHubApi(TOKEN, transport=fake.transport)
+        with tempfile.TemporaryDirectory() as temporary:
+            summary_path = Path(temporary) / "gate" / "ci-preflight.json"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, base_env(), clear=True),
+                mock.patch.object(
+                    self.pristine, "GitHubApi", lambda token: api
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                code = self.pristine.main(
+                    [
+                        "--source-sha",
+                        SHA,
+                        "--summary",
+                        str(summary_path),
+                    ]
+                )
+            return (
+                code,
+                stdout.getvalue(),
+                stderr.getvalue(),
+                json.loads(summary_path.read_text(encoding="utf-8")),
+            )
+
+    def test_pristine_cli_default_checks_both_legacy_workflows(self):
+        fake = FakeGitHub()
+        self.add_legacy_success(fake, self.legacy[0], 101, 1001)
+        self.add_legacy_success(fake, self.legacy[1], 202, 2002)
+        code, stdout, stderr, summary = self.run_pristine_main(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, "ci-preflight: pass\n")
+        self.assertEqual(stderr, "")
+        self.assertEqual(summary["result"], "pass")
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            list(self.legacy),
+        )
+
+    def test_pristine_cli_default_rejects_one_legacy_failure(self):
+        fake = FakeGitHub()
+        self.add_legacy_success(fake, self.legacy[0], 101, 1001)
+        self.add_legacy_success(fake, self.legacy[1], 202, 2002)
+        failing = make_run(
+            2002,
+            202,
+            self.legacy[1],
+            conclusion="failure",
+        )
+        fake.page_responses[(202, 1)] = json_response(
+            make_runs(1, [failing])
+        )
+        fake.attempt_responses[(2002, 1)] = json_response(failing)
+        code, stdout, stderr, summary = self.run_pristine_main(fake)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "ci-preflight: fail stage=runs kind=not-success\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            summary["failure"], {"stage": "runs", "kind": "not-success"}
+        )
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            list(self.legacy),
+        )
+        self.assertEqual(
+            summary["workflows"][1]["latest_run"]["conclusion"], "failure"
+        )
+
+    def test_pristine_default_states_are_legacy_pair(self):
+        states = self.pristine.default_workflow_states()
+        self.assertEqual(
+            tuple(state.path for state in states), self.legacy
+        )
+        self.assertEqual(self.pristine.WORKFLOW_PATHS, self.legacy)
+        self.assertEqual(
+            self.pristine.CI_WORKFLOW_PATHS,
+            (".github/workflows/ci.yml",),
+        )
+        explicit = self.pristine.default_workflow_states(
+            self.pristine.CI_WORKFLOW_PATHS
+        )
+        self.assertEqual(
+            tuple(state.path for state in explicit),
+            (".github/workflows/ci.yml",),
+        )
+
+    def test_pristine_default_gate_requires_both_legacy_workflows(self):
+        fake = FakeGitHub()
+        self.add_legacy_success(fake, self.legacy[0], 101, 1001)
+        self.add_legacy_success(fake, self.legacy[1], 202, 2002)
+        failure, _ = self.gate(fake)
+        self.assertIsNone(failure)
+        self.assertTrue(
+            any("setup-check.yml" in url for url in fake.requests)
+        )
+        self.assertTrue(
+            any("/actions/workflows/202/runs" in url for url in fake.requests)
+        )
+
+    def test_pristine_default_gate_rejects_either_legacy_failure(self):
+        cases = ((0, 101, 1001), (1, 202, 2002))
+        for index, workflow_id, run_id in cases:
+            with self.subTest(path=self.legacy[index]):
+                fake = FakeGitHub()
+                self.add_legacy_success(fake, self.legacy[0], 101, 1001)
+                self.add_legacy_success(fake, self.legacy[1], 202, 2002)
+                failing = make_run(
+                    run_id,
+                    workflow_id,
+                    self.legacy[index],
+                    conclusion="failure",
+                )
+                fake.page_responses[(workflow_id, 1)] = json_response(
+                    make_runs(1, [failing])
+                )
+                fake.attempt_responses[(run_id, 1)] = json_response(failing)
+                failure, _ = self.gate(fake)
+                self.assertEqual(failure, ("runs", "not-success"))
+
+    def test_pristine_default_gate_rejects_missing_legacy_workflow(self):
+        cases = ((0, "setup-check.yml"), (1, "check.yml"))
+        for index, filename in cases:
+            with self.subTest(path=self.legacy[index]):
+                fake = FakeGitHub()
+                self.add_legacy_success(fake, self.legacy[0], 101, 1001)
+                self.add_legacy_success(fake, self.legacy[1], 202, 2002)
+                fake.workflow_responses[filename] = raw_response(404, b"{}")
+                failure, _ = self.gate(fake)
+                self.assertEqual(failure, ("workflow", "not-found"))
 
 
 if __name__ == "__main__":
