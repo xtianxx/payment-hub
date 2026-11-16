@@ -156,7 +156,7 @@ FAILURE_ENUM = {
         "body-too-large",
         "http-error",
     },
-    "summary": {"exists", "write"},
+    "summary": {"exists", "write", "scope"},
     "internal": {"unexpected"},
 }
 
@@ -920,13 +920,33 @@ def default_workflow_states(
     return [WorkflowState(path=path) for path in resolved]
 
 
+def _approved_summary_scope(
+    scope: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Return one fixed approved summary scope or fail closed.
+
+    Only the legacy pair and the single candidate CI workflow are approved.
+    Arbitrary paths, reordered paths, duplicates, mixed scopes, and non-tuple
+    inputs are rejected; no union or user-selected scope is accepted.
+    """
+    if scope is None:
+        scope = WORKFLOW_PATHS
+    if not isinstance(scope, tuple):
+        raise PreflightError("summary", "scope")
+    if scope != WORKFLOW_PATHS and scope != CI_WORKFLOW_PATHS:
+        raise PreflightError("summary", "scope")
+    return scope
+
+
 def build_summary(
     *,
     result: str,
     failure: tuple[str, str] | None,
     source_sha: Any,
     workflows: Sequence[WorkflowState],
+    scope: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    scope_paths = _approved_summary_scope(scope)
     safe_result = "pass" if result == "pass" else "fail"
     if safe_result == "pass" and failure is not None:
         safe_result = "fail"
@@ -948,11 +968,11 @@ def build_summary(
     by_path = {
         state.path: state
         for state in workflows
-        if isinstance(state, WorkflowState) and state.path in WORKFLOW_PATHS
+        if isinstance(state, WorkflowState) and state.path in scope_paths
     }
     entries = [
         by_path.get(path, WorkflowState(path=path)).to_summary()
-        for path in WORKFLOW_PATHS
+        for path in scope_paths
     ]
     return {
         "schema": SUMMARY_SCHEMA,
@@ -1255,12 +1275,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         else None
     )
     workflows = default_workflow_states()
+    scope: tuple[str, ...] = WORKFLOW_PATHS
     failure: tuple[str, str] | None = None
     try:
         expected_run_id, expected_run_attempt = parse_expected_run_lock(
             getattr(args, "expected_run_id", None),
             getattr(args, "expected_run_attempt", None),
         )
+        if (
+            expected_run_id is not None
+            and expected_run_attempt is not None
+        ):
+            # A complete, valid lock selects the fixed single candidate CI
+            # workflow.  Partial or invalid locks fail in parse above before
+            # this scope switch and before any API call.
+            scope = CI_WORKFLOW_PATHS
+            workflows = default_workflow_states(scope)
         config = Config(
             source_sha=validate_source_sha(raw_source),
             summary_path=summary_path,
@@ -1281,16 +1311,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             failure=failure,
             source_sha=safe_source,
             workflows=workflows,
+            scope=scope,
         )
     except Exception:
         result = "fail"
         failure = ("internal", "unexpected")
-        summary = build_summary(
-            result="fail",
-            failure=failure,
-            source_sha=None,
-            workflows=default_workflow_states(),
-        )
+        try:
+            summary = build_summary(
+                result="fail",
+                failure=failure,
+                source_sha=None,
+                workflows=default_workflow_states(scope),
+                scope=scope,
+            )
+        except Exception:
+            _print_failure("summary", "write")
+            return 1
     try:
         write_summary(summary_path, summary)
     except PreflightError as exc:
