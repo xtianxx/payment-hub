@@ -322,12 +322,14 @@ def _new_state(args: argparse.Namespace) -> dict[str, Any]:
             "docker_config_removed": True,
             "cleanup_failed": False,
         },
+        "process_cleanup_failed": False,
         "failure": None,
         "limits": [
             "package-inventory-not-atomic",
             "package-visibility-check-not-atomic",
             "single-push-not-atomic",
             "creation-not-proven-atomic",
+            "pre-push-selection-check-not-atomic",
             "postcheck-detects-not-prevents-first-exposure",
             "no-visibility-mutation",
             "initialization-summary-is-not-a-delivery-record",
@@ -427,6 +429,7 @@ class MigrateInitializer(release_module.Release):
             state["credential_cleanup"]["writer_logged_out"] = False
             return False
         if result.cleanup_failed:
+            self._cancel_cleanup_failed = True
             raise ReleaseError("tool", "cleanup-failed")
         ok = not result.timed_out and result.exit_code == 0
         state["credential_cleanup"]["writer_logged_out"] = ok
@@ -510,6 +513,7 @@ class MigrateInitializer(release_module.Release):
             timeout=None,
         )
         if result.cleanup_failed:
+            self._cancel_cleanup_failed = True
             raise ReleaseError("revalidation", "cleanup-failed")
         if result.timed_out or result.exit_code != 0:
             raise ReleaseError("revalidation", "check-images")
@@ -543,6 +547,9 @@ class MigrateInitializer(release_module.Release):
         self, root: Path, state: dict[str, Any]
     ) -> None:
         state["utc"] = release_module.utc_now()
+        state["process_cleanup_failed"] = bool(
+            self._cancel_cleanup_failed
+        )
         release_module._write_json_atomic(root / SUMMARY_FILE, state)
 
     def _initialize_impl(self, args: argparse.Namespace) -> int:
@@ -682,16 +689,11 @@ class MigrateInitializer(release_module.Release):
                     ROLE, tagged, descriptor, "push"
                 )
 
-                # The CI run lock is rechecked immediately before the only
-                # remote write, then the complete owner inventory is refreshed.
-                self._verify_selection(
-                    gate_env,
-                    trusted.source_sha,
-                    run_id,
-                    attempt,
-                    artifact_id,
-                    artifact_digest,
-                )
+                # The complete owner inventory and metadata are refreshed
+                # first; the locked CI selection check is then the last
+                # external read-only gate immediately before the only remote
+                # write.  This ordering narrows, but does not eliminate, the
+                # window after the final check.
                 (
                     refreshed_states,
                     refreshed_metadata,
@@ -706,6 +708,14 @@ class MigrateInitializer(release_module.Release):
                     raise ReleaseError("package", "app-metadata-changed")
                 if refreshed_states[ROLE]["status"] != "ABSENT_CONFIRMED":
                     raise ReleaseError("package", "migrate-appeared")
+                self._verify_selection(
+                    gate_env,
+                    trusted.source_sha,
+                    run_id,
+                    attempt,
+                    artifact_id,
+                    artifact_digest,
+                )
 
                 state["push"]["attempted"] = True
                 state["push"]["side_effect"] = "unknown"
@@ -813,11 +823,6 @@ class MigrateInitializer(release_module.Release):
             state["outcome"] = "fail"
             state["initialization_verified"] = False
             state["failure"] = {"stage": exc.stage, "kind": exc.kind}
-            if state["credential_cleanup"]["cleanup_failed"]:
-                state["failure"] = {
-                    "stage": "auth",
-                    "kind": "cleanup-failed",
-                }
             try:
                 self._write_initialization_summary(root, state)
             except ReleaseError:
@@ -827,11 +832,6 @@ class MigrateInitializer(release_module.Release):
             state["outcome"] = "fail"
             state["initialization_verified"] = False
             state["failure"] = {"stage": "internal", "kind": "unexpected"}
-            if state["credential_cleanup"]["cleanup_failed"]:
-                state["failure"] = {
-                    "stage": "auth",
-                    "kind": "cleanup-failed",
-                }
             try:
                 self._write_initialization_summary(root, state)
             except ReleaseError:

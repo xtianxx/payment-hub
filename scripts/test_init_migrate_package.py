@@ -341,10 +341,13 @@ class InitTestBase(unittest.TestCase):
         self.assertTrue(path.exists(), "initialization summary must exist")
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def docker_calls(self) -> list[dict[str, Any]]:
+    def docker_calls(
+        self, runner: InitFakeRunner | None = None
+    ) -> list[dict[str, Any]]:
+        runner = runner or self.fake
         return [
             call
-            for call in self.fake.calls
+            for call in runner.calls
             if Path(call["argv"][0]).name.endswith("docker")
         ]
 
@@ -494,6 +497,7 @@ class SuccessTests(InitTestBase):
             },
         )
         self.assertIsNone(summary["failure"])
+        self.assertIs(summary["process_cleanup_failed"], False)
         self.assertEqual(
             stat.S_IMODE(
                 (self.root / init.SUMMARY_FILE).stat().st_mode
@@ -541,6 +545,7 @@ class SuccessTests(InitTestBase):
         summary = self.summary()
         self.assertIs(summary["initialization_verified"], True)
         self.assertIs(summary["published"], False)
+        self.assertIs(summary["process_cleanup_failed"], False)
         self.assertEqual(summary["migrate"]["visibility"], "public")
         self.assertIs(summary["requires_owner_visibility_action"], False)
         self.assertEqual(
@@ -708,6 +713,7 @@ class CleanupClassificationTests(InitTestBase):
         summary = self.assert_failure("revalidation", "cleanup-failed")
         self.assertIsNone(summary["revalidation"])
         self.assertEqual(summary["push"]["side_effect"], "verified")
+        self.assertIs(summary["process_cleanup_failed"], True)
         self.assertIs(
             summary["credential_cleanup"]["cleanup_failed"], False
         )
@@ -721,6 +727,7 @@ class CleanupClassificationTests(InitTestBase):
             ("tool", "cleanup-failed"),
         )
         summary = self.assert_failure("tool", "cleanup-failed")
+        self.assertIs(summary["process_cleanup_failed"], True)
         self.assertIs(
             summary["credential_cleanup"]["writer_logged_out"], False
         )
@@ -729,8 +736,37 @@ class CleanupClassificationTests(InitTestBase):
         )
         self.assertEqual(summary["push"]["side_effect"], "verified")
 
+    def test_credential_cleanup_failure_preserves_prior_stage(self):
+        def fail_logout(instance, *args, **kwargs):
+            raise init.ReleaseError("auth", "logout")
+
+        def fail_remove(instance, auth_dir, state):
+            state["credential_cleanup"]["cleanup_failed"] = True
+            state["credential_cleanup"]["docker_config_removed"] = False
+
+        with (
+            mock.patch.object(
+                init.MigrateInitializer, "_logout", new=fail_logout
+            ),
+            mock.patch.object(
+                init.MigrateInitializer, "_remove_auth_dir", new=fail_remove
+            ),
+        ):
+            with self.assertRaises(init.ReleaseError) as caught:
+                self.run_init()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("auth", "logout"),
+        )
+        summary = self.assert_failure("auth", "logout")
+        self.assertIs(
+            summary["credential_cleanup"]["cleanup_failed"], True
+        )
+        self.assertIs(summary["process_cleanup_failed"], False)
+
     def test_cancelled_cleanup_failure_classification_is_preserved(self):
         def fail(instance, *args, **kwargs):
+            instance._cancel_cleanup_failed = True
             raise init.ReleaseError("cancelled", "cleanup-failed")
 
         with mock.patch.object(
@@ -744,6 +780,7 @@ class CleanupClassificationTests(InitTestBase):
         )
         summary = self.assert_failure("cancelled", "cleanup-failed")
         self.assertEqual(summary["push"]["side_effect"], "verified")
+        self.assertIs(summary["process_cleanup_failed"], True)
         self.assertIs(summary["initialization_verified"], False)
 
 
@@ -1037,6 +1074,27 @@ class CiAndHandoffTests(InitTestBase):
         self.assertIs(summary["push"]["attempted"], False)
         self.assert_no_app_push()
 
+    def test_package_refresh_advancing_ci_is_caught_by_the_last_selector(self):
+        def advance_selection(session: int, page: int) -> None:
+            if session == 2 and page == 1:
+                self.selection = self.selection_value(
+                    run_id=1002, attempt=2
+                )
+
+        self.http.inventory_page_callback = advance_selection
+        with self.assertRaises(init.ReleaseError) as caught:
+            self.run_init()
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("ci", "selection-mismatch"),
+        )
+        self.assertEqual(self.selection_calls, 2)
+        summary = self.assert_failure("ci", "selection-mismatch")
+        self.assertEqual(self.fake.login_calls, 1)
+        self.assertEqual(self.fake.push_calls, [])
+        self.assertIs(summary["push"]["attempted"], False)
+        self.assert_no_app_push()
+
     def test_descriptor_hash_mismatch_fails_before_audit(self):
         with self.assertRaises(init.ReleaseError) as caught:
             self.run_init(args=self.make_args(descriptor_sha="c" * 64))
@@ -1064,8 +1122,37 @@ class CiAndHandoffTests(InitTestBase):
             ("handoff", "source-sha"),
         )
         self.assertEqual(self.http.calls, [])
-        self.assertEqual(self.docker_calls(), [])
+        self.assertEqual(self.docker_calls(fake), [])
         self.assert_failure("handoff", "source-sha")
+
+    def test_handoff_source_mismatch_assertion_checks_runner_under_test(self):
+        self.selection = self.selection_value(source_sha=OTHER_SHA)
+        fake = InitFakeRunner(self.pair, http=self.http, git_sha=OTHER_SHA)
+        env = dict(self.env)
+        env["GITHUB_SHA"] = OTHER_SHA
+        original = init.MigrateInitializer._verify_selection
+
+        def mutated(instance, *args, **kwargs):
+            instance._docker(["version"])
+            return original(instance, *args, **kwargs)
+
+        with mock.patch.object(
+            init.MigrateInitializer, "_verify_selection", new=mutated
+        ):
+            with self.assertRaises(init.ReleaseError) as caught:
+                self.run_init(
+                    args=self.make_args(source_sha=OTHER_SHA),
+                    env=env,
+                    fake=fake,
+                )
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("handoff", "source-sha"),
+        )
+        # The old helper target would miss this call; the runner-under-test
+        # aware helper must see it.
+        self.assertEqual(self.docker_calls(), [])
+        self.assertNotEqual(self.docker_calls(fake), [])
 
 
 class PackagePrecheckTests(InitTestBase):
@@ -1360,6 +1447,7 @@ class CancellationAndCleanupTests(InitTestBase):
         self.assertEqual(
             summary["credential_cleanup"]["cleanup_failed"], True
         )
+        self.assertIs(summary["process_cleanup_failed"], False)
         self.assertEqual(
             summary["credential_cleanup"]["docker_config_removed"], False
         )

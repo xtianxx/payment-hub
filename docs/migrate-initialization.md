@@ -89,6 +89,10 @@ Git、Go、验收与Docker子进程不继承两种token，登录只经标准输�
 - 只有内容验证、postcheck、运行验收及清理全部成功，才可声明初始化已验证。
 - `app`和`migrate`保留冻结身份，`last_observed`记录最后复查阶段及ID/可见性；
   两者不一致时拒绝成功，未知可见性不冒充private或public。
+- `process_cleanup_failed`单独记录子进程清理失败；
+  `credential_cleanup.cleanup_failed`只记录凭据目录清理失败。
+  失败摘要保留原始`failure.stage/kind`，不因后续凭据清理失败覆盖首个错误分类；
+  两种清理状态必须一起核对，任一失败都不能作为初始化成功。
 - 记录真实可见性：若为private，需要owner后续单独确认并处理公开设置；
   若已经public，不重复更改，也不尝试改回private。
 - 初始化成功后仍须另行授权正常release，完成同一源码的两个镜像发布、
@@ -96,7 +100,15 @@ Git、Go、验收与Docker子进程不继承两种token，登录只经标准输�
 
 缺失检查、push及postcheck不是原子事务。
 即使初始化验证成功，也不声称能够证明包恰由本次run创建；
-存在外部并发写者时，最后一次检查与push之间仍有窗口。
+存在外部并发写者时，最后一次检查与push之间仍有窗口：
+其他写者可能在此时创建迁移包并占用相同初始化标签，后续`docker push`
+仍可能覆盖该标签的指向。维护窗口必须排除这些写者；只暂停本工作流不够。
+当前未找到GHCR官方支持的标签条件创建、不可变标签或原子预留契约，
+不能把额外一次GET、未文档化的`If-None-Match`或事后digest校验当作防覆盖保证。
+如果不能确认没有其他写者，不应执行本入口，应先另行评审交付方案。
+
+CI选择复查同样只是时点检查。将它放到包复查之后、紧邻push，
+可以拒绝包复查期间已经推进的CI run/attempt，但不能阻止最后一次CI检查之后的新运行。
 
 失败或取消后可能已经残留包、tag或公开内容。
 摘要必须保留push是否尝试、已验证或未知副作用以及清理结果；
@@ -114,9 +126,29 @@ Git、Go、验收与Docker子进程不继承两种token，登录只经标准输�
 - 初始化与正常发布CLI的`--help`及`git diff --check`：exit 0。
 
 本地fake覆盖不能证明远端创建成功。未运行真实Actions初始化、GHCR登录/推送、
-可见性修改或真实Docker配对验收；后续仅获本地提交授权，不推送或部署。
+可见性修改或真实Docker配对验收。上述验证对应首次实现；
+其后已获授权推送分支并创建PR，不代表初始化或部署授权。
+
+## PR #21审查修复验证
+
+本地修复了包复查与最终CI选择的顺序，补强了审计Secret搬移反例及实际runner断言，
+并将进程清理失败与凭据目录清理失败分开记录。外部写者覆盖同名标签的竞态
+仍是上文明确列出的剩余风险，未宣称已获得GHCR原子创建保证。
+
+- `python3 -B -m unittest discover -s scripts -p 'test_*.py'`：
+  exit 0，1188项通过，包含46项初始化测试及140项工作流合同测试。
+- 固定Go1.27.4的`check-ci-contract.py`及`TestReleaseGates`：exit 0。
+- 初始化CLI的`--help`及`git diff --check`：exit 0。
+- 时序与runner断言测试均验证旧实现会失败；审计位置保护禁用时，
+  保持Secret总次数不变的搬移反例也会失败。
+
+以上为本地修复验证记录；后续已获授权提交并推送修复，不包含合并、真实初始化或部署。
+未回复或关闭远端审查讨论。
+PR原head的CI绿灯不作为本地新改动的远端验证证据。
 
 ## 官方规则
 
 - [Actions创建包的默认权限与可见性](https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions#default-permissions-and-access-settings-for-packages-modified-through-workflows)
 - [包可见性与访问控制](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
+- [GHCR容器镜像操作](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
+- [OCI Distribution v1.1.1：推送manifest](https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pushing-manifests)

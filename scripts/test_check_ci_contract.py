@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -2212,7 +2213,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                     {issue.kind for issue in self._issues_for_mutation(text)},
                 )
 
-    def test_mutation_init_permissions_or_audit_leak_is_rejected(self):
+    def test_mutation_init_permissions_is_rejected(self):
         text = self._mutate_init(
             "      packages: write\n",
             "      packages: write\n      statuses: write\n",
@@ -2221,20 +2222,118 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             "release-init-permissions",
             {issue.kind for issue in self._issues_for_mutation(text)},
         )
-        text = self._mutate_init(
-            "      - name: Verify resolved candidate identity\n"
-            "        shell: bash\n"
-            "        env:\n",
+
+    def _move_init_audit_to_identity(self, text):
+        audit = RELEASE_AUDIT_SECRET_LINE
+        head, tail = text.split("  initialize-migrate:\n", 1)
+        self.assertEqual(tail.count(audit), 1)
+        tail = tail.replace(audit, "", 1)
+        marker = (
             "      - name: Verify resolved candidate identity\n"
             "        shell: bash\n"
             "        env:\n"
-            "          GHCR_PACKAGE_AUDIT_TOKEN: "
-            "${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}\n",
         )
-        self.assertIn(
-            "release-token-location",
-            {issue.kind for issue in self._issues_for_mutation(text)},
+        self.assertIn(marker, tail)
+        tail = tail.replace(marker, marker + audit, 1)
+        return head + "  initialize-migrate:\n" + tail
+
+    def test_mutation_third_audit_secret_is_rejected(self):
+        marker = (
+            "      - name: Verify resolved candidate identity\n"
+            "        shell: bash\n"
+            "        env:\n"
         )
+        text = self._mutate_init(
+            marker, marker + RELEASE_AUDIT_SECRET_LINE
+        )
+        self.assertEqual(
+            text.count(MOD.RELEASE_AUDIT_SECRET_NAME + ":"), 3
+        )
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-token-location", kinds)
+
+    def test_mutation_init_audit_moved_to_unapproved_step_is_rejected(self):
+        text = self._move_init_audit_to_identity(self.text)
+        self.assertNotEqual(text, self.text)
+        self.assertEqual(
+            text.count(MOD.RELEASE_AUDIT_SECRET_NAME + ":"), 2
+        )
+        self.assertEqual(len(_secret_expressions(text)), 2)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-token-location", kinds)
+
+    def test_mutation_publish_audit_moved_to_unapproved_step_is_rejected(self):
+        audit = RELEASE_AUDIT_SECRET_LINE
+        start = self.text.index("  upload:\n")
+        end = self.text.index("  initialize-migrate:\n")
+        section = self.text[start:end]
+        self.assertEqual(section.count(audit), 1)
+        section = section.replace(audit, "", 1)
+        marker = (
+            "      - name: Verify resolved candidate identity\n"
+            "        shell: bash\n"
+            "        env:\n"
+        )
+        self.assertIn(marker, section)
+        section = section.replace(marker, marker + audit, 1)
+        text = self.text[:start] + section + self.text[end:]
+        self.assertNotEqual(text, self.text)
+        self.assertEqual(
+            text.count(MOD.RELEASE_AUDIT_SECRET_NAME + ":"), 2
+        )
+        self.assertEqual(len(_secret_expressions(text)), 2)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-token-location", kinds)
+
+    def test_audit_location_guard_controlled_mutation_is_effective(self):
+        text = self._move_init_audit_to_identity(self.text)
+        parsed = MOD.parse_workflow_text(text)
+        baseline = {
+            issue.kind for issue in MOD.validate_release_workflow(parsed, text, REPO)
+        }
+        self.assertIn("release-token-location", baseline)
+
+        source = SCRIPT.read_text(encoding="utf-8")
+        needle = (
+            "            if RELEASE_AUDIT_SECRET_NAME in step_env:\n"
+            "                if location not in allowed_audit_steps:\n"
+            '                    add("release-token-location", job_id)\n'
+        )
+        replacement = (
+            "            if RELEASE_AUDIT_SECRET_NAME in step_env:\n"
+            "                if False:\n"
+            '                    add("release-token-location", job_id)\n'
+        )
+        self.assertIn(needle, source)
+        patched_source = source.replace(needle, replacement, 1)
+        self.assertNotEqual(patched_source, source)
+
+        module = types.ModuleType("patched_ci_contract_for_audit_test")
+        module.__file__ = str(SCRIPT)
+        sys.modules[module.__name__] = module
+        try:
+            exec(compile(patched_source, str(SCRIPT), "exec"), module.__dict__)
+            patched_workflow = module.parse_workflow_text(text)
+            patched_kinds = {
+                issue.kind
+                for issue in module.validate_release_workflow(
+                    patched_workflow, text, REPO
+                )
+            }
+        finally:
+            sys.modules.pop(module.__name__, None)
+        self.assertNotIn("release-token-location", patched_kinds)
+
+        original_validator = MOD.validate_release_workflow
+        MOD.validate_release_workflow = module.validate_release_workflow
+        try:
+            with self.assertRaises(AssertionError):
+                kinds = {
+                    issue.kind for issue in self._issues_for_mutation(text)
+                }
+                self.assertIn("release-token-location", kinds)
+        finally:
+            MOD.validate_release_workflow = original_validator
 
     def test_mutation_init_cli_target_publish_or_identity_args_are_rejected(self):
         for old, new in (
