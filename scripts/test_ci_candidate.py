@@ -785,6 +785,24 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(values["source_sha"], SOURCE_SHA)
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
 
+    def test_github_output_separates_existing_unterminated_value(self):
+        for index, initial in enumerate(("existing=1", "existing=1\n", "")):
+            with self.subTest(initial=initial):
+                output = self.base / f"output-separator-{index}"
+                output.write_text(initial)
+                ci_candidate._write_github_output(
+                    output,
+                    bundle_dir=self.base / "bundle",
+                    descriptor_sha256="a" * 64,
+                    source_sha=SOURCE_SHA,
+                )
+                prefix = initial + ("\n" if initial and not initial.endswith("\n") else "")
+                self.assertEqual(
+                    output.read_text(),
+                    prefix + f"bundle_dir={self.base / 'bundle'}\n"
+                    + f"descriptor_sha256={'a' * 64}\nsource_sha={SOURCE_SHA}\n",
+                )
+
     def test_export_helper_detects_record_change_after_validation(self):
         root = self.base / "snapshot-record"
         root.mkdir()

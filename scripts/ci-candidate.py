@@ -162,7 +162,7 @@ def _write_github_output(
     ]
     for name, value in lines:
         _validate_output_value(value)
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags, 0o600)
@@ -173,6 +173,11 @@ def _write_github_output(
         if not stat.S_ISREG(info.st_mode):
             raise release.ReleaseError("artifact", "github-output")
         os.fchmod(descriptor, 0o600)
+        separator = (
+            "\n"
+            if info.st_size and os.pread(descriptor, 1, info.st_size - 1) != b"\n"
+            else ""
+        )
     except release.ReleaseError:
         os.close(descriptor)
         raise
@@ -182,7 +187,7 @@ def _write_github_output(
     try:
         with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(
-                "".join(f"{name}={value}\n" for name, value in lines)
+                separator + "".join(f"{name}={value}\n" for name, value in lines)
             )
     except OSError as exc:
         raise release.ReleaseError("artifact", "github-output") from exc
