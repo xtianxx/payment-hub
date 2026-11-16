@@ -46,6 +46,7 @@ def load_pristine_check_main_ci():
 
 TOKEN = "ghs_test_token_1234567890"
 SHA = "a" * 40
+OTHER_SHA = "b" * 40
 OLDER = "2026-01-01T00:00:00Z"
 LATEST = "2026-01-02T00:00:00Z"
 
@@ -1695,9 +1696,6 @@ class LockWorkflowPreconditionTests(unittest.TestCase):
         )
         fake.attempt_responses[(run_id, 1)] = json_response(run)
 
-    def add_legacy_success(self, fake, path, workflow_id, run_id):
-        self.add_success(fake, path, workflow_id, run_id)
-
     def locked_config(self):
         return MOD.Config(
             source_sha=SHA,
@@ -1706,44 +1704,19 @@ class LockWorkflowPreconditionTests(unittest.TestCase):
             expected_run_attempt=1,
         )
 
-    def test_lock_single_candidate_succeeds_when_defaults_are_legacy(self):
+    def test_lock_single_candidate_succeeds(self):
+        self.assertEqual(
+            MOD.WORKFLOW_PATHS, (MOD.CANDIDATE_WORKFLOW_PATH,)
+        )
         fake = FakeGitHub()
         self.add_success(fake, MOD.CANDIDATE_WORKFLOW_PATH, 101, 1001)
         states = [MOD.WorkflowState(path=MOD.CANDIDATE_WORKFLOW_PATH)]
-        with mock.patch.object(MOD, "WORKFLOW_PATHS", self.LEGACY):
-            self.assertIsNone(
-                MOD.run_gate(
-                    self.locked_config(), self.make_api(fake), states
-                )
+        self.assertIsNone(
+            MOD.run_gate(
+                self.locked_config(), self.make_api(fake), states
             )
+        )
         self.assertTrue(any("ci.yml" in url for url in fake.requests))
-
-    def test_lock_rejects_single_legacy_when_defaults_are_legacy(self):
-        fake = FakeGitHub()
-        states = [MOD.WorkflowState(path=self.LEGACY[0])]
-        with mock.patch.object(MOD, "WORKFLOW_PATHS", self.LEGACY):
-            self.assertEqual(
-                MOD.run_gate(
-                    self.locked_config(), self.make_api(fake), states
-                ),
-                ("cli", "lock-workflow"),
-            )
-        self.assertEqual(fake.requests, [])
-
-    def test_lock_rejects_legacy_pair_when_defaults_are_legacy(self):
-        fake = FakeGitHub()
-        states = [
-            MOD.WorkflowState(path=self.LEGACY[0]),
-            MOD.WorkflowState(path=self.LEGACY[1]),
-        ]
-        with mock.patch.object(MOD, "WORKFLOW_PATHS", self.LEGACY):
-            self.assertEqual(
-                MOD.run_gate(
-                    self.locked_config(), self.make_api(fake), states
-                ),
-                ("cli", "lock-workflow"),
-            )
-        self.assertEqual(fake.requests, [])
 
     def test_lock_rejects_two_legacy_states_before_api(self):
         fake = FakeGitHub()
@@ -1766,29 +1739,6 @@ class LockWorkflowPreconditionTests(unittest.TestCase):
         )
         self.assertEqual(fake.requests, [])
 
-    def test_default_no_lock_legacy_pair_still_runs(self):
-        fake = FakeGitHub()
-        self.add_legacy_success(fake, self.LEGACY[0], 101, 1001)
-        self.add_legacy_success(fake, self.LEGACY[1], 202, 2002)
-        states = [
-            MOD.WorkflowState(path=self.LEGACY[0]),
-            MOD.WorkflowState(path=self.LEGACY[1]),
-        ]
-        config = MOD.Config(
-            source_sha=SHA,
-            summary_path=Path("/unused-legacy-gate"),
-        )
-        with mock.patch.object(MOD, "WORKFLOW_PATHS", self.LEGACY):
-            self.assertIsNone(
-                MOD.run_gate(config, self.make_api(fake), states)
-            )
-        self.assertTrue(
-            any("setup-check.yml" in url for url in fake.requests)
-        )
-        self.assertTrue(
-            any("/actions/workflows/202/runs" in url for url in fake.requests)
-        )
-
     def test_lock_workflow_failure_is_whitelisted(self):
         summary = MOD.build_summary(
             result="fail",
@@ -1800,6 +1750,323 @@ class LockWorkflowPreconditionTests(unittest.TestCase):
             summary["failure"],
             {"stage": "cli", "kind": "lock-workflow"},
         )
+
+
+class SingleCiCliTests(unittest.TestCase):
+    """Real production CLI regressions for the final single-ci entry."""
+
+    def setUp(self):
+        self.pristine = load_pristine_check_main_ci()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.fake = FakeGitHub()
+        self.api = self.pristine.GitHubApi(
+            TOKEN, transport=self.fake.transport
+        )
+        self.counter = 0
+        self.factory_calls = 0
+        self.ci_path = self.pristine.CANDIDATE_WORKFLOW_PATH
+
+    def reset_fake(self):
+        self.fake = FakeGitHub()
+        self.api = self.pristine.GitHubApi(
+            TOKEN, transport=self.fake.transport
+        )
+        self.factory_calls = 0
+
+    def add_ci_success(self, run_id=1001, attempt=1, sha=SHA):
+        self.fake.workflow_responses["ci.yml"] = json_response(
+            make_workflow(self.ci_path, 101)
+        )
+        run = make_run(
+            run_id, 101, self.ci_path, attempt=attempt, sha=sha
+        )
+        self.fake.page_responses[(101, 1)] = json_response(
+            make_runs(1, [run])
+        )
+        self.fake.attempt_responses[(run_id, attempt)] = json_response(run)
+        return run
+
+    def run_main_argv(self, extra, environment=None):
+        self.counter += 1
+        summary_path = (
+            self.root / f"gate-{self.counter}" / "ci-preflight.json"
+        )
+        argv = [
+            "--source-sha",
+            SHA,
+            "--summary",
+            str(summary_path),
+            *extra,
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def factory(token):
+            self.factory_calls += 1
+            return self.api
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                base_env() if environment is None else environment,
+                clear=True,
+            ),
+            mock.patch.object(
+                self.pristine, "GitHubApi", side_effect=factory
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            code = self.pristine.main(argv)
+        summary = None
+        if summary_path.exists():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        return code, stdout.getvalue(), stderr.getvalue(), summary
+
+    def run_locked(self, run_id="1001", attempt="1"):
+        return self.run_main_argv(
+            [
+                "--expected-run-id",
+                run_id,
+                "--expected-run-attempt",
+                attempt,
+            ]
+        )
+
+    def assert_only_ci_requests(self):
+        self.assertFalse(
+            any("setup-check.yml" in url for url in self.fake.requests)
+        )
+        self.assertFalse(
+            any(
+                url.endswith("/actions/workflows/check.yml")
+                for url in self.fake.requests
+            )
+        )
+
+    def test_complete_lock_success_queries_only_ci(self):
+        self.add_ci_success()
+        code, stdout, stderr, summary = self.run_locked()
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, "ci-preflight: pass\n")
+        self.assertEqual(stderr, "")
+        self.assertEqual(summary["result"], "pass")
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            [self.ci_path],
+        )
+        self.assertEqual(self.factory_calls, 1)
+        self.assertEqual(len(self.fake.requests), 3)
+        self.assert_only_ci_requests()
+
+    def test_complete_lock_new_run_rejected_summary_stays_ci(self):
+        self.add_ci_success(run_id=1002)
+        code, stdout, stderr, summary = self.run_locked()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "ci-preflight: fail stage=run kind=expected-mismatch\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            summary["failure"],
+            {"stage": "run", "kind": "expected-mismatch"},
+        )
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            [self.ci_path],
+        )
+        self.assert_only_ci_requests()
+
+    def test_complete_lock_new_attempt_rejected_summary_stays_ci(self):
+        self.add_ci_success(attempt=2)
+        code, stdout, stderr, summary = self.run_locked()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "ci-preflight: fail stage=run kind=expected-mismatch\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            summary["failure"],
+            {"stage": "run", "kind": "expected-mismatch"},
+        )
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            [self.ci_path],
+        )
+        self.assert_only_ci_requests()
+
+    def test_complete_lock_other_sha_rejected_summary_stays_ci(self):
+        self.add_ci_success(sha=OTHER_SHA)
+        code, stdout, stderr, summary = self.run_locked()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "ci-preflight: fail stage=runs kind=identity\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            summary["failure"], {"stage": "runs", "kind": "identity"}
+        )
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            [self.ci_path],
+        )
+        self.assert_only_ci_requests()
+
+    def test_no_lock_ci_success_unchanged(self):
+        self.add_ci_success()
+        code, stdout, stderr, summary = self.run_main_argv([])
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, "ci-preflight: pass\n")
+        self.assertEqual(stderr, "")
+        self.assertEqual(summary["result"], "pass")
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            [self.ci_path],
+        )
+        self.assertEqual(len(self.fake.requests), 3)
+        self.assert_only_ci_requests()
+
+    def test_no_lock_ci_failure_and_missing_unchanged(self):
+        cases = (
+            ("failure", "failure", "runs", "not-success"),
+            ("missing", "missing", "runs", "missing"),
+        )
+        for name, mode, stage, kind in cases:
+            with self.subTest(name=name):
+                self.reset_fake()
+                self.add_ci_success()
+                if mode == "failure":
+                    failing = make_run(
+                        1001, 101, self.ci_path, conclusion="failure"
+                    )
+                    self.fake.page_responses[(101, 1)] = json_response(
+                        make_runs(1, [failing])
+                    )
+                    self.fake.attempt_responses[(1001, 1)] = json_response(
+                        failing
+                    )
+                else:
+                    self.fake.page_responses[(101, 1)] = json_response(
+                        make_runs(0, [])
+                    )
+                code, stdout, stderr, summary = self.run_main_argv([])
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    stdout,
+                    f"ci-preflight: fail stage={stage} kind={kind}\n",
+                )
+                self.assertEqual(stderr, "")
+                self.assertEqual(
+                    summary["failure"], {"stage": stage, "kind": kind}
+                )
+                self.assertEqual(
+                    [entry["path"] for entry in summary["workflows"]],
+                    [self.ci_path],
+                )
+
+    def test_partial_or_invalid_lock_rejected_before_api(self):
+        cases = (
+            ("id-only", ["--expected-run-id", "1001"]),
+            ("attempt-only", ["--expected-run-attempt", "1"]),
+            (
+                "zero-id",
+                ["--expected-run-id", "0", "--expected-run-attempt", "1"],
+            ),
+            (
+                "bool-id",
+                [
+                    "--expected-run-id",
+                    "True",
+                    "--expected-run-attempt",
+                    "1",
+                ],
+            ),
+            (
+                "zero-attempt",
+                ["--expected-run-id", "1", "--expected-run-attempt", "0"],
+            ),
+            (
+                "bad-attempt",
+                ["--expected-run-id", "1", "--expected-run-attempt", "x"],
+            ),
+        )
+        for name, extra in cases:
+            with self.subTest(name=name):
+                self.reset_fake()
+                code, stdout, stderr, summary = self.run_main_argv(extra)
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    stdout,
+                    "ci-preflight: fail stage=cli kind=expected-run\n",
+                )
+                self.assertEqual(stderr, "")
+                self.assertEqual(
+                    summary["failure"],
+                    {"stage": "cli", "kind": "expected-run"},
+                )
+                self.assertEqual(
+                    [entry["path"] for entry in summary["workflows"]],
+                    [self.ci_path],
+                )
+                self.assertEqual(self.factory_calls, 0)
+                self.assertEqual(self.fake.requests, [])
+
+    def test_summary_exception_fallback_stays_ci(self):
+        self.add_ci_success()
+        original = self.pristine.build_summary
+        calls = {"count": 0}
+
+        def flaky(**kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("RAW_SECRET_BODY " + TOKEN)
+            return original(**kwargs)
+
+        with mock.patch.object(
+            self.pristine, "build_summary", side_effect=flaky
+        ):
+            code, stdout, stderr, summary = self.run_locked()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "ci-preflight: fail stage=internal kind=unexpected\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            summary["failure"],
+            {"stage": "internal", "kind": "unexpected"},
+        )
+        self.assertIsNone(summary["source_sha"])
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            [self.ci_path],
+        )
+        text = json.dumps(summary)
+        self.assertNotIn(TOKEN, text)
+        self.assertNotIn("RAW_SECRET_BODY", text)
+
+    def test_summary_fallback_double_failure_is_safe(self):
+        self.add_ci_success()
+        with mock.patch.object(
+            self.pristine,
+            "build_summary",
+            side_effect=RuntimeError("RAW_SECRET_BODY " + TOKEN),
+        ):
+            code, stdout, stderr, summary = self.run_locked()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "ci-preflight: fail stage=summary kind=write\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertIsNone(summary)
+        self.assertNotIn(TOKEN, stdout)
+        self.assertNotIn("RAW_SECRET_BODY", stdout)
 
 
 if __name__ == "__main__":

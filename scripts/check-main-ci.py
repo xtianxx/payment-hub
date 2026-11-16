@@ -1101,8 +1101,7 @@ def run_gate(
             or config.expected_run_attempt is not None
         ):
             # A run lock identifies exactly one candidate CI run.  The lock
-            # path is fixed independently of WORKFLOW_PATHS so transitional
-            # legacy defaults cannot widen or misdirect it.  Applying the
+            # path is fixed independently of WORKFLOW_PATHS.  Applying the
             # same lock to multiple workflows is rejected before any API
             # request; no user-selectable workflow path is exposed.
             if (
@@ -1275,12 +1274,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         result = "fail"
         failure = ("internal", "unexpected")
-        summary = build_summary(
-            result="fail",
-            failure=failure,
-            source_sha=None,
-            workflows=default_workflow_states(),
-        )
+        try:
+            summary = build_summary(
+                result="fail",
+                failure=failure,
+                source_sha=None,
+                workflows=default_workflow_states(),
+            )
+        except Exception:
+            _print_failure("summary", "write")
+            return 1
     try:
         write_summary(summary_path, summary)
     except PreflightError as exc:
