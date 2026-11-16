@@ -212,15 +212,6 @@ class GateTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        # Scoped test configuration only: final B fixtures exercise the
-        # explicit single candidate ci.yml gate.  This does not assert the
-        # production default; pristine tests below load the unpatched module
-        # to prove the real legacy default and explicit ci selection.
-        self._candidate_workflow_patch = mock.patch.object(
-            MOD, "WORKFLOW_PATHS", MOD.CI_WORKFLOW_PATHS
-        )
-        self._candidate_workflow_patch.start()
-        self.addCleanup(self._candidate_workflow_patch.stop)
         self.root = Path(self.temporary.name)
         self.summary_path = self.root / "gate" / "ci-preflight.json"
         self.fake = FakeGitHub()
@@ -920,41 +911,30 @@ class GateTests(GateTestCase):
         self.fake.page_responses[(101, 1)] = json_response(make_runs(1, [run]))
         self.assertEqual(self.gate(), ("runs", "identity"))
 
-    def test_pristine_production_workflow_defaults(self):
+    def test_workflow_paths_has_only_ci_workflow(self):
         pristine = load_pristine_check_main_ci()
-        legacy = (
-            ".github/workflows/setup-check.yml",
-            ".github/workflows/check.yml",
-        )
         self.assertEqual(
             pristine.CANDIDATE_WORKFLOW_PATH,
             ".github/workflows/ci.yml",
         )
-        self.assertEqual(pristine.WORKFLOW_PATHS, legacy)
         self.assertEqual(
-            pristine.CI_WORKFLOW_PATHS,
+            pristine.WORKFLOW_PATHS,
             (pristine.CANDIDATE_WORKFLOW_PATH,),
         )
-        default_states = pristine.default_workflow_states()
+        states = pristine.default_workflow_states()
         self.assertEqual(
-            tuple(state.path for state in default_states), legacy
-        )
-        explicit_states = pristine.default_workflow_states(
-            pristine.CI_WORKFLOW_PATHS
-        )
-        self.assertEqual(
-            tuple(state.path for state in explicit_states),
+            tuple(state.path for state in states),
             (pristine.CANDIDATE_WORKFLOW_PATH,),
         )
         summary = pristine.build_summary(
             result="pass",
             failure=None,
             source_sha=SHA,
-            workflows=default_states,
+            workflows=states,
         )
         self.assertEqual(
             [entry["path"] for entry in summary["workflows"]],
-            list(legacy),
+            [".github/workflows/ci.yml"],
         )
 
     def test_older_success_does_not_mask_latest_failure(self):
@@ -1716,9 +1696,6 @@ class LockWorkflowPreconditionTests(unittest.TestCase):
         )
         fake.attempt_responses[(run_id, 1)] = json_response(run)
 
-    def add_legacy_success(self, fake, path, workflow_id, run_id):
-        self.add_success(fake, path, workflow_id, run_id)
-
     def locked_config(self):
         return MOD.Config(
             source_sha=SHA,
@@ -1727,8 +1704,10 @@ class LockWorkflowPreconditionTests(unittest.TestCase):
             expected_run_attempt=1,
         )
 
-    def test_lock_single_candidate_succeeds_when_defaults_are_legacy(self):
-        self.assertEqual(MOD.WORKFLOW_PATHS, self.LEGACY)
+    def test_lock_single_candidate_succeeds(self):
+        self.assertEqual(
+            MOD.WORKFLOW_PATHS, (MOD.CANDIDATE_WORKFLOW_PATH,)
+        )
         fake = FakeGitHub()
         self.add_success(fake, MOD.CANDIDATE_WORKFLOW_PATH, 101, 1001)
         states = [MOD.WorkflowState(path=MOD.CANDIDATE_WORKFLOW_PATH)]
@@ -1738,31 +1717,6 @@ class LockWorkflowPreconditionTests(unittest.TestCase):
             )
         )
         self.assertTrue(any("ci.yml" in url for url in fake.requests))
-
-    def test_lock_rejects_single_legacy_when_defaults_are_legacy(self):
-        fake = FakeGitHub()
-        states = [MOD.WorkflowState(path=self.LEGACY[0])]
-        self.assertEqual(
-            MOD.run_gate(
-                self.locked_config(), self.make_api(fake), states
-            ),
-            ("cli", "lock-workflow"),
-        )
-        self.assertEqual(fake.requests, [])
-
-    def test_lock_rejects_legacy_pair_when_defaults_are_legacy(self):
-        fake = FakeGitHub()
-        states = [
-            MOD.WorkflowState(path=self.LEGACY[0]),
-            MOD.WorkflowState(path=self.LEGACY[1]),
-        ]
-        self.assertEqual(
-            MOD.run_gate(
-                self.locked_config(), self.make_api(fake), states
-            ),
-            ("cli", "lock-workflow"),
-        )
-        self.assertEqual(fake.requests, [])
 
     def test_lock_rejects_two_legacy_states_before_api(self):
         fake = FakeGitHub()
@@ -1785,28 +1739,6 @@ class LockWorkflowPreconditionTests(unittest.TestCase):
         )
         self.assertEqual(fake.requests, [])
 
-    def test_default_no_lock_legacy_pair_still_runs(self):
-        fake = FakeGitHub()
-        self.add_legacy_success(fake, self.LEGACY[0], 101, 1001)
-        self.add_legacy_success(fake, self.LEGACY[1], 202, 2002)
-        states = [
-            MOD.WorkflowState(path=self.LEGACY[0]),
-            MOD.WorkflowState(path=self.LEGACY[1]),
-        ]
-        config = MOD.Config(
-            source_sha=SHA,
-            summary_path=Path("/unused-legacy-gate"),
-        )
-        self.assertIsNone(
-            MOD.run_gate(config, self.make_api(fake), states)
-        )
-        self.assertTrue(
-            any("setup-check.yml" in url for url in fake.requests)
-        )
-        self.assertTrue(
-            any("/actions/workflows/202/runs" in url for url in fake.requests)
-        )
-
     def test_lock_workflow_failure_is_whitelisted(self):
         summary = MOD.build_summary(
             result="fail",
@@ -1820,233 +1752,8 @@ class LockWorkflowPreconditionTests(unittest.TestCase):
         )
 
 
-class TransitionalLegacyDefaultTests(unittest.TestCase):
-    """PR19 proof that the real production default still gates legacy pair."""
-
-    def setUp(self):
-        self.pristine = load_pristine_check_main_ci()
-        self.legacy = (
-            ".github/workflows/setup-check.yml",
-            ".github/workflows/check.yml",
-        )
-
-    def add_legacy_success(self, fake, path, workflow_id, run_id):
-        fake.workflow_responses[path.rsplit("/", 1)[-1]] = json_response(
-            make_workflow(path, workflow_id)
-        )
-        run = make_run(run_id, workflow_id, path)
-        fake.page_responses[(workflow_id, 1)] = json_response(
-            make_runs(1, [run])
-        )
-        fake.attempt_responses[(run_id, 1)] = json_response(run)
-        return run
-
-    def gate(self, fake):
-        api = self.pristine.GitHubApi(TOKEN, transport=fake.transport)
-        config = self.pristine.Config(
-            source_sha=SHA,
-            summary_path=Path("/unused-transition"),
-        )
-        states = self.pristine.default_workflow_states()
-        return self.pristine.run_gate(config, api, states), states
-
-    def run_pristine_main(self, fake):
-        api = self.pristine.GitHubApi(TOKEN, transport=fake.transport)
-        with tempfile.TemporaryDirectory() as temporary:
-            summary_path = Path(temporary) / "gate" / "ci-preflight.json"
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with (
-                mock.patch.dict(os.environ, base_env(), clear=True),
-                mock.patch.object(
-                    self.pristine, "GitHubApi", lambda token: api
-                ),
-                redirect_stdout(stdout),
-                redirect_stderr(stderr),
-            ):
-                code = self.pristine.main(
-                    [
-                        "--source-sha",
-                        SHA,
-                        "--summary",
-                        str(summary_path),
-                    ]
-                )
-            return (
-                code,
-                stdout.getvalue(),
-                stderr.getvalue(),
-                json.loads(summary_path.read_text(encoding="utf-8")),
-            )
-
-    def test_pristine_cli_default_checks_both_legacy_workflows(self):
-        fake = FakeGitHub()
-        self.add_legacy_success(fake, self.legacy[0], 101, 1001)
-        self.add_legacy_success(fake, self.legacy[1], 202, 2002)
-        code, stdout, stderr, summary = self.run_pristine_main(fake)
-        self.assertEqual(code, 0)
-        self.assertEqual(stdout, "ci-preflight: pass\n")
-        self.assertEqual(stderr, "")
-        self.assertEqual(summary["result"], "pass")
-        self.assertEqual(
-            [entry["path"] for entry in summary["workflows"]],
-            list(self.legacy),
-        )
-
-    def test_pristine_cli_default_rejects_one_legacy_failure(self):
-        fake = FakeGitHub()
-        self.add_legacy_success(fake, self.legacy[0], 101, 1001)
-        self.add_legacy_success(fake, self.legacy[1], 202, 2002)
-        failing = make_run(
-            2002,
-            202,
-            self.legacy[1],
-            conclusion="failure",
-        )
-        fake.page_responses[(202, 1)] = json_response(
-            make_runs(1, [failing])
-        )
-        fake.attempt_responses[(2002, 1)] = json_response(failing)
-        code, stdout, stderr, summary = self.run_pristine_main(fake)
-        self.assertEqual(code, 1)
-        self.assertEqual(
-            stdout,
-            "ci-preflight: fail stage=runs kind=not-success\n",
-        )
-        self.assertEqual(stderr, "")
-        self.assertEqual(
-            summary["failure"], {"stage": "runs", "kind": "not-success"}
-        )
-        self.assertEqual(
-            [entry["path"] for entry in summary["workflows"]],
-            list(self.legacy),
-        )
-        self.assertEqual(
-            summary["workflows"][1]["latest_run"]["conclusion"], "failure"
-        )
-
-    def test_pristine_cli_default_rejects_each_legacy_failure(self):
-        cases = ((0, 101, 1001), (1, 202, 2002))
-        for index, workflow_id, run_id in cases:
-            with self.subTest(path=self.legacy[index]):
-                fake = FakeGitHub()
-                self.add_legacy_success(fake, self.legacy[0], 101, 1001)
-                self.add_legacy_success(fake, self.legacy[1], 202, 2002)
-                failing = make_run(
-                    run_id,
-                    workflow_id,
-                    self.legacy[index],
-                    conclusion="failure",
-                )
-                fake.page_responses[(workflow_id, 1)] = json_response(
-                    make_runs(1, [failing])
-                )
-                fake.attempt_responses[(run_id, 1)] = json_response(failing)
-                code, stdout, stderr, summary = self.run_pristine_main(fake)
-                self.assertEqual(code, 1)
-                self.assertEqual(
-                    stdout,
-                    "ci-preflight: fail stage=runs kind=not-success\n",
-                )
-                self.assertEqual(stderr, "")
-                self.assertEqual(
-                    summary["failure"],
-                    {"stage": "runs", "kind": "not-success"},
-                )
-                self.assertEqual(
-                    [entry["path"] for entry in summary["workflows"]],
-                    list(self.legacy),
-                )
-
-    def test_pristine_cli_default_rejects_missing_legacy_workflow(self):
-        cases = ((0, "setup-check.yml"), (1, "check.yml"))
-        for index, filename in cases:
-            with self.subTest(path=self.legacy[index]):
-                fake = FakeGitHub()
-                self.add_legacy_success(fake, self.legacy[0], 101, 1001)
-                self.add_legacy_success(fake, self.legacy[1], 202, 2002)
-                fake.workflow_responses[filename] = raw_response(404, b"{}")
-                code, stdout, stderr, summary = self.run_pristine_main(fake)
-                self.assertEqual(code, 1)
-                self.assertEqual(
-                    stdout,
-                    "ci-preflight: fail stage=workflow kind=not-found\n",
-                )
-                self.assertEqual(stderr, "")
-                self.assertEqual(
-                    summary["failure"],
-                    {"stage": "workflow", "kind": "not-found"},
-                )
-                self.assertEqual(
-                    [entry["path"] for entry in summary["workflows"]],
-                    list(self.legacy),
-                )
-
-    def test_pristine_default_states_are_legacy_pair(self):
-        states = self.pristine.default_workflow_states()
-        self.assertEqual(
-            tuple(state.path for state in states), self.legacy
-        )
-        self.assertEqual(self.pristine.WORKFLOW_PATHS, self.legacy)
-        self.assertEqual(
-            self.pristine.CI_WORKFLOW_PATHS,
-            (".github/workflows/ci.yml",),
-        )
-        explicit = self.pristine.default_workflow_states(
-            self.pristine.CI_WORKFLOW_PATHS
-        )
-        self.assertEqual(
-            tuple(state.path for state in explicit),
-            (".github/workflows/ci.yml",),
-        )
-
-    def test_pristine_default_gate_requires_both_legacy_workflows(self):
-        fake = FakeGitHub()
-        self.add_legacy_success(fake, self.legacy[0], 101, 1001)
-        self.add_legacy_success(fake, self.legacy[1], 202, 2002)
-        failure, _ = self.gate(fake)
-        self.assertIsNone(failure)
-        self.assertTrue(
-            any("setup-check.yml" in url for url in fake.requests)
-        )
-        self.assertTrue(
-            any("/actions/workflows/202/runs" in url for url in fake.requests)
-        )
-
-    def test_pristine_default_gate_rejects_either_legacy_failure(self):
-        cases = ((0, 101, 1001), (1, 202, 2002))
-        for index, workflow_id, run_id in cases:
-            with self.subTest(path=self.legacy[index]):
-                fake = FakeGitHub()
-                self.add_legacy_success(fake, self.legacy[0], 101, 1001)
-                self.add_legacy_success(fake, self.legacy[1], 202, 2002)
-                failing = make_run(
-                    run_id,
-                    workflow_id,
-                    self.legacy[index],
-                    conclusion="failure",
-                )
-                fake.page_responses[(workflow_id, 1)] = json_response(
-                    make_runs(1, [failing])
-                )
-                fake.attempt_responses[(run_id, 1)] = json_response(failing)
-                failure, _ = self.gate(fake)
-                self.assertEqual(failure, ("runs", "not-success"))
-
-    def test_pristine_default_gate_rejects_missing_legacy_workflow(self):
-        cases = ((0, "setup-check.yml"), (1, "check.yml"))
-        for index, filename in cases:
-            with self.subTest(path=self.legacy[index]):
-                fake = FakeGitHub()
-                self.add_legacy_success(fake, self.legacy[0], 101, 1001)
-                self.add_legacy_success(fake, self.legacy[1], 202, 2002)
-                fake.workflow_responses[filename] = raw_response(404, b"{}")
-                failure, _ = self.gate(fake)
-                self.assertEqual(failure, ("workflow", "not-found"))
-
-
-class ApprovedScopeCliTests(unittest.TestCase):
-    """Real production CLI coverage for approved summary scopes and locks."""
+class SingleCiCliTests(unittest.TestCase):
+    """Real production CLI regressions for the final single-ci entry."""
 
     def setUp(self):
         self.pristine = load_pristine_check_main_ci()
@@ -2060,7 +1767,6 @@ class ApprovedScopeCliTests(unittest.TestCase):
         self.counter = 0
         self.factory_calls = 0
         self.ci_path = self.pristine.CANDIDATE_WORKFLOW_PATH
-        self.legacy = self.pristine.WORKFLOW_PATHS
 
     def reset_fake(self):
         self.fake = FakeGitHub()
@@ -2069,29 +1775,18 @@ class ApprovedScopeCliTests(unittest.TestCase):
         )
         self.factory_calls = 0
 
-    def add_success(
-        self, path, workflow_id, run_id, *, attempt=1, sha=SHA
-    ):
-        self.fake.workflow_responses[path.rsplit("/", 1)[-1]] = (
-            json_response(make_workflow(path, workflow_id))
+    def add_ci_success(self, run_id=1001, attempt=1, sha=SHA):
+        self.fake.workflow_responses["ci.yml"] = json_response(
+            make_workflow(self.ci_path, 101)
         )
         run = make_run(
-            run_id, workflow_id, path, attempt=attempt, sha=sha
+            run_id, 101, self.ci_path, attempt=attempt, sha=sha
         )
-        self.fake.page_responses[(workflow_id, 1)] = json_response(
+        self.fake.page_responses[(101, 1)] = json_response(
             make_runs(1, [run])
         )
         self.fake.attempt_responses[(run_id, attempt)] = json_response(run)
         return run
-
-    def add_ci_success(self, run_id=1001, attempt=1, sha=SHA):
-        return self.add_success(
-            self.ci_path, 101, run_id, attempt=attempt, sha=sha
-        )
-
-    def add_legacy_success(self):
-        self.add_success(self.legacy[0], 101, 1001)
-        self.add_success(self.legacy[1], 202, 2002)
 
     def run_main_argv(self, extra, environment=None):
         self.counter += 1
@@ -2140,7 +1835,7 @@ class ApprovedScopeCliTests(unittest.TestCase):
             ]
         )
 
-    def assert_no_legacy_requests(self):
+    def assert_only_ci_requests(self):
         self.assertFalse(
             any("setup-check.yml" in url for url in self.fake.requests)
         )
@@ -2164,7 +1859,7 @@ class ApprovedScopeCliTests(unittest.TestCase):
         )
         self.assertEqual(self.factory_calls, 1)
         self.assertEqual(len(self.fake.requests), 3)
-        self.assert_no_legacy_requests()
+        self.assert_only_ci_requests()
 
     def test_complete_lock_new_run_rejected_summary_stays_ci(self):
         self.add_ci_success(run_id=1002)
@@ -2183,7 +1878,7 @@ class ApprovedScopeCliTests(unittest.TestCase):
             [entry["path"] for entry in summary["workflows"]],
             [self.ci_path],
         )
-        self.assert_no_legacy_requests()
+        self.assert_only_ci_requests()
 
     def test_complete_lock_new_attempt_rejected_summary_stays_ci(self):
         self.add_ci_success(attempt=2)
@@ -2202,7 +1897,7 @@ class ApprovedScopeCliTests(unittest.TestCase):
             [entry["path"] for entry in summary["workflows"]],
             [self.ci_path],
         )
-        self.assert_no_legacy_requests()
+        self.assert_only_ci_requests()
 
     def test_complete_lock_other_sha_rejected_summary_stays_ci(self):
         self.add_ci_success(sha=OTHER_SHA)
@@ -2220,10 +1915,10 @@ class ApprovedScopeCliTests(unittest.TestCase):
             [entry["path"] for entry in summary["workflows"]],
             [self.ci_path],
         )
-        self.assert_no_legacy_requests()
+        self.assert_only_ci_requests()
 
-    def test_no_lock_legacy_success_unchanged(self):
-        self.add_legacy_success()
+    def test_no_lock_ci_success_unchanged(self):
+        self.add_ci_success()
         code, stdout, stderr, summary = self.run_main_argv([])
         self.assertEqual(code, 0)
         self.assertEqual(stdout, "ci-preflight: pass\n")
@@ -2231,46 +1926,34 @@ class ApprovedScopeCliTests(unittest.TestCase):
         self.assertEqual(summary["result"], "pass")
         self.assertEqual(
             [entry["path"] for entry in summary["workflows"]],
-            list(self.legacy),
+            [self.ci_path],
         )
-        self.assertTrue(
-            any("setup-check.yml" in url for url in self.fake.requests)
-        )
-        self.assertTrue(
-            any(
-                "/actions/workflows/202/runs" in url
-                for url in self.fake.requests
-            )
-        )
+        self.assertEqual(len(self.fake.requests), 3)
+        self.assert_only_ci_requests()
 
-    def test_no_lock_legacy_failure_and_missing_unchanged(self):
+    def test_no_lock_ci_failure_and_missing_unchanged(self):
         cases = (
-            ("failure-0", "failure", 0, "runs", "not-success"),
-            ("failure-1", "failure", 1, "runs", "not-success"),
-            ("missing-0", "missing", 0, "workflow", "not-found"),
-            ("missing-1", "missing", 1, "workflow", "not-found"),
+            ("failure", "failure", "runs", "not-success"),
+            ("missing", "missing", "runs", "missing"),
         )
-        for name, mode, index, stage, kind in cases:
+        for name, mode, stage, kind in cases:
             with self.subTest(name=name):
                 self.reset_fake()
-                self.add_legacy_success()
-                path = self.legacy[index]
-                workflow_id = 101 if index == 0 else 202
-                run_id = 1001 if index == 0 else 2002
+                self.add_ci_success()
                 if mode == "failure":
                     failing = make_run(
-                        run_id, workflow_id, path, conclusion="failure"
+                        1001, 101, self.ci_path, conclusion="failure"
                     )
-                    self.fake.page_responses[(workflow_id, 1)] = (
-                        json_response(make_runs(1, [failing]))
+                    self.fake.page_responses[(101, 1)] = json_response(
+                        make_runs(1, [failing])
                     )
-                    self.fake.attempt_responses[(run_id, 1)] = (
-                        json_response(failing)
+                    self.fake.attempt_responses[(1001, 1)] = json_response(
+                        failing
                     )
                 else:
-                    self.fake.workflow_responses[
-                        path.rsplit("/", 1)[-1]
-                    ] = raw_response(404, b"{}")
+                    self.fake.page_responses[(101, 1)] = json_response(
+                        make_runs(0, [])
+                    )
                 code, stdout, stderr, summary = self.run_main_argv([])
                 self.assertEqual(code, 1)
                 self.assertEqual(
@@ -2283,7 +1966,7 @@ class ApprovedScopeCliTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     [entry["path"] for entry in summary["workflows"]],
-                    list(self.legacy),
+                    [self.ci_path],
                 )
 
     def test_partial_or_invalid_lock_rejected_before_api(self):
@@ -2328,77 +2011,10 @@ class ApprovedScopeCliTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     [entry["path"] for entry in summary["workflows"]],
-                    list(self.legacy),
+                    [self.ci_path],
                 )
                 self.assertEqual(self.factory_calls, 0)
                 self.assertEqual(self.fake.requests, [])
-
-    def test_build_summary_rejects_unapproved_scopes(self):
-        legacy_states = self.pristine.default_workflow_states()
-        invalid_scopes = (
-            (self.ci_path, "other.yml"),
-            (self.ci_path, self.ci_path),
-            (self.legacy[0],),
-            (self.legacy[1], self.legacy[0]),
-            (self.legacy[0], self.legacy[1], self.ci_path),
-            (self.legacy[0], self.legacy[1], self.legacy[0]),
-            [self.ci_path],
-            (),
-        )
-        for scope in invalid_scopes:
-            with self.subTest(scope=scope):
-                with self.assertRaises(
-                    self.pristine.PreflightError
-                ) as raised:
-                    self.pristine.build_summary(
-                        result="pass",
-                        failure=None,
-                        source_sha=SHA,
-                        workflows=legacy_states,
-                        scope=scope,
-                    )
-                self.assertEqual(
-                    (raised.exception.stage, raised.exception.kind),
-                    ("summary", "scope"),
-                )
-
-    def test_build_summary_uses_only_approved_scope(self):
-        legacy_summary = self.pristine.build_summary(
-            result="pass",
-            failure=None,
-            source_sha=SHA,
-            workflows=self.pristine.default_workflow_states(),
-        )
-        self.assertEqual(
-            [entry["path"] for entry in legacy_summary["workflows"]],
-            list(self.legacy),
-        )
-        ci_states = self.pristine.default_workflow_states(
-            self.pristine.CI_WORKFLOW_PATHS
-        )
-        ci_summary = self.pristine.build_summary(
-            result="pass",
-            failure=None,
-            source_sha=SHA,
-            workflows=ci_states,
-            scope=self.pristine.CI_WORKFLOW_PATHS,
-        )
-        self.assertEqual(
-            [entry["path"] for entry in ci_summary["workflows"]],
-            [self.ci_path],
-        )
-        filtered = self.pristine.build_summary(
-            result="pass",
-            failure=None,
-            source_sha=SHA,
-            workflows=ci_states,
-            scope=self.pristine.WORKFLOW_PATHS,
-        )
-        self.assertEqual(
-            [entry["path"] for entry in filtered["workflows"]],
-            list(self.legacy),
-        )
-        self.assertIsNone(filtered["workflows"][0]["latest_run"])
 
     def test_summary_exception_fallback_stays_ci(self):
         self.add_ci_success()
@@ -2433,6 +2049,24 @@ class ApprovedScopeCliTests(unittest.TestCase):
         text = json.dumps(summary)
         self.assertNotIn(TOKEN, text)
         self.assertNotIn("RAW_SECRET_BODY", text)
+
+    def test_summary_fallback_double_failure_is_safe(self):
+        self.add_ci_success()
+        with mock.patch.object(
+            self.pristine,
+            "build_summary",
+            side_effect=RuntimeError("RAW_SECRET_BODY " + TOKEN),
+        ):
+            code, stdout, stderr, summary = self.run_locked()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "ci-preflight: fail stage=summary kind=write\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertIsNone(summary)
+        self.assertNotIn(TOKEN, stdout)
+        self.assertNotIn("RAW_SECRET_BODY", stdout)
 
 
 if __name__ == "__main__":

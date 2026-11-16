@@ -346,7 +346,7 @@ def _select_artifact(
 
 
 def select_candidate(source_sha: str, api: Any) -> Selection:
-    states = CI.default_workflow_states(CI.CI_WORKFLOW_PATHS)
+    states = CI.default_workflow_states()
     config = CI.Config(
         source_sha=source_sha,
         summary_path=Path("/unused-release-selection"),
@@ -382,7 +382,7 @@ def select_candidate(source_sha: str, api: Any) -> Selection:
     # real preflight with the selected run lock so a newer run or rerun that
     # appeared in that window fails instead of silently switching candidates.
     # This narrows the window; it does not claim atomicity with publishing.
-    recheck_states = CI.default_workflow_states(CI.CI_WORKFLOW_PATHS)
+    recheck_states = CI.default_workflow_states()
     recheck_config = CI.Config(
         source_sha=source_sha,
         summary_path=Path("/unused-release-recheck"),

@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """Fail-closed read-only GitHub Actions preflight for main release gates.
 
-The release workflow invokes this checker before publishing.  By default it
-checks the latest push run for the supplied SHA in the legacy
-``setup-check.yml`` and ``check.yml`` pair.  The release candidate selector
-explicitly opts in to ``CI_WORKFLOW_PATHS`` (``ci.yml``) so selection never
-falls back to an older legacy success.  The upload job repeats the check with
-the selected run lock before any registry write.  The checker verifies that
-the workflow_dispatch context is the trusted main branch of
-``xtianxx/payment-hub``, that ``GITHUB_SHA`` equals ``--source-sha``, and that
-the latest push run for that SHA in every checked workflow is ``completed``
-with conclusion ``success``.  A newer failed, queued, cancelled, or running
-run is never hidden by an older success.
+The release workflow invokes this checker before publishing.  The release
+candidate selector reuses the same preflight to choose the CI run, and the
+upload job repeats the check with the selected run lock before any registry
+write.  It verifies that the workflow_dispatch context is the trusted main
+branch of ``xtianxx/payment-hub``, that ``GITHUB_SHA`` equals ``--source-sha``,
+and that the latest push run for that SHA in ``.github/workflows/ci.yml`` is
+``completed`` with conclusion ``success``.  A newer failed, queued, cancelled,
+or running run is never hidden by an older success.
 
 ``--expected-run-id`` and ``--expected-run-attempt`` may be supplied together
 to lock the exact CI run that supplied a release candidate.  If the latest run
@@ -50,11 +47,7 @@ REF = "refs/heads/main"
 TRIGGER_EVENT = "workflow_dispatch"
 PUSH_EVENT = "push"
 CANDIDATE_WORKFLOW_PATH = ".github/workflows/ci.yml"
-WORKFLOW_PATHS = (
-    ".github/workflows/setup-check.yml",
-    ".github/workflows/check.yml",
-)
-CI_WORKFLOW_PATHS = (CANDIDATE_WORKFLOW_PATH,)
+WORKFLOW_PATHS = (CANDIDATE_WORKFLOW_PATH,)
 
 API_HOST = "api.github.com"
 API_BASE = f"https://{API_HOST}"
@@ -156,7 +149,7 @@ FAILURE_ENUM = {
         "body-too-large",
         "http-error",
     },
-    "summary": {"exists", "write", "scope"},
+    "summary": {"exists", "write"},
     "internal": {"unexpected"},
 }
 
@@ -913,29 +906,8 @@ class WorkflowState:
         }
 
 
-def default_workflow_states(
-    paths: Sequence[str] | None = None,
-) -> list[WorkflowState]:
-    resolved = WORKFLOW_PATHS if paths is None else paths
-    return [WorkflowState(path=path) for path in resolved]
-
-
-def _approved_summary_scope(
-    scope: Sequence[str] | None,
-) -> tuple[str, ...]:
-    """Return one fixed approved summary scope or fail closed.
-
-    Only the legacy pair and the single candidate CI workflow are approved.
-    Arbitrary paths, reordered paths, duplicates, mixed scopes, and non-tuple
-    inputs are rejected; no union or user-selected scope is accepted.
-    """
-    if scope is None:
-        scope = WORKFLOW_PATHS
-    if not isinstance(scope, tuple):
-        raise PreflightError("summary", "scope")
-    if scope != WORKFLOW_PATHS and scope != CI_WORKFLOW_PATHS:
-        raise PreflightError("summary", "scope")
-    return scope
+def default_workflow_states() -> list[WorkflowState]:
+    return [WorkflowState(path=path) for path in WORKFLOW_PATHS]
 
 
 def build_summary(
@@ -944,9 +916,7 @@ def build_summary(
     failure: tuple[str, str] | None,
     source_sha: Any,
     workflows: Sequence[WorkflowState],
-    scope: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    scope_paths = _approved_summary_scope(scope)
     safe_result = "pass" if result == "pass" else "fail"
     if safe_result == "pass" and failure is not None:
         safe_result = "fail"
@@ -968,11 +938,11 @@ def build_summary(
     by_path = {
         state.path: state
         for state in workflows
-        if isinstance(state, WorkflowState) and state.path in scope_paths
+        if isinstance(state, WorkflowState) and state.path in WORKFLOW_PATHS
     }
     entries = [
         by_path.get(path, WorkflowState(path=path)).to_summary()
-        for path in scope_paths
+        for path in WORKFLOW_PATHS
     ]
     return {
         "schema": SUMMARY_SCHEMA,
@@ -1131,8 +1101,7 @@ def run_gate(
             or config.expected_run_attempt is not None
         ):
             # A run lock identifies exactly one candidate CI run.  The lock
-            # path is fixed independently of WORKFLOW_PATHS so transitional
-            # legacy defaults cannot widen or misdirect it.  Applying the
+            # path is fixed independently of WORKFLOW_PATHS.  Applying the
             # same lock to multiple workflows is rejected before any API
             # request; no user-selectable workflow path is exposed.
             if (
@@ -1242,7 +1211,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         allow_abbrev=False,
         description=(
             "Fail-closed read-only check that the latest main push run for "
-            "the supplied source SHA succeeded in the approved workflows."
+            "the supplied source SHA succeeded in the approved CI workflow."
         ),
     )
     parser.add_argument("--source-sha", required=True)
@@ -1275,22 +1244,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         else None
     )
     workflows = default_workflow_states()
-    scope: tuple[str, ...] = WORKFLOW_PATHS
     failure: tuple[str, str] | None = None
     try:
         expected_run_id, expected_run_attempt = parse_expected_run_lock(
             getattr(args, "expected_run_id", None),
             getattr(args, "expected_run_attempt", None),
         )
-        if (
-            expected_run_id is not None
-            and expected_run_attempt is not None
-        ):
-            # A complete, valid lock selects the fixed single candidate CI
-            # workflow.  Partial or invalid locks fail in parse above before
-            # this scope switch and before any API call.
-            scope = CI_WORKFLOW_PATHS
-            workflows = default_workflow_states(scope)
         config = Config(
             source_sha=validate_source_sha(raw_source),
             summary_path=summary_path,
@@ -1311,7 +1270,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             failure=failure,
             source_sha=safe_source,
             workflows=workflows,
-            scope=scope,
         )
     except Exception:
         result = "fail"
@@ -1321,8 +1279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result="fail",
                 failure=failure,
                 source_sha=None,
-                workflows=default_workflow_states(scope),
-                scope=scope,
+                workflows=default_workflow_states(),
             )
         except Exception:
             _print_failure("summary", "write")

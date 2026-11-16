@@ -376,51 +376,6 @@ class SelectSuccessTests(SelectorTestCase):
         self.assertEqual(MOD.WORKFLOW_PATH, CI.CANDIDATE_WORKFLOW_PATH)
         self.assertEqual(MOD.WORKFLOW_PATH, ".github/workflows/ci.yml")
 
-    def test_select_uses_only_ci_workflow_path(self):
-        self.add_ci_success()
-        self.add_default_artifacts()
-        code, stdout, stderr = self.run_select()
-        self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout, "release-selection: select pass\n")
-        self.assertTrue(
-            any(
-                url.endswith("/actions/workflows/ci.yml")
-                for url in self.fake.requests
-            )
-        )
-        self.assertFalse(
-            any("setup-check.yml" in url for url in self.fake.requests)
-        )
-        self.assertFalse(
-            any(
-                url.endswith("/actions/workflows/check.yml")
-                for url in self.fake.requests
-            )
-        )
-        self.assertEqual(len(self.fake.requests), 7)
-
-    def test_selector_default_states_remain_legacy_pair(self):
-        self.assertEqual(
-            tuple(state.path for state in CI.default_workflow_states()),
-            (
-                ".github/workflows/setup-check.yml",
-                ".github/workflows/check.yml",
-            ),
-        )
-        self.assertEqual(
-            CI.CI_WORKFLOW_PATHS,
-            (CI.CANDIDATE_WORKFLOW_PATH,),
-        )
-        self.assertEqual(
-            tuple(
-                state.path
-                for state in CI.default_workflow_states(
-                    CI.CI_WORKFLOW_PATHS
-                )
-            ),
-            (CI.CANDIDATE_WORKFLOW_PATH,),
-        )
-
     def test_select_writes_fixed_provenance_and_outputs(self):
         self.add_ci_success()
         self.add_default_artifacts()
@@ -615,20 +570,6 @@ class SelectSuccessTests(SelectorTestCase):
 
 
 class SelectFailureTests(SelectorTestCase):
-    def test_select_does_not_fall_back_to_legacy_success(self):
-        self.fake.workflow_responses["ci.yml"] = raw_response(404, b"{}")
-        self.fake.workflow_responses["setup-check.yml"] = json_response(
-            make_workflow(".github/workflows/setup-check.yml", 101)
-        )
-        self.fake.workflow_responses["check.yml"] = json_response(
-            make_workflow(".github/workflows/check.yml", 202)
-        )
-        self.add_default_artifacts()
-        self.assert_select_failure("workflow", "not-found")
-        self.assertFalse(
-            any("setup-check.yml" in url for url in self.fake.requests)
-        )
-
     def test_new_run_after_artifacts_is_rejected(self):
         self.add_ci_success()
         self.add_default_artifacts()
