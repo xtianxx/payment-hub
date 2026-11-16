@@ -30,13 +30,9 @@ MOD = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MOD
 SPEC.loader.exec_module(MOD)
 
-# PR2 transition shim: final B tests exercise the single ci.yml path.  PR3
-# removes this line together with the legacy default pair.
-MOD.WORKFLOW_PATHS = MOD.CI_WORKFLOW_PATHS
-
 
 def load_pristine_check_main_ci():
-    """Load production check-main-ci.py without the transitional shim."""
+    """Load production check-main-ci.py in an isolated module namespace."""
     name = "check_main_ci_pristine"
     spec = importlib.util.spec_from_file_location(
         name,
@@ -215,6 +211,15 @@ class GateTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        # Scoped test configuration only: final B fixtures exercise the
+        # explicit single candidate ci.yml gate.  This does not assert the
+        # production default; pristine tests below load the unpatched module
+        # to prove the real legacy default and explicit ci selection.
+        self._candidate_workflow_patch = mock.patch.object(
+            MOD, "WORKFLOW_PATHS", MOD.CI_WORKFLOW_PATHS
+        )
+        self._candidate_workflow_patch.start()
+        self.addCleanup(self._candidate_workflow_patch.stop)
         self.root = Path(self.temporary.name)
         self.summary_path = self.root / "gate" / "ci-preflight.json"
         self.fake = FakeGitHub()
@@ -914,9 +919,41 @@ class GateTests(GateTestCase):
         self.fake.page_responses[(101, 1)] = json_response(make_runs(1, [run]))
         self.assertEqual(self.gate(), ("runs", "identity"))
 
-    def test_workflow_paths_has_only_ci_workflow(self):
+    def test_pristine_production_workflow_defaults(self):
+        pristine = load_pristine_check_main_ci()
+        legacy = (
+            ".github/workflows/setup-check.yml",
+            ".github/workflows/check.yml",
+        )
         self.assertEqual(
-            MOD.WORKFLOW_PATHS, (".github/workflows/ci.yml",)
+            pristine.CANDIDATE_WORKFLOW_PATH,
+            ".github/workflows/ci.yml",
+        )
+        self.assertEqual(pristine.WORKFLOW_PATHS, legacy)
+        self.assertEqual(
+            pristine.CI_WORKFLOW_PATHS,
+            (pristine.CANDIDATE_WORKFLOW_PATH,),
+        )
+        default_states = pristine.default_workflow_states()
+        self.assertEqual(
+            tuple(state.path for state in default_states), legacy
+        )
+        explicit_states = pristine.default_workflow_states(
+            pristine.CI_WORKFLOW_PATHS
+        )
+        self.assertEqual(
+            tuple(state.path for state in explicit_states),
+            (pristine.CANDIDATE_WORKFLOW_PATH,),
+        )
+        summary = pristine.build_summary(
+            result="pass",
+            failure=None,
+            source_sha=SHA,
+            workflows=default_states,
+        )
+        self.assertEqual(
+            [entry["path"] for entry in summary["workflows"]],
+            list(legacy),
         )
 
     def test_older_success_does_not_mask_latest_failure(self):
@@ -1657,8 +1694,133 @@ class EnvironmentAndMainTests(GateTestCase):
         )
 
 
+class LockWorkflowPreconditionTests(unittest.TestCase):
+    """A run lock is valid only for the fixed candidate CI workflow."""
+
+    LEGACY = (
+        ".github/workflows/setup-check.yml",
+        ".github/workflows/check.yml",
+    )
+
+    def make_api(self, fake):
+        return MOD.GitHubApi(TOKEN, transport=fake.transport)
+
+    def add_success(self, fake, path, workflow_id, run_id):
+        fake.workflow_responses[path.rsplit("/", 1)[-1]] = json_response(
+            make_workflow(path, workflow_id)
+        )
+        run = make_run(run_id, workflow_id, path)
+        fake.page_responses[(workflow_id, 1)] = json_response(
+            make_runs(1, [run])
+        )
+        fake.attempt_responses[(run_id, 1)] = json_response(run)
+
+    def add_legacy_success(self, fake, path, workflow_id, run_id):
+        self.add_success(fake, path, workflow_id, run_id)
+
+    def locked_config(self):
+        return MOD.Config(
+            source_sha=SHA,
+            summary_path=Path("/unused-lock-workflow"),
+            expected_run_id=1001,
+            expected_run_attempt=1,
+        )
+
+    def test_lock_single_candidate_succeeds_when_defaults_are_legacy(self):
+        self.assertEqual(MOD.WORKFLOW_PATHS, self.LEGACY)
+        fake = FakeGitHub()
+        self.add_success(fake, MOD.CANDIDATE_WORKFLOW_PATH, 101, 1001)
+        states = [MOD.WorkflowState(path=MOD.CANDIDATE_WORKFLOW_PATH)]
+        self.assertIsNone(
+            MOD.run_gate(
+                self.locked_config(), self.make_api(fake), states
+            )
+        )
+        self.assertTrue(any("ci.yml" in url for url in fake.requests))
+
+    def test_lock_rejects_single_legacy_when_defaults_are_legacy(self):
+        fake = FakeGitHub()
+        states = [MOD.WorkflowState(path=self.LEGACY[0])]
+        self.assertEqual(
+            MOD.run_gate(
+                self.locked_config(), self.make_api(fake), states
+            ),
+            ("cli", "lock-workflow"),
+        )
+        self.assertEqual(fake.requests, [])
+
+    def test_lock_rejects_legacy_pair_when_defaults_are_legacy(self):
+        fake = FakeGitHub()
+        states = [
+            MOD.WorkflowState(path=self.LEGACY[0]),
+            MOD.WorkflowState(path=self.LEGACY[1]),
+        ]
+        self.assertEqual(
+            MOD.run_gate(
+                self.locked_config(), self.make_api(fake), states
+            ),
+            ("cli", "lock-workflow"),
+        )
+        self.assertEqual(fake.requests, [])
+
+    def test_lock_rejects_two_legacy_states_before_api(self):
+        fake = FakeGitHub()
+        states = [
+            MOD.WorkflowState(path=self.LEGACY[0]),
+            MOD.WorkflowState(path=self.LEGACY[1]),
+        ]
+        self.assertEqual(
+            MOD.run_gate(self.locked_config(), self.make_api(fake), states),
+            ("cli", "lock-workflow"),
+        )
+        self.assertEqual(fake.requests, [])
+
+    def test_lock_rejects_single_non_candidate_workflow_before_api(self):
+        fake = FakeGitHub()
+        states = [MOD.WorkflowState(path=self.LEGACY[0])]
+        self.assertEqual(
+            MOD.run_gate(self.locked_config(), self.make_api(fake), states),
+            ("cli", "lock-workflow"),
+        )
+        self.assertEqual(fake.requests, [])
+
+    def test_default_no_lock_legacy_pair_still_runs(self):
+        fake = FakeGitHub()
+        self.add_legacy_success(fake, self.LEGACY[0], 101, 1001)
+        self.add_legacy_success(fake, self.LEGACY[1], 202, 2002)
+        states = [
+            MOD.WorkflowState(path=self.LEGACY[0]),
+            MOD.WorkflowState(path=self.LEGACY[1]),
+        ]
+        config = MOD.Config(
+            source_sha=SHA,
+            summary_path=Path("/unused-legacy-gate"),
+        )
+        self.assertIsNone(
+            MOD.run_gate(config, self.make_api(fake), states)
+        )
+        self.assertTrue(
+            any("setup-check.yml" in url for url in fake.requests)
+        )
+        self.assertTrue(
+            any("/actions/workflows/202/runs" in url for url in fake.requests)
+        )
+
+    def test_lock_workflow_failure_is_whitelisted(self):
+        summary = MOD.build_summary(
+            result="fail",
+            failure=("cli", "lock-workflow"),
+            source_sha=SHA,
+            workflows=MOD.default_workflow_states(),
+        )
+        self.assertEqual(
+            summary["failure"],
+            {"stage": "cli", "kind": "lock-workflow"},
+        )
+
+
 class TransitionalLegacyDefaultTests(unittest.TestCase):
-    """PR2-only proof that the production default still gates the legacy pair."""
+    """PR19 proof that the real production default still gates legacy pair."""
 
     def setUp(self):
         self.pristine = load_pristine_check_main_ci()
@@ -1761,6 +1923,63 @@ class TransitionalLegacyDefaultTests(unittest.TestCase):
         self.assertEqual(
             summary["workflows"][1]["latest_run"]["conclusion"], "failure"
         )
+
+    def test_pristine_cli_default_rejects_each_legacy_failure(self):
+        cases = ((0, 101, 1001), (1, 202, 2002))
+        for index, workflow_id, run_id in cases:
+            with self.subTest(path=self.legacy[index]):
+                fake = FakeGitHub()
+                self.add_legacy_success(fake, self.legacy[0], 101, 1001)
+                self.add_legacy_success(fake, self.legacy[1], 202, 2002)
+                failing = make_run(
+                    run_id,
+                    workflow_id,
+                    self.legacy[index],
+                    conclusion="failure",
+                )
+                fake.page_responses[(workflow_id, 1)] = json_response(
+                    make_runs(1, [failing])
+                )
+                fake.attempt_responses[(run_id, 1)] = json_response(failing)
+                code, stdout, stderr, summary = self.run_pristine_main(fake)
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    stdout,
+                    "ci-preflight: fail stage=runs kind=not-success\n",
+                )
+                self.assertEqual(stderr, "")
+                self.assertEqual(
+                    summary["failure"],
+                    {"stage": "runs", "kind": "not-success"},
+                )
+                self.assertEqual(
+                    [entry["path"] for entry in summary["workflows"]],
+                    list(self.legacy),
+                )
+
+    def test_pristine_cli_default_rejects_missing_legacy_workflow(self):
+        cases = ((0, "setup-check.yml"), (1, "check.yml"))
+        for index, filename in cases:
+            with self.subTest(path=self.legacy[index]):
+                fake = FakeGitHub()
+                self.add_legacy_success(fake, self.legacy[0], 101, 1001)
+                self.add_legacy_success(fake, self.legacy[1], 202, 2002)
+                fake.workflow_responses[filename] = raw_response(404, b"{}")
+                code, stdout, stderr, summary = self.run_pristine_main(fake)
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    stdout,
+                    "ci-preflight: fail stage=workflow kind=not-found\n",
+                )
+                self.assertEqual(stderr, "")
+                self.assertEqual(
+                    summary["failure"],
+                    {"stage": "workflow", "kind": "not-found"},
+                )
+                self.assertEqual(
+                    [entry["path"] for entry in summary["workflows"]],
+                    list(self.legacy),
+                )
 
     def test_pristine_default_states_are_legacy_pair(self):
         states = self.pristine.default_workflow_states()

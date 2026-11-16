@@ -468,8 +468,7 @@ def _read_bounded_bytes(path: Path, stage: str, kind: str, maximum: int) -> byte
         raise ReleaseError(stage, kind) from exc
 
 
-def _read_json(path: Path, stage: str, kind: str, maximum: int) -> dict[str, Any]:
-    data = _read_bounded_bytes(path, stage, kind, maximum)
+def _parse_json_object(data: bytes, stage: str, kind: str) -> dict[str, Any]:
     try:
         value = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -477,6 +476,12 @@ def _read_json(path: Path, stage: str, kind: str, maximum: int) -> dict[str, Any
     if not isinstance(value, dict):
         raise ReleaseError(stage, kind)
     return value
+
+
+def _read_json(path: Path, stage: str, kind: str, maximum: int) -> dict[str, Any]:
+    return _parse_json_object(
+        _read_bounded_bytes(path, stage, kind, maximum), stage, kind
+    )
 
 
 def _write_bytes_exclusive(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -1779,30 +1784,25 @@ class Release:
         self, build_root: Path, trusted: TrustedContext
     ) -> tuple[dict[str, Any], Path, Path, str, str]:
         record_path = build_root / BUILD_RECORD_FILE
-        record = _read_json(
+        record_bytes = _read_bounded_bytes(
             record_path, "builder", "build-record", BUILD_RECORD_MAX_BYTES
         )
+        record = _parse_json_object(record_bytes, "builder", "build-record")
         reports = sorted((build_root / "validation").glob("*/images.json"))
         if len(reports) != 1:
             raise ReleaseError("builder", "accepted-report")
         accepted_path = reports[0]
-        accepted = _read_json(
-            accepted_path,
-            "builder",
-            "accepted-report",
-            ACCEPTED_REPORT_MAX_BYTES,
-        )
-        self._validate_build_record(record, trusted)
-        self._validate_accepted_report(accepted, record)
-        record_bytes = _read_bounded_bytes(
-            record_path, "builder", "build-record", BUILD_RECORD_MAX_BYTES
-        )
         accepted_bytes = _read_bounded_bytes(
             accepted_path,
             "builder",
             "accepted-report",
             ACCEPTED_REPORT_MAX_BYTES,
         )
+        accepted = _parse_json_object(
+            accepted_bytes, "builder", "accepted-report"
+        )
+        self._validate_build_record(record, trusted)
+        self._validate_accepted_report(accepted, record)
         return (
             record,
             record_path,
@@ -2258,6 +2258,21 @@ class Release:
             accepted_sha,
         ) = self._read_builder_outputs(build_root, trusted)
         inspected = self._verify_local_images(record)
+        # Read the validated bytes once and write exactly these bytes later so
+        # the descriptor hashes always match the bundled record/report.
+        record_bytes = _read_bounded_bytes(
+            record_path, "builder", "build-record", BUILD_RECORD_MAX_BYTES
+        )
+        accepted_bytes = _read_bounded_bytes(
+            accepted_path,
+            "builder",
+            "accepted-report",
+            ACCEPTED_REPORT_MAX_BYTES,
+        )
+        if _sha256_bytes(record_bytes) != record_sha:
+            raise ReleaseError("builder", "record-changed")
+        if _sha256_bytes(accepted_bytes) != accepted_sha:
+            raise ReleaseError("builder", "accepted-changed")
 
         bundle = root / DEFAULT_BUNDLE
         _mkdir_private(bundle)
@@ -2292,15 +2307,6 @@ class Release:
             ):
                 raise ReleaseError("tar", "actual-root")
 
-        record_bytes = _read_bounded_bytes(
-            record_path, "builder", "build-record", BUILD_RECORD_MAX_BYTES
-        )
-        accepted_bytes = _read_bounded_bytes(
-            accepted_path,
-            "builder",
-            "accepted-report",
-            ACCEPTED_REPORT_MAX_BYTES,
-        )
         _write_bytes_exclusive(bundle / BUILD_RECORD_FILE, record_bytes)
         _write_bytes_exclusive(bundle / ACCEPTED_BUNDLE_FILE, accepted_bytes)
         archive_sha, archive_size = _stream_sha256(

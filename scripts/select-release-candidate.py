@@ -51,7 +51,7 @@ def _load_check_main_ci() -> Any:
 CI = _load_check_main_ci()
 
 REPOSITORY = CI.REPOSITORY
-WORKFLOW_PATH = CI.CI_WORKFLOW_PATHS[0]
+WORKFLOW_PATH = CI.CANDIDATE_WORKFLOW_PATH
 PLATFORM = "linux/amd64"
 POINTER_PREFIX = "ci-release-pointer-"
 BUNDLE_PREFIX = "ci-release-bundle-"
@@ -377,6 +377,28 @@ def select_candidate(source_sha: str, api: Any) -> Selection:
         trusted_repository_id=state.latest_run_repository_id,
         max_bytes=MAX_BUNDLE_ARTIFACT_BYTES,
     )
+
+    # Artifact listing and validation take additional API calls.  Re-run the
+    # real preflight with the selected run lock so a newer run or rerun that
+    # appeared in that window fails instead of silently switching candidates.
+    # This narrows the window; it does not claim atomicity with publishing.
+    recheck_states = CI.default_workflow_states(CI.CI_WORKFLOW_PATHS)
+    recheck_config = CI.Config(
+        source_sha=source_sha,
+        summary_path=Path("/unused-release-recheck"),
+        expected_run_id=run_id,
+        expected_run_attempt=run_attempt,
+    )
+    failure = CI.run_gate(recheck_config, api, recheck_states)
+    if failure is not None:
+        raise CI.PreflightError(failure[0], failure[1])
+    if (
+        len(recheck_states) != 1
+        or recheck_states[0].latest_run_id != run_id
+        or recheck_states[0].latest_run_attempt != run_attempt
+    ):
+        raise CI.PreflightError("run", "expected-mismatch")
+
     return Selection(
         source_sha=source_sha,
         ci_run_id=run_id,
@@ -722,19 +744,30 @@ def _valid_output_value(key: str, value: Any) -> bool:
     return False
 
 
+def _rollback_github_output(descriptor: int, initial_size: int | None) -> None:
+    """Best-effort removal of partially appended output lines."""
+    if initial_size is None:
+        return
+    try:
+        os.ftruncate(descriptor, initial_size)
+        os.fsync(descriptor)
+    except OSError:
+        pass
+
+
 def write_github_output(
     path: Path,
     pairs: Sequence[tuple[str, str]],
     allowed_keys: frozenset[str],
 ) -> None:
-    """Append fixed key/value lines without permitting newline injection."""
+    """Append fixed key/value lines, separating only when needed."""
     for key, value in pairs:
         if key not in allowed_keys or not _valid_output_value(key, value):
             raise CI.PreflightError("output", "value")
     try:
         descriptor = os.open(
             path,
-            os.O_WRONLY
+            os.O_RDWR
             | os.O_APPEND
             | os.O_CREAT
             | getattr(os, "O_NOFOLLOW", 0)
@@ -743,28 +776,39 @@ def write_github_output(
         )
     except OSError:
         raise CI.PreflightError("output", "write") from None
+    initial_size: int | None = None
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise CI.PreflightError("output", "path")
+        initial_size = info.st_size
+        if initial_size > 0:
+            last = os.pread(descriptor, 1, initial_size - 1)
+            if last != b"\n":
+                _write_all(descriptor, b"\n")
         for key, value in pairs:
-            line = f"{key}={value}\n".encode("ascii")
-            offset = 0
-            while offset < len(line):
-                written = os.write(descriptor, line[offset:])
-                if written <= 0:
-                    raise CI.PreflightError("output", "write")
-                offset += written
+            _write_all(descriptor, f"{key}={value}\n".encode("ascii"))
         os.fsync(descriptor)
     except CI.PreflightError:
+        _rollback_github_output(descriptor, initial_size)
         raise
     except OSError:
+        _rollback_github_output(descriptor, initial_size)
         raise CI.PreflightError("output", "write") from None
     finally:
         try:
             os.close(descriptor)
         except OSError:
             pass
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise CI.PreflightError("output", "write")
+        offset += written
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -825,22 +869,6 @@ def _main_select(args: argparse.Namespace) -> int:
     except Exception:
         failure = ("internal", "unexpected")
 
-    if failure is None and selection is not None and output_path is not None:
-        try:
-            write_github_output(
-                output_path,
-                [
-                    ("ci_run_id", str(selection.ci_run_id)),
-                    ("ci_run_attempt", str(selection.ci_run_attempt)),
-                    ("pointer_artifact_id", str(selection.pointer_artifact_id)),
-                ],
-                SELECT_OUTPUT_KEYS,
-            )
-        except CI.PreflightError as exc:
-            failure = (exc.stage, exc.kind)
-        except Exception:
-            failure = ("internal", "unexpected")
-
     try:
         summary = build_selection_summary(
             result="pass" if failure is None else "fail",
@@ -848,6 +876,8 @@ def _main_select(args: argparse.Namespace) -> int:
             source_sha=safe_source,
             selection=selection,
         )
+        # Persist provenance before exposing candidate outputs.  The summary
+        # and GITHUB_OUTPUT are separate files and are not written atomically.
         CI.write_summary(summary_path, summary)
     except CI.PreflightError as exc:
         _print_failure(exc.stage, exc.kind)
@@ -858,6 +888,26 @@ def _main_select(args: argparse.Namespace) -> int:
 
     if failure is not None:
         _print_failure(failure[0], failure[1])
+        return 1
+
+    if selection is None or output_path is None:
+        _print_failure("internal", "unexpected")
+        return 1
+    try:
+        write_github_output(
+            output_path,
+            [
+                ("ci_run_id", str(selection.ci_run_id)),
+                ("ci_run_attempt", str(selection.ci_run_attempt)),
+                ("pointer_artifact_id", str(selection.pointer_artifact_id)),
+            ],
+            SELECT_OUTPUT_KEYS,
+        )
+    except CI.PreflightError as exc:
+        _print_failure(exc.stage, exc.kind)
+        return 1
+    except Exception:
+        _print_failure("output", "write")
         return 1
     print(f"{STDOUT_PREFIX} select pass")
     return 0

@@ -49,15 +49,12 @@ BRANCH = "main"
 REF = "refs/heads/main"
 TRIGGER_EVENT = "workflow_dispatch"
 PUSH_EVENT = "push"
+CANDIDATE_WORKFLOW_PATH = ".github/workflows/ci.yml"
 WORKFLOW_PATHS = (
     ".github/workflows/setup-check.yml",
     ".github/workflows/check.yml",
 )
-# The release candidate selector opts in to the consolidated CI workflow
-# explicitly.  PR2 keeps the legacy default pair for the existing publish
-# gate; the final migration removes WORKFLOW_PATHS and makes this the only
-# path.
-CI_WORKFLOW_PATHS = (".github/workflows/ci.yml",)
+CI_WORKFLOW_PATHS = (CANDIDATE_WORKFLOW_PATH,)
 
 API_HOST = "api.github.com"
 API_BASE = f"https://{API_HOST}"
@@ -115,6 +112,7 @@ FAILURE_ENUM = {
         "summary-exists",
         "summary-not-fresh",
         "expected-run",
+        "lock-workflow",
     },
     "env": {"event", "ref", "repository", "sha", "sha-mismatch", "token"},
     "workflow": {"not-found", "disabled", "schema", "path"},
@@ -1108,6 +1106,20 @@ def run_gate(
     workflows: Sequence[WorkflowState],
 ) -> tuple[str, str] | None:
     try:
+        if (
+            config.expected_run_id is not None
+            or config.expected_run_attempt is not None
+        ):
+            # A run lock identifies exactly one candidate CI run.  The lock
+            # path is fixed independently of WORKFLOW_PATHS so transitional
+            # legacy defaults cannot widen or misdirect it.  Applying the
+            # same lock to multiple workflows is rejected before any API
+            # request; no user-selectable workflow path is exposed.
+            if (
+                len(workflows) != 1
+                or workflows[0].path != CANDIDATE_WORKFLOW_PATH
+            ):
+                raise PreflightError("cli", "lock-workflow")
         for state in workflows:
             state.workflow_id = None
             state.latest_run_id = None

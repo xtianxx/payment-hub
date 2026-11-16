@@ -167,6 +167,7 @@ class FakeGitHub:
         self.attempt_responses = {}
         self.artifact_responses = {}
         self.requests = []
+        self.after_artifacts = None
         self.transport = _FakeTransport(self)
 
 
@@ -207,7 +208,12 @@ class _FakeTransport:
         if match:
             run_id = int(match.group(1))
             page = int(urllib.parse.parse_qs(parsed.query)["page"][0])
-            return self.owner.artifact_responses[(run_id, page)]
+            response = self.owner.artifact_responses[(run_id, page)]
+            callback = self.owner.after_artifacts
+            if callback is not None:
+                self.owner.after_artifacts = None
+                callback(self.owner)
+            return response
         raise AssertionError(f"unexpected API request: {url}")
 
 
@@ -366,6 +372,55 @@ class SelectorTestCase(unittest.TestCase):
 
 
 class SelectSuccessTests(SelectorTestCase):
+    def test_selector_workflow_path_is_fixed_candidate(self):
+        self.assertEqual(MOD.WORKFLOW_PATH, CI.CANDIDATE_WORKFLOW_PATH)
+        self.assertEqual(MOD.WORKFLOW_PATH, ".github/workflows/ci.yml")
+
+    def test_select_uses_only_ci_workflow_path(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+        code, stdout, stderr = self.run_select()
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "release-selection: select pass\n")
+        self.assertTrue(
+            any(
+                url.endswith("/actions/workflows/ci.yml")
+                for url in self.fake.requests
+            )
+        )
+        self.assertFalse(
+            any("setup-check.yml" in url for url in self.fake.requests)
+        )
+        self.assertFalse(
+            any(
+                url.endswith("/actions/workflows/check.yml")
+                for url in self.fake.requests
+            )
+        )
+        self.assertEqual(len(self.fake.requests), 7)
+
+    def test_selector_default_states_remain_legacy_pair(self):
+        self.assertEqual(
+            tuple(state.path for state in CI.default_workflow_states()),
+            (
+                ".github/workflows/setup-check.yml",
+                ".github/workflows/check.yml",
+            ),
+        )
+        self.assertEqual(
+            CI.CI_WORKFLOW_PATHS,
+            (CI.CANDIDATE_WORKFLOW_PATH,),
+        )
+        self.assertEqual(
+            tuple(
+                state.path
+                for state in CI.default_workflow_states(
+                    CI.CI_WORKFLOW_PATHS
+                )
+            ),
+            (CI.CANDIDATE_WORKFLOW_PATH,),
+        )
+
     def test_select_writes_fixed_provenance_and_outputs(self):
         self.add_ci_success()
         self.add_default_artifacts()
@@ -414,47 +469,73 @@ class SelectSuccessTests(SelectorTestCase):
         )
         self.assertTrue(all(url.startswith("https://api.github.com/") for url in self.fake.requests))
 
-    def test_select_uses_only_ci_workflow_path(self):
-        self.assertEqual(MOD.WORKFLOW_PATH, CI.CI_WORKFLOW_PATHS[0])
-        self.assertEqual(MOD.WORKFLOW_PATH, ".github/workflows/ci.yml")
+    def test_select_output_appends_after_existing_lf(self):
         self.add_ci_success()
         self.add_default_artifacts()
-        self.assertEqual(self.run_select()[0], 0)
-        self.assertTrue(
-            any(
-                url.endswith("/actions/workflows/ci.yml")
-                for url in self.fake.requests
-            )
-        )
-        self.assertFalse(
-            any("setup-check.yml" in url for url in self.fake.requests)
-        )
-        self.assertFalse(
-            any(
-                url.endswith("/actions/workflows/check.yml")
-                for url in self.fake.requests
-            )
+        self.output_path.write_text("existing=1\n", encoding="utf-8")
+        code, stdout, stderr = self.run_select()
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "release-selection: select pass\n")
+        self.assertEqual(
+            self.output_path.read_text(encoding="utf-8"),
+            "existing=1\n"
+            "ci_run_id=1001\n"
+            "ci_run_attempt=1\n"
+            "pointer_artifact_id=11\n",
         )
 
-    def test_selector_default_states_remain_legacy_pair(self):
-        # PR2 transition proof: the selector opts into ci.yml explicitly and
-        # never relies on the production default legacy pair.
+    def test_select_output_adds_separator_lf_for_existing_no_lf(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+        self.output_path.write_text("existing=1", encoding="utf-8")
+        code, stdout, stderr = self.run_select()
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "release-selection: select pass\n")
+        text = self.output_path.read_text(encoding="utf-8")
         self.assertEqual(
-            tuple(state.path for state in CI.default_workflow_states()),
-            (
-                ".github/workflows/setup-check.yml",
-                ".github/workflows/check.yml",
-            ),
+            text,
+            "existing=1\n"
+            "ci_run_id=1001\n"
+            "ci_run_attempt=1\n"
+            "pointer_artifact_id=11\n",
         )
+        self.assertNotIn("existing=1ci_run_id", text)
+
+    def test_select_output_empty_file_has_no_leading_blank_line(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+        self.output_path.write_text("", encoding="utf-8")
+        code, stdout, stderr = self.run_select()
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "release-selection: select pass\n")
+        text = self.output_path.read_text(encoding="utf-8")
         self.assertEqual(
-            CI.WORKFLOW_PATHS,
-            (
-                ".github/workflows/setup-check.yml",
-                ".github/workflows/check.yml",
-            ),
+            text,
+            "ci_run_id=1001\n"
+            "ci_run_attempt=1\n"
+            "pointer_artifact_id=11\n",
         )
-        self.assertEqual(
-            CI.CI_WORKFLOW_PATHS, (".github/workflows/ci.yml",)
+        self.assertFalse(text.startswith("\n"))
+
+    def test_select_rechecks_same_run_after_artifacts(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+        self.fake.after_artifacts = lambda fake: None
+        code, stdout, stderr = self.run_select()
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "release-selection: select pass\n")
+        run_list_urls = [
+            url
+            for url in self.fake.requests
+            if "/actions/workflows/101/runs" in url
+        ]
+        self.assertEqual(len(run_list_urls), 2)
+        self.assertEqual(len(self.fake.requests), 7)
+        self.assertTrue(
+            all(
+                url.startswith("https://api.github.com/")
+                for url in self.fake.requests
+            )
         )
 
     def test_select_accepts_artifact_without_workflow_run(self):
@@ -547,6 +628,78 @@ class SelectFailureTests(SelectorTestCase):
         self.assertFalse(
             any("setup-check.yml" in url for url in self.fake.requests)
         )
+
+    def test_new_run_after_artifacts_is_rejected(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+
+        def switch_to_new_run(fake):
+            newer = make_run(1002, 101, created_at=LATEST)
+            fake.page_responses[(101, 1)] = json_response(
+                make_runs(1, [newer])
+            )
+            fake.attempt_responses[(1002, 1)] = json_response(newer)
+
+        self.fake.after_artifacts = switch_to_new_run
+        self.assert_select_failure("run", "expected-mismatch")
+
+    def test_new_attempt_after_artifacts_is_rejected(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+
+        def switch_to_new_attempt(fake):
+            newer = make_run(
+                1001,
+                101,
+                attempt=2,
+                created_at=LATEST,
+            )
+            fake.page_responses[(101, 1)] = json_response(
+                make_runs(1, [newer])
+            )
+            fake.attempt_responses[(1001, 2)] = json_response(newer)
+
+        self.fake.after_artifacts = switch_to_new_attempt
+        self.assert_select_failure("run", "expected-mismatch")
+
+    def test_queued_new_run_after_artifacts_is_rejected(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+
+        def switch_to_queued_run(fake):
+            newer = make_run(
+                1002,
+                101,
+                status="queued",
+                conclusion=None,
+                created_at=LATEST,
+            )
+            fake.page_responses[(101, 1)] = json_response(
+                make_runs(1, [newer])
+            )
+            fake.attempt_responses[(1002, 1)] = json_response(newer)
+
+        self.fake.after_artifacts = switch_to_queued_run
+        self.assert_select_failure("runs", "not-completed")
+
+    def test_failed_new_run_after_artifacts_is_rejected(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+
+        def switch_to_failed_run(fake):
+            newer = make_run(
+                1002,
+                101,
+                conclusion="failure",
+                created_at=LATEST,
+            )
+            fake.page_responses[(101, 1)] = json_response(
+                make_runs(1, [newer])
+            )
+            fake.attempt_responses[(1002, 1)] = json_response(newer)
+
+        self.fake.after_artifacts = switch_to_failed_run
+        self.assert_select_failure("runs", "not-success")
 
     def assert_select_failure(self, stage, kind, environment=None):
         code, stdout, stderr = self.run_select(environment)
@@ -1057,6 +1210,93 @@ class SelectFailureTests(SelectorTestCase):
         self.assertNotIn("RAW_SECRET_BODY", text)
         self.assertNotIn("https://", text)
 
+    def test_select_summary_write_failure_leaves_no_output(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+        self.output_path.write_text("previous=1", encoding="utf-8")
+        with mock.patch.object(
+            MOD.CI,
+            "write_summary",
+            side_effect=CI.PreflightError("summary", "write"),
+        ):
+            code, stdout, stderr = self.run_select()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "release-selection: fail stage=summary kind=write\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            self.output_path.read_text(encoding="utf-8"), "previous=1"
+        )
+
+    def test_select_output_write_failure_happens_after_summary(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+        self.output_path.write_text("previous=1\n", encoding="utf-8")
+        with mock.patch.object(
+            MOD,
+            "write_github_output",
+            side_effect=CI.PreflightError("output", "write"),
+        ):
+            code, stdout, stderr = self.run_select()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "release-selection: fail stage=output kind=write\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(self.selection_data()["result"], "pass")
+        self.assertEqual(
+            self.output_path.read_text(encoding="utf-8"), "previous=1\n"
+        )
+
+    def test_select_partial_output_failure_rolls_back(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+        self.output_path.write_text("previous=1\n", encoding="utf-8")
+        calls = {"count": 0}
+
+        def fsync(descriptor):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("simulated output fsync failure")
+
+        with mock.patch.object(MOD.os, "fsync", side_effect=fsync):
+            code, stdout, stderr = self.run_select()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "release-selection: fail stage=output kind=write\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            self.output_path.read_text(encoding="utf-8"), "previous=1\n"
+        )
+
+    def test_select_partial_output_failure_rolls_back_added_lf(self):
+        self.add_ci_success()
+        self.add_default_artifacts()
+        self.output_path.write_text("previous=1", encoding="utf-8")
+        calls = {"count": 0}
+
+        def fsync(descriptor):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("simulated output fsync failure")
+
+        with mock.patch.object(MOD.os, "fsync", side_effect=fsync):
+            code, stdout, stderr = self.run_select()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "release-selection: fail stage=output kind=write\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            self.output_path.read_text(encoding="utf-8"), "previous=1"
+        )
+
     def test_select_output_symlink_is_rejected(self):
         self.add_ci_success()
         self.add_default_artifacts()
@@ -1389,6 +1629,49 @@ class VerifyFailureTests(SelectorTestCase):
         )
         self.assert_verify_failure("pointer", "body-too-large")
 
+    def test_verify_output_adds_separator_lf_for_existing_no_lf(self):
+        self.write_selection()
+        self.write_pointer()
+        self.verify_output_path.write_text("existing=1", encoding="utf-8")
+        code, stdout, stderr = self.run_main(self.verify_argv())
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "release-selection: verify pass\n")
+        text = self.verify_output_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            text,
+            "existing=1\n"
+            "ci_run_id=1001\n"
+            "ci_run_attempt=1\n"
+            "bundle_artifact_id=22\n"
+            f"descriptor_sha256={DESCRIPTOR_SHA}\n"
+            f"bundle_artifact_digest={BUNDLE_DIGEST}\n",
+        )
+        self.assertNotIn("existing=1ci_run_id", text)
+
+    def test_verify_output_write_failure_rolls_back(self):
+        self.write_selection()
+        self.write_pointer()
+        self.verify_output_path.write_text("previous=1\n", encoding="utf-8")
+        calls = {"count": 0}
+
+        def fsync(descriptor):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise OSError("simulated verify output fsync failure")
+
+        with mock.patch.object(MOD.os, "fsync", side_effect=fsync):
+            code, stdout, stderr = self.run_main(self.verify_argv())
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stdout,
+            "release-selection: fail stage=output kind=write\n",
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            self.verify_output_path.read_text(encoding="utf-8"),
+            "previous=1\n",
+        )
+
     def test_verify_rejects_output_symlink(self):
         target = self.root / "verify-target"
         target.write_text("", encoding="utf-8")
@@ -1435,6 +1718,9 @@ class CrossModuleIntegrationTests(SelectorTestCase):
     BUNDLE_ARTIFACT_ID = 222
     DESCRIPTOR_SHA = "3" * 64
     BUNDLE_DIGEST = "sha256:" + "2" * 64
+    WORKFLOW_REF = (
+        "xtianxx/payment-hub/.github/workflows/ci.yml@refs/heads/main"
+    )
 
     def producer_env(self):
         return {
@@ -1445,10 +1731,16 @@ class CrossModuleIntegrationTests(SelectorTestCase):
             "GITHUB_EVENT_NAME": "push",
             "GITHUB_REF": "refs/heads/main",
             "GITHUB_REPOSITORY": MOD.REPOSITORY,
+            "GITHUB_WORKFLOW_REF": self.WORKFLOW_REF,
             "GITHUB_SHA": SHA,
             "GITHUB_RUN_ID": str(self.PRODUCER_RUN_ID),
             "GITHUB_RUN_ATTEMPT": str(self.PRODUCER_RUN_ATTEMPT),
         }
+
+    def consumer_event_env(self):
+        environment = self.producer_env()
+        environment["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+        return environment
 
     def consumer_select_env(self):
         return base_env()
@@ -1504,6 +1796,41 @@ class CrossModuleIntegrationTests(SelectorTestCase):
         self.assertEqual(stderr, "")
         self.assertFalse(self.verify_output_path.exists())
 
+    def test_pointer_cli_rejects_missing_or_wrong_workflow_ref(self):
+        cases = (
+            ("missing", None),
+            (
+                "wrong",
+                "xtianxx/payment-hub/.github/workflows/old.yml"
+                "@refs/heads/main",
+            ),
+        )
+        for name, workflow_ref in cases:
+            with self.subTest(name=name):
+                output = self.root / f"workflow-ref-{name}" / "pointer.json"
+                environment = self.producer_env()
+                if workflow_ref is None:
+                    environment.pop("GITHUB_WORKFLOW_REF", None)
+                else:
+                    environment["GITHUB_WORKFLOW_REF"] = workflow_ref
+                completed = subprocess.run(
+                    self.pointer_command(output),
+                    cwd=str(REPO),
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(
+                    completed.stderr, "ERROR: context/workflow-ref\n"
+                )
+                self.assertEqual(
+                    completed.stdout,
+                    "result: fail stage=context kind=workflow-ref\n",
+                )
+                self.assertFalse(output.exists())
+
     def test_a_pointer_select_verify_contract_and_mutations(self):
         producer = self.producer_env()
         for checker in (CI.validate_environment, MOD.validate_trusted_context):
@@ -1518,12 +1845,17 @@ class CrossModuleIntegrationTests(SelectorTestCase):
         completed = subprocess.run(
             self.pointer_command(consumer_pointer),
             cwd=str(REPO),
-            env=self.consumer_select_env(),
+            env=self.consumer_event_env(),
             capture_output=True,
             text=True,
             timeout=30,
         )
-        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, "ERROR: context/event\n")
+        self.assertEqual(
+            completed.stdout,
+            "result: fail stage=context kind=event\n",
+        )
         self.assertFalse(consumer_pointer.exists())
 
         pointer_path, pointer = self.generate_pointer_with_a()
