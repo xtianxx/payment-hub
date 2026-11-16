@@ -5,7 +5,7 @@
 > 来源绑定、四文件交接及本轮未实现的nightly实验见[CI/CD说明](ci-cd.md)。
 > 下方历史运行保留原文件名和证据，不代表旧入口仍用于当前发布。
 
-## 当前策略：仅更新已存在的public包（2026-11-15）
+## 正常发布策略：仅更新已存在的public包（2026-11-15）
 
 负责人已确认暂停工作流自动创建缺失包。无论源码仓库公开或私有，
 两个目标包都必须已存在、为public、属于`xtianxx`并正确关联
@@ -21,6 +21,12 @@
 不构成公开凭据、敏感数据或任意其他软件包的授权。
 源码仓库可见性仍独立，不以`repository.private`的值替代包自身可见性检查。
 public包可匿名读取且不能直接改回private，公开包内容不应包含任何凭据或敏感数据。
+
+缺失迁移包使用独立、默认关闭的`initialize-migrate`操作，不借用bootstrap开关，
+不改变上述正常发布门禁。首次推送可能直接public，必须独立确认风险；
+实际为private时也不自动更改可见性。入口、权限、互斥确认和恢复边界见
+[迁移包一次性初始化](migrate-initialization.md)。
+本轮只实现和验证代码，不执行初始化或正式发布。
 
 registry验证允许匿名GET直接返回200，但必须完成与鉴权响应相同的manifest大小、
 内容哈希、响应摘要、媒体类型、根描述及runtime/attestation校验；
@@ -53,8 +59,9 @@ migrate未尝试。摘要`push_attempted_roles=["app"]`、
 本轮可见性策略调整不改变源码仓库可见性、不扩大审计token权限、不新增写入PAT，
 也不授权创建缺失包、初始化、发布或部署。public包不能直接改回private；
 保留原名删除重建、更名及独立初始化均须另行明确授权和验证，
-不能靠重跑工作流试探。后续初始化必须使用真实已验收的配对镜像，
-不可用占位镜像冒充；当前未实现或批准此恢复路径。
+不能靠重跑工作流试探。初始化必须使用真实已验收的配对镜像，
+不可用占位镜像冒充。此前未实现该恢复路径；本轮新增独立初始化入口，
+但代码实现授权不等于真实首次推送、包创建、公开或正式发布授权。
 
 本门禁只阻止已检测到的缺失包进入push。完整分页和push前后重查不是原子锁，
 外部写者仍可能在最后检查后删除、重建或改变包可见性；
@@ -347,13 +354,17 @@ main在镜像标签仍存在时从同一对镜像导出四文件bundle，
 它不登录GHCR、不申请包写权限，也不将PR产物当作发布候选。
 镜像移除仅限确认归属的隔离临时daemon，禁止影响普通本地daemon及无关资源。
 
-`release.yml`仍为main人工发布，但不执行镜像builder。
+`release.yml`仍为main人工操作，不执行镜像builder。
+默认`publish`执行正常发布；`initialize-migrate`只在独立三项初始化确认满足时执行，
+两种写入job互斥。初始化只写迁移包，不能作为完整配对发布成功。
 候选解析和真正发布入口前均由`check-main-ci.py`核验同SHA的`ci.yml`最新push/main成功运行，
 并锁定run ID和attempt。精确选取并校验该运行的pointer及bundle artifact ID/digest，
 再用受信descriptor SHA执行`verify-handoff`，不取全仓最新同名产物，
 不从PR、nightly、旧成功或旧attempt回退。产物缺失、过期或来源不符直接停止。
 查询和下载只读使用`GITHUB_TOKEN`及`actions: read`；
-包写权限只属于upload job，audit Secret只在publish步骤注入，不写摘要。
+包写权限只属于正常upload及独立初始化job；
+audit Secret仅在对应publish或初始化执行步骤显式注入，不写摘要。
+权限本身是job级，不能把显式env注入限制表述为step级包写权限隔离。
 
 建议顺序：修复分支开PR → `ci.yml`及其全部必需检查通过 → 合并main →
 合并后SHA的push/main `ci.yml`及其全部必需检查通过 → 核实包权限并在另行授权后人工发布。

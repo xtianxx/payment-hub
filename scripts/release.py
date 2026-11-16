@@ -2795,7 +2795,15 @@ class Release:
                 raise ReleaseError("package", role + "-appeared")
         return states, metadata
 
-    def _check_package(self, role: str, token: str) -> dict[str, Any]:
+    def _fetch_package_metadata(self, role: str, token: str) -> dict[str, Any]:
+        """Fetch one raw package metadata document with fixed status handling.
+
+        Only the HTTP status, bounded body size, and JSON decoding are checked
+        here.  Role-specific field and shape validation stays with the caller
+        so normal publish keeps the historical public linked-package validator
+        while the one-shot initialization path can apply its own fixed
+        private-or-public rule without weakening either caller.
+        """
         name = PACKAGE_NAMES[role]
         url = f"{GITHUB_API}/user/packages/container/{name}"
         response = self.http(
@@ -2817,6 +2825,10 @@ class Release:
             value = json.loads(response.body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ReleaseError("package", role + "-json") from exc
+        return value
+
+    def _check_package(self, role: str, token: str) -> dict[str, Any]:
+        value = self._fetch_package_metadata(role, token)
         return _validate_package_metadata(value, role)
 
     def _registry_manifest(

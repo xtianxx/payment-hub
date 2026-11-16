@@ -3,18 +3,41 @@ name: Manual paired image release / 人工配对镜像发布
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: 'Operation: normal paired publish, or migration package initialization only'
+        required: true
+        default: publish
+        type: choice
+        options:
+          - publish
+          - initialize-migrate
       publish_authorized:
         description: Explicit authorization to publish the prepared pair
         required: true
         default: false
         type: boolean
       packages_verified:
-        description: Package preconditions verified for normal updates (both existing public linked packages) and bootstrap compatibility (owner inventory, risk); automatic package creation is suspended
+        description: Package preconditions verified for normal publish only (both existing public linked packages); not reused by migration initialization
         required: true
         default: false
         type: boolean
       bootstrap_packages:
         description: 兼容开关：自动创建已暂停；仍要求两包已存在且为public；不替代 publish_authorized 或 packages_verified
+        required: true
+        default: false
+        type: boolean
+      initialize_authorized:
+        description: Explicit authorization to initialize only the migration package
+        required: true
+        default: false
+        type: boolean
+      initialization_preconditions_verified:
+        description: 'Initialization preconditions verified: app is already public and linked, migrate is absent, and no other writer is active'
+        required: true
+        default: false
+        type: boolean
+      public_creation_acknowledged:
+        description: Acknowledge that first package creation may become public immediately and is irreversible; this is not a private guarantee
         required: true
         default: false
         type: boolean
@@ -50,7 +73,7 @@ jobs:
       bundle_artifact_digest: ${{ steps.verify-candidate.outputs.bundle_artifact_digest }}
 
     steps:
-      - name: Verify manual publish preconditions
+      - name: Verify manual operation preconditions
         shell: bash
         env:
           SOURCE_SHA: ${{ github.sha }}
@@ -59,8 +82,13 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RELEASE_ACTOR: ${{ github.actor }}
           RELEASE_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          OPERATION: ${{ inputs.operation }}
           PUBLISH_AUTHORIZED: ${{ inputs.publish_authorized }}
           PACKAGES_VERIFIED: ${{ inputs.packages_verified }}
+          BOOTSTRAP_PACKAGES: ${{ inputs.bootstrap_packages }}
+          INITIALIZE_AUTHORIZED: ${{ inputs.initialize_authorized }}
+          INITIALIZATION_PRECONDITIONS_VERIFIED: ${{ inputs.initialization_preconditions_verified }}
+          PUBLIC_CREATION_ACKNOWLEDGED: ${{ inputs.public_creation_acknowledged }}
         run: |
           set -euo pipefail
           if [[ "$RELEASE_ACTOR" != "xtianxx" || "$RELEASE_TRIGGERING_ACTOR" != "xtianxx" ]]; then
@@ -83,10 +111,32 @@ jobs:
             echo "::error::publish requires a 40-hex source SHA"
             exit 1
           fi
-          if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]; then
-            echo "::error::publish requires both manual authorizations"
-            exit 1
-          fi
+          case "$OPERATION" in
+            publish)
+              if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]; then
+                echo "::error::publish requires both manual authorizations"
+                exit 1
+              fi
+              if [[ "$INITIALIZE_AUTHORIZED" != "false" || "$INITIALIZATION_PRECONDITIONS_VERIFIED" != "false" || "$PUBLIC_CREATION_ACKNOWLEDGED" != "false" ]]; then
+                echo "::error::publish requires initialization flags to remain false"
+                exit 1
+              fi
+              ;;
+            initialize-migrate)
+              if [[ "$INITIALIZE_AUTHORIZED" != "true" || "$INITIALIZATION_PRECONDITIONS_VERIFIED" != "true" || "$PUBLIC_CREATION_ACKNOWLEDGED" != "true" ]]; then
+                echo "::error::initialize-migrate requires all three initialization authorizations"
+                exit 1
+              fi
+              if [[ "$PUBLISH_AUTHORIZED" != "false" || "$PACKAGES_VERIFIED" != "false" || "$BOOTSTRAP_PACKAGES" != "false" ]]; then
+                echo "::error::initialize-migrate requires publish and bootstrap flags to remain false"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::OPERATION must be publish or initialize-migrate"
+              exit 1
+              ;;
+          esac
 
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -128,7 +178,7 @@ jobs:
   upload:
     name: Publish paired images (linux/amd64)
     needs: resolve-candidate
-    if: ${{ github.actor == 'xtianxx' && github.triggering_actor == 'xtianxx' }}
+    if: ${{ github.actor == 'xtianxx' && github.triggering_actor == 'xtianxx' && inputs.operation == 'publish' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -332,6 +382,199 @@ jobs:
         with:
           name: release-summary-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/payment-hub-release-publish/release-summary.json
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false
+
+  initialize-migrate:
+    name: Initialize migration package (linux/amd64)
+    needs: resolve-candidate
+    if: ${{ github.actor == 'xtianxx' && github.triggering_actor == 'xtianxx' && inputs.operation == 'initialize-migrate' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+
+    steps:
+      - name: Verify resolved candidate identity
+        shell: bash
+        env:
+          CI_RUN_ID: ${{ needs.resolve-candidate.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ needs.resolve-candidate.outputs.ci_run_attempt }}
+          BUNDLE_ARTIFACT_ID: ${{ needs.resolve-candidate.outputs.bundle_artifact_id }}
+          BUNDLE_ARTIFACT_DIGEST: ${{ needs.resolve-candidate.outputs.bundle_artifact_digest }}
+          EXPECTED_DESCRIPTOR_SHA: ${{ needs.resolve-candidate.outputs.descriptor_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::resolved candidate must bind a positive CI run id and attempt"
+            exit 1
+          fi
+          if [[ ! "$BUNDLE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::resolved candidate bundle artifact id is invalid"
+            exit 1
+          fi
+          if [[ ! "$BUNDLE_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::resolved candidate bundle artifact digest is not canonical sha256:64-hex"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_DESCRIPTOR_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::expected descriptor digest is not 64-hex"
+            exit 1
+          fi
+
+      - name: Isolate initialization Go config and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/payment-hub-initialization"
+          mkdir -p "$base/config" "$base/gomod" "$base/gobuild" "$base/gopath" "$base/tmp"
+          export XDG_CONFIG_HOME="$base/config"
+          export GOPATH="$base/gopath"
+          export GOMODCACHE="$base/gomod"
+          export GOCACHE="$base/gobuild"
+          export TMPDIR="$base/tmp"
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::runner-provided Go is missing; initialization cannot continue"
+            exit 1
+          fi
+          if ! go telemetry off; then
+            echo "::error::failed to disable Go telemetry in the isolated config"
+            exit 1
+          fi
+
+          {
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+            echo "GOPATH=$GOPATH"
+            echo "GOMODCACHE=$GOMODCACHE"
+            echo "GOCACHE=$GOCACHE"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go 1.27.4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+          check-latest: false
+          cache: false
+
+      - name: Set up Docker 29.9.3 with containerd image store
+        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
+        with:
+          version: v29.9.3
+          context: payment-hub-initialization
+          set-host: true
+          runtime-basedir: ${{ runner.temp }}/payment-hub-docker
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+          github-token: ""
+
+      - name: Verify Docker image store
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DOCKER_HOST:-}" ]]; then
+            echo "::error::DOCKER_HOST is not set; DOCKER_CONFIG overrides would bypass the dedicated daemon"
+            exit 1
+          fi
+          if [[ "$(docker version --format '{{.Server.Version}}')" != "29.9.3" ]]; then
+            echo "::error::unexpected Docker server version"
+            exit 1
+          fi
+          driver_status="$(docker info --format '{{range .DriverStatus}}{{index . 0}}={{index . 1}}{{"\n"}}{{end}}')"
+          if ! grep -Fxq 'driver-type=io.containerd.snapshotter.v1' <<<"$driver_status"; then
+            echo "::error::Docker image store is not the containerd snapshotter"
+            exit 1
+          fi
+          daemon_id="$(docker info --format '{{.ID}}')"
+          auth_dir="$(mktemp -d)"
+          trap 'rm -rf "$auth_dir"' EXIT
+          if [[ "$(DOCKER_CONFIG="$auth_dir" docker info --format '{{.ID}}')" != "$daemon_id" ]]; then
+            echo "::error::empty DOCKER_CONFIG reaches a different Docker daemon"
+            exit 1
+          fi
+
+      - name: Prepare initialization download directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/payment-hub-initialization-bundle"
+
+      - name: Download initialization bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.resolve-candidate.outputs.bundle_artifact_id }}
+          run-id: ${{ needs.resolve-candidate.outputs.ci_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: ${{ runner.temp }}/payment-hub-initialization-bundle
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Restrict initialization bundle permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 0600 \
+            "$RUNNER_TEMP/payment-hub-initialization-bundle/pair.tar" \
+            "$RUNNER_TEMP/payment-hub-initialization-bundle/descriptor.json" \
+            "$RUNNER_TEMP/payment-hub-initialization-bundle/build-record.json" \
+            "$RUNNER_TEMP/payment-hub-initialization-bundle/accepted-images.json"
+
+      - name: Verify initialization handoff
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_DESCRIPTOR_SHA: ${{ needs.resolve-candidate.outputs.descriptor_sha256 }}
+        run: |
+          set -euo pipefail
+          bash scripts/release.sh --stage verify-handoff \
+            --source-sha "$SOURCE_SHA" \
+            --bundle-dir "$RUNNER_TEMP/payment-hub-initialization-bundle" \
+            --expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA"
+
+      - name: Require successful main CI
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          CI_RUN_ID: ${{ needs.resolve-candidate.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ needs.resolve-candidate.outputs.ci_run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/check-main-ci.py --source-sha "$SOURCE_SHA" --summary "$RUNNER_TEMP/payment-hub-ci-gate/ci-preflight.json" --expected-run-id "$CI_RUN_ID" --expected-run-attempt "$CI_RUN_ATTEMPT"
+
+      - name: Initialize migration package
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          CI_RUN_ID: ${{ needs.resolve-candidate.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ needs.resolve-candidate.outputs.ci_run_attempt }}
+          BUNDLE_ARTIFACT_ID: ${{ needs.resolve-candidate.outputs.bundle_artifact_id }}
+          BUNDLE_ARTIFACT_DIGEST: ${{ needs.resolve-candidate.outputs.bundle_artifact_digest }}
+          EXPECTED_DESCRIPTOR_SHA: ${{ needs.resolve-candidate.outputs.descriptor_sha256 }}
+          PAYMENT_HUB_RELEASE_OPERATION: ${{ inputs.operation }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GHCR_PACKAGE_AUDIT_TOKEN: ${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/init-migrate-package.py --source-sha "$SOURCE_SHA" --ci-run-id "$CI_RUN_ID" --ci-run-attempt "$CI_RUN_ATTEMPT" --bundle-artifact-id "$BUNDLE_ARTIFACT_ID" --bundle-artifact-digest "$BUNDLE_ARTIFACT_DIGEST" --bundle-dir "$RUNNER_TEMP/payment-hub-initialization-bundle" --expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA" --artifact-root "$RUNNER_TEMP/payment-hub-migrate-initialization" --go "$(command -v go)" --cache-dir "$RUNNER_TEMP/payment-hub-initialization" --prepare-inputs --approve-initialization --acknowledge-public-creation --initialization-preconditions-verified
+
+      - name: Upload migration initialization summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: migrate-initialization-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/payment-hub-migrate-initialization/initialization-summary.json
           if-no-files-found: error
           retention-days: 30
           include-hidden-files: false

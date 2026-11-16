@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -72,11 +73,11 @@ CI_ACTION_COUNTS = {
 }
 NIGHTLY_ACTION_COUNTS = {CHECKOUT: 1, SETUP_GO: 1, UPLOAD: 1}
 RELEASE_ACTION_COUNTS = {
-    CHECKOUT: 2,
-    SETUP_GO: 1,
-    UPLOAD: 1,
-    DOWNLOAD: 2,
-    SETUP_DOCKER: 1,
+    CHECKOUT: 3,
+    SETUP_GO: 2,
+    UPLOAD: 2,
+    DOWNLOAD: 3,
+    SETUP_DOCKER: 2,
 }
 CI_CANDIDATE_GUARD = (
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' "
@@ -85,6 +86,16 @@ CI_CANDIDATE_GUARD = (
 RELEASE_OWNER_GUARD = (
     "${{ github.actor == 'xtianxx' && "
     "github.triggering_actor == 'xtianxx' }}"
+)
+RELEASE_PUBLISH_GUARD = (
+    "${{ github.actor == 'xtianxx' && "
+    "github.triggering_actor == 'xtianxx' && "
+    "inputs.operation == 'publish' }}"
+)
+RELEASE_INITIALIZE_GUARD = (
+    "${{ github.actor == 'xtianxx' && "
+    "github.triggering_actor == 'xtianxx' && "
+    "inputs.operation == 'initialize-migrate' }}"
 )
 RELEASE_INPUT_BLOCK = (
     "      bootstrap_packages:\n"
@@ -1366,9 +1377,13 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertEqual(tuple(self.workflow.get("jobs", {})), MOD.RELEASE_JOBS)
         resolve = _job(self.workflow, "resolve-candidate")
         upload = _job(self.workflow, "upload")
+        initialize = _job(self.workflow, "initialize-migrate")
         self.assertEqual(resolve["name"], "Resolve release candidate (linux/amd64)")
         self.assertEqual(upload["name"], "Publish paired images (linux/amd64)")
-        for job in (resolve, upload):
+        self.assertEqual(
+            initialize["name"], "Initialize migration package (linux/amd64)"
+        )
+        for job in (resolve, upload, initialize):
             self.assertEqual(job["runs-on"], "ubuntu-24.04")
             self.assertEqual(job["timeout-minutes"], 30)
             self.assertNotIn("env", job)
@@ -1377,15 +1392,18 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             {"contents": "read", "actions": "read"},
         )
         self.assertEqual(upload["needs"], "resolve-candidate")
-        self.assertEqual(upload["if"], RELEASE_OWNER_GUARD)
-        self.assertEqual(
-            upload["permissions"],
-            {
-                "contents": "read",
-                "actions": "read",
-                "packages": "write",
-            },
-        )
+        self.assertEqual(initialize["needs"], "resolve-candidate")
+        self.assertEqual(upload["if"], RELEASE_PUBLISH_GUARD)
+        self.assertEqual(initialize["if"], RELEASE_INITIALIZE_GUARD)
+        for job in (upload, initialize):
+            self.assertEqual(
+                job["permissions"],
+                {
+                    "contents": "read",
+                    "actions": "read",
+                    "packages": "write",
+                },
+            )
         self.assertEqual(self.workflow.get("permissions"), {"contents": "read"})
         self.assertEqual(
             self.workflow.get("concurrency"),
@@ -1396,14 +1414,42 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual(self.workflow.get("env"), MOD.RELEASE_TOP_ENV)
 
-    def test_manual_inputs_are_public_normal_only_and_false(self):
+    def test_manual_inputs_are_closed_and_operation_aware(self):
         on_value = self.workflow.get("on", {})
         self.assertEqual(set(on_value), {"workflow_dispatch"})
         dispatch = on_value["workflow_dispatch"]
         self.assertEqual(set(dispatch), {"inputs"})
         inputs = dispatch["inputs"]
         self.assertEqual(tuple(inputs), MOD.RELEASE_INPUT_NAMES)
+        self.assertEqual(
+            tuple(inputs),
+            (
+                "operation",
+                "publish_authorized",
+                "packages_verified",
+                "bootstrap_packages",
+                "initialize_authorized",
+                "initialization_preconditions_verified",
+                "public_creation_acknowledged",
+            ),
+        )
+        operation = inputs["operation"]
+        self.assertEqual(
+            set(operation),
+            {"description", "required", "default", "type", "options"},
+        )
+        self.assertIs(operation["required"], True)
+        self.assertEqual(operation["default"], "publish")
+        self.assertEqual(operation["type"], "choice")
+        self.assertEqual(
+            tuple(operation["options"]), MOD.RELEASE_OPERATION_OPTIONS
+        )
+        self.assertEqual(
+            operation["description"], MOD.RELEASE_INPUT_DESCRIPTIONS["operation"]
+        )
         for name in MOD.RELEASE_INPUT_NAMES:
+            if name == "operation":
+                continue
             body = inputs[name]
             with self.subTest(input=name):
                 self.assertEqual(
@@ -1415,12 +1461,20 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                 self.assertEqual(
                     body["description"], MOD.RELEASE_INPUT_DESCRIPTIONS[name]
                 )
+        for name in ("packages_verified", "bootstrap_packages"):
+            self.assertIn("public", inputs[name]["description"])
+            self.assertNotIn("private", inputs[name]["description"])
         self.assertIn(
-            "public", inputs["packages_verified"]["description"]
+            "not reused", inputs["packages_verified"]["description"]
         )
-        self.assertIn("public", inputs["bootstrap_packages"]["description"])
-        self.assertNotIn("private", inputs["packages_verified"]["description"])
-        self.assertNotIn("private", inputs["bootstrap_packages"]["description"])
+        for name in (
+            "initialize_authorized",
+            "initialization_preconditions_verified",
+        ):
+            self.assertIn("initializ", inputs[name]["description"].lower())
+        self.assertIn(
+            "public", inputs["public_creation_acknowledged"]["description"].lower()
+        )
 
     def test_resolve_job_is_read_only_and_selects_exact_candidate(self):
         resolve = _job(self.workflow, "resolve-candidate")
@@ -1432,7 +1486,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         gate = _step(
             self.workflow,
             "resolve-candidate",
-            "Verify manual publish preconditions",
+            "Verify manual operation preconditions",
         )
         self.assertEqual(gate["env"], MOD.RELEASE_GATE_ENV)
         self.assertEqual(gate["run"].strip(), MOD.RELEASE_GATE_RUN.strip())
@@ -1440,6 +1494,12 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("workflow_dispatch", gate["run"])
         self.assertIn("refs/heads/main", gate["run"])
         self.assertIn("both manual authorizations", gate["run"])
+        self.assertIn('case "$OPERATION" in', gate["run"])
+        self.assertIn("initialize-migrate)", gate["run"])
+        self.assertIn(
+            "initialize-migrate requires all three initialization authorizations",
+            gate["run"],
+        )
         select = _step(
             self.workflow, "resolve-candidate", "Select release candidate"
         )
@@ -1575,6 +1635,137 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("--stage prepare", publish["run"])
         self.assertIn("GHCR_PACKAGE_AUDIT_TOKEN", publish["env"])
 
+    def test_initialize_migrate_job_is_independent_and_exact(self):
+        initialize = _job(self.workflow, "initialize-migrate")
+        self.assertEqual(
+            tuple(step["name"] for step in initialize["steps"]),
+            MOD.RELEASE_INIT_STEP_NAMES,
+        )
+        self.assertEqual(initialize["if"], RELEASE_INITIALIZE_GUARD)
+        identity = _step(
+            self.workflow,
+            "initialize-migrate",
+            "Verify resolved candidate identity",
+        )
+        self.assertEqual(
+            identity["env"],
+            {
+                "CI_RUN_ID": (
+                    "${{ needs.resolve-candidate.outputs.ci_run_id }}"
+                ),
+                "CI_RUN_ATTEMPT": (
+                    "${{ needs.resolve-candidate.outputs.ci_run_attempt }}"
+                ),
+                "BUNDLE_ARTIFACT_ID": (
+                    "${{ needs.resolve-candidate.outputs.bundle_artifact_id }}"
+                ),
+                "BUNDLE_ARTIFACT_DIGEST": (
+                    "${{ needs.resolve-candidate.outputs.bundle_artifact_digest }}"
+                ),
+                "EXPECTED_DESCRIPTOR_SHA": (
+                    "${{ needs.resolve-candidate.outputs.descriptor_sha256 }}"
+                ),
+            },
+        )
+        self.assertIn(
+            'if [[ ! "$BUNDLE_ARTIFACT_DIGEST" =~ '
+            + MOD.RELEASE_BUNDLE_DIGEST_PATTERN,
+            identity["run"],
+        )
+        self.assertIn(MOD.RELEASE_BUNDLE_DIGEST_ERROR, identity["run"])
+        self.assertIn(
+            'if [[ ! "$EXPECTED_DESCRIPTOR_SHA" =~ '
+            + MOD.RELEASE_DESCRIPTOR_DIGEST_PATTERN,
+            identity["run"],
+        )
+        isolation = _step(
+            self.workflow,
+            "initialize-migrate",
+            "Isolate initialization Go config and caches",
+        )
+        self.assertIn(MOD.RELEASE_INIT_ISOLATION_BASE, isolation["run"])
+        setup = _step(
+            self.workflow,
+            "initialize-migrate",
+            "Set up Docker 29.9.3 with containerd image store",
+        )
+        self.assertEqual(setup["with"]["context"], MOD.RELEASE_INIT_DOCKER_CONTEXT)
+        download = _step(
+            self.workflow, "initialize-migrate", "Download initialization bundle"
+        )
+        self.assertEqual(
+            download["with"],
+            {
+                "artifact-ids": (
+                    "${{ needs.resolve-candidate.outputs.bundle_artifact_id }}"
+                ),
+                "run-id": "${{ needs.resolve-candidate.outputs.ci_run_id }}",
+                "github-token": "${{ github.token }}",
+                "repository": "${{ github.repository }}",
+                "path": "${{ runner.temp }}/payment-hub-initialization-bundle",
+                "merge-multiple": True,
+                "digest-mismatch": "error",
+            },
+        )
+        chmod = _run(
+            self.workflow,
+            "initialize-migrate",
+            "Restrict initialization bundle permissions",
+        )
+        self.assertIn("chmod 0600", chmod)
+        self.assertIn("payment-hub-initialization-bundle", chmod)
+        verify = _step(
+            self.workflow, "initialize-migrate", "Verify initialization handoff"
+        )
+        self.assertIn("--stage verify-handoff", verify["run"])
+        self.assertIn(
+            '--bundle-dir "$RUNNER_TEMP/payment-hub-initialization-bundle"',
+            verify["run"],
+        )
+        self.assertNotIn("GHCR_PACKAGE_AUDIT_TOKEN", verify["env"])
+        ci_gate = _step(
+            self.workflow, "initialize-migrate", "Require successful main CI"
+        )
+        self.assertIn('--expected-run-id "$CI_RUN_ID"', ci_gate["run"])
+        self.assertIn('--expected-run-attempt "$CI_RUN_ATTEMPT"', ci_gate["run"])
+        initializer = _step(
+            self.workflow, "initialize-migrate", "Initialize migration package"
+        )
+        self.assertEqual(initializer["env"], MOD.RELEASE_INIT_ENV)
+        self.assertEqual(initializer["run"].strip(), MOD.RELEASE_INIT_RUN)
+        for token in (
+            "scripts/init-migrate-package.py",
+            '--bundle-artifact-id "$BUNDLE_ARTIFACT_ID"',
+            '--bundle-artifact-digest "$BUNDLE_ARTIFACT_DIGEST"',
+            "--prepare-inputs",
+            "--approve-initialization",
+            "--acknowledge-public-creation",
+            "--initialization-preconditions-verified",
+        ):
+            self.assertIn(token, initializer["run"])
+        for token in (
+            "scripts/release.sh",
+            "--stage publish",
+            "--stage prepare",
+            "build-images.py",
+            "--bootstrap-packages",
+            "--target",
+            "--tag",
+            "--role",
+        ):
+            self.assertNotIn(token, initializer["run"])
+        summary = _step(
+            self.workflow,
+            "initialize-migrate",
+            "Upload migration initialization summary",
+        )
+        self.assertEqual(summary["if"], "always()")
+        self.assertEqual(summary["with"]["name"], MOD.RELEASE_INIT_SUMMARY_NAME)
+        self.assertEqual(summary["with"]["path"], MOD.RELEASE_INIT_SUMMARY_PATH)
+        self.assertEqual(summary["with"]["retention-days"], 30)
+        self.assertIs(summary["with"]["include-hidden-files"], False)
+        self.assertNotIn("release-summary", summary["with"]["name"])
+
     def test_summary_and_actions_are_exact(self):
         summary = _step(
             self.workflow, "upload", "Upload release summary"
@@ -1596,25 +1787,34 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         for pin, count in RELEASE_ACTION_COUNTS.items():
             self.assertEqual(uses.count(pin), count)
 
-    def test_audit_secret_is_unique_to_publish_step(self):
+    def test_audit_secret_is_exact_to_publish_and_init_steps(self):
         self.assertEqual(
             _secret_expressions(self.text),
-            [MOD.RELEASE_AUDIT_SECRET_EXPRESSION],
+            [
+                MOD.RELEASE_AUDIT_SECRET_EXPRESSION,
+                MOD.RELEASE_AUDIT_SECRET_EXPRESSION,
+            ],
         )
-        self.assertEqual(self.text.count(RELEASE_AUDIT_SECRET_LINE), 1)
-        publish = _step(
-            self.workflow, "upload", "Publish paired images"
-        )
-        self.assertEqual(
-            publish["env"]["GHCR_PACKAGE_AUDIT_TOKEN"],
-            MOD.RELEASE_AUDIT_SECRET_EXPRESSION,
-        )
-        for job in self.workflow.get("jobs", {}).values():
+        self.assertEqual(self.text.count(RELEASE_AUDIT_SECRET_LINE), 2)
+        allowed = {
+            ("upload", "Publish paired images"),
+            ("initialize-migrate", "Initialize migration package"),
+        }
+        for job_id, job in self.workflow.get("jobs", {}).items():
             for step in job.get("steps", []):
-                if step.get("name") == "Publish paired images":
-                    continue
-                self.assertNotIn("GHCR_PACKAGE_AUDIT_TOKEN", step.get("env", {}))
-                self.assertNotIn("GHCR_PACKAGE_AUDIT_TOKEN", step.get("run", ""))
+                location = (job_id, step.get("name"))
+                if location in allowed:
+                    self.assertEqual(
+                        step["env"]["GHCR_PACKAGE_AUDIT_TOKEN"],
+                        MOD.RELEASE_AUDIT_SECRET_EXPRESSION,
+                    )
+                else:
+                    self.assertNotIn(
+                        "GHCR_PACKAGE_AUDIT_TOKEN", step.get("env", {})
+                    )
+                    self.assertNotIn(
+                        "GHCR_PACKAGE_AUDIT_TOKEN", step.get("run", "")
+                    )
 
     def test_no_prepare_builder_or_candidate_script(self):
         for token in (
@@ -1635,7 +1835,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             for step in job.get("steps", [])
             if step.get("shell") == "bash"
         ]
-        self.assertEqual(len(scripts), 11)
+        self.assertEqual(len(scripts), 19)
         for index, script in enumerate(scripts):
             result = subprocess.run(
                 [bash, "-n"],
@@ -1658,6 +1858,15 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def _issues_for_mutation(self, text):
         return _issues_for(self.workflow, MOD.validate_release_workflow, text)
 
+    def _mutate_init(self, old, new):
+        head, tail = self.text.split("  initialize-migrate:\n", 1)
+        self.assertIn(old, tail)
+        return (
+            head
+            + "  initialize-migrate:\n"
+            + tail.replace(old, new, 1)
+        )
+
     def test_mutation_input_default_true_non_boolean_or_omitted_is_rejected(self):
         for old, new in (
             ("default: false", "default: true"),
@@ -1676,6 +1885,56 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             "release-workflow-trigger-inputs",
             {issue.kind for issue in self._issues_for_mutation(text)},
         )
+
+    def test_mutation_operation_choice_is_closed(self):
+        for old, new in (
+            ("        default: publish\n", "        default: initialize-migrate\n"),
+            ("        type: choice\n", "        type: string\n"),
+            (
+                "          - initialize-migrate\n",
+                "          - initialize-migrate\n          - extra\n",
+            ),
+        ):
+            with self.subTest(new=new):
+                text = self.text.replace(old, new, 1)
+                self.assertNotEqual(text, self.text)
+                self.assertIn(
+                    "release-workflow-trigger-inputs",
+                    {issue.kind for issue in self._issues_for_mutation(text)},
+                )
+
+    def test_mutation_initialize_inputs_missing_or_default_true_is_rejected(self):
+        for name in (
+            "initialize_authorized",
+            "initialization_preconditions_verified",
+            "public_creation_acknowledged",
+        ):
+            description = MOD.RELEASE_INPUT_DESCRIPTIONS[name]
+            if name == "initialization_preconditions_verified":
+                description = "'" + description + "'"
+            block = (
+                f"      {name}:\n"
+                f"        description: {description}\n"
+                "        required: true\n"
+                "        default: false\n"
+                "        type: boolean\n"
+            )
+            with self.subTest(name=name, mutation="missing"):
+                text = self.text.replace(block, "", 1)
+                self.assertNotEqual(text, self.text)
+                self.assertIn(
+                    "release-workflow-trigger-inputs",
+                    {issue.kind for issue in self._issues_for_mutation(text)},
+                )
+            with self.subTest(name=name, mutation="default-true"):
+                text = self.text.replace(
+                    block, block.replace("default: false", "default: true"), 1
+                )
+                self.assertNotEqual(text, self.text)
+                self.assertIn(
+                    "release-workflow-trigger-inputs",
+                    {issue.kind for issue in self._issues_for_mutation(text)},
+                )
 
     def test_mutation_old_private_or_allow_create_description_is_rejected(self):
         for current, legacy in (
@@ -1732,15 +1991,32 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
     def test_mutation_owner_upload_guard_is_rejected(self):
         for replacement in (
+            RELEASE_OWNER_GUARD,
             "${{ always() }}",
-            "${{ github.actor == 'someone' && github.triggering_actor == 'xtianxx' }}",
-            "${{ github.actor == 'xtianxx' }}",
+            "${{ github.actor == 'someone' && github.triggering_actor == 'xtianxx' && inputs.operation == 'publish' }}",
+            "${{ github.actor == 'xtianxx' && github.triggering_actor == 'xtianxx' && inputs.operation == 'initialize-migrate' }}",
         ):
             with self.subTest(replacement=replacement):
-                text = self.text.replace(RELEASE_OWNER_GUARD, replacement, 1)
+                text = self.text.replace(RELEASE_PUBLISH_GUARD, replacement, 1)
                 self.assertNotEqual(text, self.text)
                 self.assertIn(
                     "release-upload-owner-guard",
+                    {issue.kind for issue in self._issues_for_mutation(text)},
+                )
+
+    def test_mutation_owner_initialize_guard_is_rejected(self):
+        for replacement in (
+            RELEASE_OWNER_GUARD,
+            "${{ always() }}",
+            "${{ github.actor == 'xtianxx' && github.triggering_actor == 'xtianxx' && inputs.operation == 'publish' }}",
+        ):
+            with self.subTest(replacement=replacement):
+                text = self.text.replace(
+                    RELEASE_INITIALIZE_GUARD, replacement, 1
+                )
+                self.assertNotEqual(text, self.text)
+                self.assertIn(
+                    "release-init-guard",
                     {issue.kind for issue in self._issues_for_mutation(text)},
                 )
 
@@ -1883,6 +2159,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             ("Verify release candidate", "release-resolve-step-if"),
             ("Verify release handoff", "release-upload-step-if"),
             ("Publish paired images", "release-upload-step-if"),
+            ("Verify initialization handoff", "release-init-step-if"),
+            ("Initialize migration package", "release-init-step-if"),
         ):
             with self.subTest(step=step_name):
                 text = self.text.replace(
@@ -1934,6 +2212,234 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                     kind,
                     {issue.kind for issue in self._issues_for_mutation(text)},
                 )
+
+    def test_mutation_init_permissions_is_rejected(self):
+        text = self._mutate_init(
+            "      packages: write\n",
+            "      packages: write\n      statuses: write\n",
+        )
+        self.assertIn(
+            "release-init-permissions",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+    def _move_init_audit_to_identity(self, text):
+        audit = RELEASE_AUDIT_SECRET_LINE
+        head, tail = text.split("  initialize-migrate:\n", 1)
+        self.assertEqual(tail.count(audit), 1)
+        tail = tail.replace(audit, "", 1)
+        marker = (
+            "      - name: Verify resolved candidate identity\n"
+            "        shell: bash\n"
+            "        env:\n"
+        )
+        self.assertIn(marker, tail)
+        tail = tail.replace(marker, marker + audit, 1)
+        return head + "  initialize-migrate:\n" + tail
+
+    def test_mutation_third_audit_secret_is_rejected(self):
+        marker = (
+            "      - name: Verify resolved candidate identity\n"
+            "        shell: bash\n"
+            "        env:\n"
+        )
+        text = self._mutate_init(
+            marker, marker + RELEASE_AUDIT_SECRET_LINE
+        )
+        self.assertEqual(
+            text.count(MOD.RELEASE_AUDIT_SECRET_NAME + ":"), 3
+        )
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-token-location", kinds)
+
+    def test_mutation_init_audit_moved_to_unapproved_step_is_rejected(self):
+        text = self._move_init_audit_to_identity(self.text)
+        self.assertNotEqual(text, self.text)
+        self.assertEqual(
+            text.count(MOD.RELEASE_AUDIT_SECRET_NAME + ":"), 2
+        )
+        self.assertEqual(len(_secret_expressions(text)), 2)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-token-location", kinds)
+
+    def test_mutation_publish_audit_moved_to_unapproved_step_is_rejected(self):
+        audit = RELEASE_AUDIT_SECRET_LINE
+        start = self.text.index("  upload:\n")
+        end = self.text.index("  initialize-migrate:\n")
+        section = self.text[start:end]
+        self.assertEqual(section.count(audit), 1)
+        section = section.replace(audit, "", 1)
+        marker = (
+            "      - name: Verify resolved candidate identity\n"
+            "        shell: bash\n"
+            "        env:\n"
+        )
+        self.assertIn(marker, section)
+        section = section.replace(marker, marker + audit, 1)
+        text = self.text[:start] + section + self.text[end:]
+        self.assertNotEqual(text, self.text)
+        self.assertEqual(
+            text.count(MOD.RELEASE_AUDIT_SECRET_NAME + ":"), 2
+        )
+        self.assertEqual(len(_secret_expressions(text)), 2)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-token-location", kinds)
+
+    def test_audit_location_guard_controlled_mutation_is_effective(self):
+        text = self._move_init_audit_to_identity(self.text)
+        parsed = MOD.parse_workflow_text(text)
+        baseline = {
+            issue.kind for issue in MOD.validate_release_workflow(parsed, text, REPO)
+        }
+        self.assertIn("release-token-location", baseline)
+
+        source = SCRIPT.read_text(encoding="utf-8")
+        needle = (
+            "            if RELEASE_AUDIT_SECRET_NAME in step_env:\n"
+            "                if location not in allowed_audit_steps:\n"
+            '                    add("release-token-location", job_id)\n'
+        )
+        replacement = (
+            "            if RELEASE_AUDIT_SECRET_NAME in step_env:\n"
+            "                if False:\n"
+            '                    add("release-token-location", job_id)\n'
+        )
+        self.assertIn(needle, source)
+        patched_source = source.replace(needle, replacement, 1)
+        self.assertNotEqual(patched_source, source)
+
+        module = types.ModuleType("patched_ci_contract_for_audit_test")
+        module.__file__ = str(SCRIPT)
+        sys.modules[module.__name__] = module
+        try:
+            exec(compile(patched_source, str(SCRIPT), "exec"), module.__dict__)
+            patched_workflow = module.parse_workflow_text(text)
+            patched_kinds = {
+                issue.kind
+                for issue in module.validate_release_workflow(
+                    patched_workflow, text, REPO
+                )
+            }
+        finally:
+            sys.modules.pop(module.__name__, None)
+        self.assertNotIn("release-token-location", patched_kinds)
+
+        original_validator = MOD.validate_release_workflow
+        MOD.validate_release_workflow = module.validate_release_workflow
+        try:
+            with self.assertRaises(AssertionError):
+                kinds = {
+                    issue.kind for issue in self._issues_for_mutation(text)
+                }
+                self.assertIn("release-token-location", kinds)
+        finally:
+            MOD.validate_release_workflow = original_validator
+
+    def test_mutation_init_cli_target_publish_or_identity_args_are_rejected(self):
+        for old, new in (
+            ("--prepare-inputs", "--prepare-inputs --target extra"),
+            (
+                "scripts/init-migrate-package.py",
+                "scripts/release.sh --stage publish",
+            ),
+            ('--bundle-artifact-id "$BUNDLE_ARTIFACT_ID"', ""),
+            ('--bundle-artifact-digest "$BUNDLE_ARTIFACT_DIGEST"', ""),
+        ):
+            with self.subTest(old=old):
+                text = self._mutate_init(old, new)
+                kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+                self.assertTrue(
+                    {"release-init-command-run", "release-init-command-unsafe"}
+                    & kinds
+                )
+
+    def test_mutation_init_download_or_summary_is_rejected(self):
+        for old, new in (
+            (
+                "run-id: ${{ needs.resolve-candidate.outputs.ci_run_id }}",
+                "run-id: 12345",
+            ),
+            (
+                "artifact-ids: ${{ needs.resolve-candidate.outputs.bundle_artifact_id }}",
+                "name: ci-release-bundle-latest",
+            ),
+            (
+                "path: ${{ runner.temp }}/payment-hub-initialization-bundle",
+                "path: ${{ runner.temp }}/payment-hub-initialization-bundle-other",
+            ),
+        ):
+            with self.subTest(old=old[:30]):
+                text = self._mutate_init(old, new)
+                kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+                self.assertTrue(
+                    any(kind.startswith("release-init-bundle") for kind in kinds)
+                )
+        text = self._mutate_init(
+            "path: ${{ runner.temp }}/payment-hub-migrate-initialization/initialization-summary.json",
+            "path: ${{ runner.temp }}/payment-hub-migrate-initialization/*.json",
+        )
+        self.assertIn(
+            "release-init-summary-path",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+        text = self._mutate_init(
+            "name: migrate-initialization-summary-${{ github.run_id }}-${{ github.run_attempt }}",
+            "name: release-summary-${{ github.run_id }}-${{ github.run_attempt }}",
+        )
+        self.assertIn(
+            "release-init-summary-name",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+    def test_mutation_init_needs_docker_or_setup_go_is_rejected(self):
+        text = self._mutate_init(
+            "context: payment-hub-initialization",
+            "context: payment-hub-check",
+        )
+        self.assertIn(
+            "release-init-docker-context",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+        text = self._mutate_init(
+            "          go-version: \"1.27.4\"\n",
+            "          go-version: \"1.27.3\"\n",
+        )
+        self.assertIn(
+            "release-init-setup-go-version",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+        text = self._mutate_init("    needs: resolve-candidate\n", "")
+        self.assertIn(
+            "release-init-needs",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+    def test_mutation_init_attempt_or_bundle_identity_is_rejected(self):
+        text = self._mutate_init(
+            "          CI_RUN_ATTEMPT: ${{ needs.resolve-candidate.outputs.ci_run_attempt }}\n",
+            "          CI_RUN_ATTEMPT: 2\n",
+        )
+        self.assertIn(
+            "release-init-identity-env",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+        text = self._mutate_init(
+            '--ci-run-attempt "$CI_RUN_ATTEMPT"',
+            '--ci-run-attempt "2"',
+        )
+        self.assertIn(
+            "release-init-command-run",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+    def test_mutation_init_identity_bare_digest_is_rejected(self):
+        text = self._mutate_init(
+            MOD.RELEASE_BUNDLE_DIGEST_PATTERN, "^[0-9a-f]{64}$"
+        )
+        self.assertIn(
+            "release-init-identity-run",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
 
     def test_mutation_ci_rebind_removed_is_rejected(self):
         text = self.text.replace(
@@ -2183,7 +2689,7 @@ class ReleaseOwnerGateExecutionTests(unittest.TestCase):
         run = _run(
             self.workflow,
             "resolve-candidate",
-            "Verify manual publish preconditions",
+            "Verify manual operation preconditions",
         )
         bash = shutil.which("bash")
         self.assertIsNotNone(bash)
@@ -2194,8 +2700,13 @@ class ReleaseOwnerGateExecutionTests(unittest.TestCase):
             "EVENT_NAME": "workflow_dispatch",
             "REF_NAME": "refs/heads/main",
             "REPOSITORY": "xtianxx/payment-hub",
+            "OPERATION": "publish",
             "PUBLISH_AUTHORIZED": "true",
             "PACKAGES_VERIFIED": "true",
+            "BOOTSTRAP_PACKAGES": "false",
+            "INITIALIZE_AUTHORIZED": "false",
+            "INITIALIZATION_PRECONDITIONS_VERIFIED": "false",
+            "PUBLIC_CREATION_ACKNOWLEDGED": "false",
         }
         env.update(overrides)
         return subprocess.run(
@@ -2243,6 +2754,76 @@ class ReleaseOwnerGateExecutionTests(unittest.TestCase):
                 output = result.stdout + result.stderr
                 self.assertIn("both manual authorizations", output)
                 self.assertNotIn("owner-only", output)
+
+
+    def test_publish_mode_accepts_bootstrap_true_but_rejects_init_flags(self):
+        result = self._run_gate(BOOTSTRAP_PACKAGES="true")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for key in (
+            "INITIALIZE_AUTHORIZED",
+            "INITIALIZATION_PRECONDITIONS_VERIFIED",
+            "PUBLIC_CREATION_ACKNOWLEDGED",
+        ):
+            with self.subTest(key=key):
+                result = self._run_gate(**{key: "true"})
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("initialization flags", result.stdout)
+
+    def test_initialize_mode_requires_three_flags_and_rejects_publish_flags(self):
+        base = {
+            "OPERATION": "initialize-migrate",
+            "PUBLISH_AUTHORIZED": "false",
+            "PACKAGES_VERIFIED": "false",
+            "BOOTSTRAP_PACKAGES": "false",
+            "INITIALIZE_AUTHORIZED": "true",
+            "INITIALIZATION_PRECONDITIONS_VERIFIED": "true",
+            "PUBLIC_CREATION_ACKNOWLEDGED": "true",
+        }
+        result = self._run_gate(**base)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for key in (
+            "INITIALIZE_AUTHORIZED",
+            "INITIALIZATION_PRECONDITIONS_VERIFIED",
+            "PUBLIC_CREATION_ACKNOWLEDGED",
+        ):
+            with self.subTest(key=key):
+                result = self._run_gate(**{**base, key: "false"})
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    "all three initialization authorizations", result.stdout
+                )
+        for key in (
+            "PUBLISH_AUTHORIZED",
+            "PACKAGES_VERIFIED",
+            "BOOTSTRAP_PACKAGES",
+        ):
+            with self.subTest(key=key):
+                result = self._run_gate(**{**base, key: "true"})
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    "publish and bootstrap flags to remain false", result.stdout
+                )
+
+    def test_unknown_operation_or_mixed_mode_fails_closed(self):
+        for value in ("", "unknown"):
+            with self.subTest(value=value):
+                result = self._run_gate(OPERATION=value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    "OPERATION must be publish or initialize-migrate",
+                    result.stdout,
+                )
+        result = self._run_gate(
+            OPERATION="initialize-migrate",
+            PUBLISH_AUTHORIZED="true",
+            INITIALIZE_AUTHORIZED="true",
+            INITIALIZATION_PRECONDITIONS_VERIFIED="true",
+            PUBLIC_CREATION_ACKNOWLEDGED="true",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "publish and bootstrap flags to remain false", result.stdout
+        )
 
 
 class ReleaseBootstrapCommandExecutionTests(unittest.TestCase):
