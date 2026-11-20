@@ -1665,6 +1665,62 @@ class WallDeadlineTests(SourceTestBase):
         self.assertEqual(self.fixture.api.calls, [])
         self.assertEqual(self.fixture.download.calls, [])
 
+    def test_timer_ownership_survives_pause_around_setitimer(self) -> None:
+        old_handler = source.signal.getsignal(source.signal.SIGALRM)
+        deadline = source._WallDeadline(60.0)
+        try:
+            with mock.patch.object(
+                source.time,
+                "monotonic",
+                side_effect=[10.0, 11.0, 11.0, 11.0],
+            ):
+                with mock.patch.object(
+                    source.signal,
+                    "setitimer",
+                    wraps=source.signal.setitimer,
+                ) as setitimer_mock:
+                    deadline.__enter__()
+                    deadline.__exit__(None, None, None)
+                setitimer_mock.assert_any_call(
+                    source.signal.ITIMER_REAL, 0
+                )
+            self.assertIs(
+                source.signal.getsignal(source.signal.SIGALRM), old_handler
+            )
+        finally:
+            source.signal.setitimer(source.signal.ITIMER_REAL, 0)
+            source.signal.signal(source.signal.SIGALRM, old_handler)
+
+    def test_timer_ownership_survives_pause_after_getitimer(self) -> None:
+        deadline = source._WallDeadline(60.0)
+        deadline.deadline_low = 70.0
+        deadline.deadline_high = 70.0
+        with mock.patch.object(
+            source.time, "monotonic", side_effect=[10.0, 11.0]
+        ):
+            with mock.patch.object(
+                source.signal,
+                "getitimer",
+                return_value=(60.0, 0.0),
+            ):
+                self.assertTrue(deadline._timer_is_ours())
+
+    def test_timer_ownership_rejects_remaining_outside_interval(
+        self,
+    ) -> None:
+        deadline = source._WallDeadline(60.0)
+        deadline.deadline_low = 70.0
+        deadline.deadline_high = 71.0
+        with mock.patch.object(
+            source.time, "monotonic", side_effect=[10.0, 10.5]
+        ):
+            with mock.patch.object(
+                source.signal,
+                "getitimer",
+                return_value=(50.0, 0.0),
+            ):
+                self.assertFalse(deadline._timer_is_ours())
+
     def test_timer_cleanup_failure_still_restores_handler(self) -> None:
         old_handler = source.signal.getsignal(source.signal.SIGALRM)
         deadline = source._WallDeadline(60.0)

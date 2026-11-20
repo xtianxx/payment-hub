@@ -114,6 +114,7 @@ _SOURCE_SHA_RE = re.compile(r"[0-9a-f]{40}")
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]{8,512}")
 _SAFE_CATEGORY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
+_TIMER_RESOLUTION_SECONDS = 0.05
 _DEADLINE_LOCK = threading.Lock()
 
 _ALLOWED_CHECKER_FAILURES = {
@@ -259,8 +260,9 @@ class _WallDeadline:
     replaced or merged: that fails closed as ``verify/deadline-conflict`` and
     leaves the caller's handler and timer untouched.  On exit the guard
     restores its handler only while that handler is still installed, and
-    clears its timer only while the timer still matches the deadline it set;
-    an externally replaced handler or timer is never overwritten.
+    clears its timer only while its remaining time still falls inside the
+    arming interval it recorded; an externally replaced handler or timer is
+    never overwritten.
 
     Platforms without ``SIGALRM`` fail closed as
     ``verify/deadline-unsupported`` rather than silently dropping the guard.
@@ -277,7 +279,8 @@ class _WallDeadline:
         self.kind = kind
         self.old_handler: Any = None
         self.installed_handler: Any = None
-        self.deadline_at: float | None = None
+        self.deadline_low: float | None = None
+        self.deadline_high: float | None = None
         self.handler_owned = False
         self.timer_owned = False
         self.installed = False
@@ -334,11 +337,19 @@ class _WallDeadline:
         self.handler_owned = True
         # Record ownership before arming the timer: a signal delivered just
         # after ``setitimer`` returns must still let cleanup identify and
-        # cancel this guard's own timer.
-        self.deadline_at = time.monotonic() + self.seconds
+        # cancel this guard's own timer.  The real expiry lies between the
+        # monotonic samples taken immediately before and after the call, so an
+        # unbounded pause around ``setitimer`` cannot make our own timer look
+        # external.
         self.timer_owned = True
         try:
-            signal.setitimer(signal.ITIMER_REAL, self.seconds)
+            before = time.monotonic()
+            try:
+                signal.setitimer(signal.ITIMER_REAL, self.seconds)
+            finally:
+                after = time.monotonic()
+                self.deadline_low = before + self.seconds
+                self.deadline_high = after + self.seconds
         except (AttributeError, OSError, ValueError):
             self._restore()
             raise VerificationError(
@@ -364,24 +375,33 @@ class _WallDeadline:
     def _timer_is_ours(self) -> bool:
         """Whether the active ``ITIMER_REAL`` is the one this guard set.
 
-        Fully restored timers are already cancelled (``remaining <= 0``).  A
-        live timer must be one-shot and its remaining time must agree with the
-        recorded absolute deadline within a small tolerance; anything else is
-        treated as an external replacement and is left running.
+        The guard arms its timer between two monotonic samples, so the real
+        expiry lies within the recorded ``[deadline_low, deadline_high]``
+        interval.  Sampling the clock around ``getitimer`` bounds the remaining
+        time from both sides without assuming any bound on scheduler pauses.
+        A live timer outside that interval is an external replacement and is
+        left running.
         """
 
-        if self.deadline_at is None:
+        if self.deadline_low is None or self.deadline_high is None:
             return False
+        before = time.monotonic()
         try:
             remaining, interval = signal.getitimer(signal.ITIMER_REAL)
         except (AttributeError, OSError, ValueError):
             return False
+        after = time.monotonic()
         if interval != 0:
             return False
         if remaining <= 0.0:
             return True
-        expected = self.deadline_at - time.monotonic()
-        return abs(remaining - expected) <= 0.25
+        lower = self.deadline_low - after
+        upper = self.deadline_high - before
+        return (
+            lower - _TIMER_RESOLUTION_SECONDS
+            <= remaining
+            <= upper + _TIMER_RESOLUTION_SECONDS
+        )
 
     def _restore(self) -> None:
         try:
