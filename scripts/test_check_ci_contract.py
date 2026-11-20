@@ -97,13 +97,22 @@ RELEASE_INITIALIZE_GUARD = (
     "github.triggering_actor == 'xtianxx' && "
     "inputs.operation == 'initialize-migrate' }}"
 )
-RELEASE_INPUT_BLOCK = (
-    "      bootstrap_packages:\n"
-    "        description: 兼容开关：自动创建已暂停；仍要求两包已存在且为public；"
-    "不替代 publish_authorized 或 packages_verified\n"
+RELEASE_PACKAGES_VERIFIED_BLOCK = (
+    "      packages_verified:\n"
+    "        description: '"
+    + MOD.RELEASE_INPUT_DESCRIPTIONS["packages_verified"]
+    + "'\n"
     "        required: true\n"
     "        default: false\n"
     "        type: boolean\n"
+)
+RELEASE_CONFIRMATION_BLOCK = (
+    "      confirmation:\n"
+    "        description: '"
+    + MOD.RELEASE_INPUT_DESCRIPTIONS["confirmation"]
+    + "'\n"
+    "        required: true\n"
+    "        type: string\n"
 )
 RELEASE_AUDIT_SECRET_LINE = (
     "          GHCR_PACKAGE_AUDIT_TOKEN: "
@@ -1423,15 +1432,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertEqual(tuple(inputs), MOD.RELEASE_INPUT_NAMES)
         self.assertEqual(
             tuple(inputs),
-            (
-                "operation",
-                "publish_authorized",
-                "packages_verified",
-                "bootstrap_packages",
-                "initialize_authorized",
-                "initialization_preconditions_verified",
-                "public_creation_acknowledged",
-            ),
+            ("operation", "packages_verified", "confirmation"),
         )
         operation = inputs["operation"]
         self.assertEqual(
@@ -1447,34 +1448,48 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertEqual(
             operation["description"], MOD.RELEASE_INPUT_DESCRIPTIONS["operation"]
         )
-        for name in MOD.RELEASE_INPUT_NAMES:
-            if name == "operation":
-                continue
-            body = inputs[name]
-            with self.subTest(input=name):
-                self.assertEqual(
-                    set(body), {"description", "required", "default", "type"}
-                )
-                self.assertIs(body["required"], True)
-                self.assertIs(body["default"], False)
-                self.assertEqual(body["type"], "boolean")
-                self.assertEqual(
-                    body["description"], MOD.RELEASE_INPUT_DESCRIPTIONS[name]
-                )
-        for name in ("packages_verified", "bootstrap_packages"):
-            self.assertIn("public", inputs[name]["description"])
-            self.assertNotIn("private", inputs[name]["description"])
-        self.assertIn(
-            "not reused", inputs["packages_verified"]["description"]
+        packages_verified = inputs["packages_verified"]
+        self.assertEqual(
+            set(packages_verified),
+            {"description", "required", "default", "type"},
         )
-        for name in (
-            "initialize_authorized",
-            "initialization_preconditions_verified",
+        self.assertIs(packages_verified["required"], True)
+        self.assertIs(packages_verified["default"], False)
+        self.assertEqual(packages_verified["type"], "boolean")
+        self.assertEqual(
+            packages_verified["description"],
+            MOD.RELEASE_INPUT_DESCRIPTIONS["packages_verified"],
+        )
+        confirmation = inputs["confirmation"]
+        self.assertEqual(
+            set(confirmation), {"description", "required", "type"}
+        )
+        self.assertIs(confirmation["required"], True)
+        self.assertNotIn("default", confirmation)
+        self.assertEqual(confirmation["type"], "string")
+        self.assertEqual(
+            confirmation["description"],
+            MOD.RELEASE_INPUT_DESCRIPTIONS["confirmation"],
+        )
+        for token in (
+            "existing",
+            "public",
+            "correctly linked",
+            "migrate",
+            "absent",
+            "writer",
         ):
-            self.assertIn("initializ", inputs[name]["description"].lower())
-        self.assertIn(
-            "public", inputs["public_creation_acknowledged"]["description"].lower()
-        )
+            with self.subTest(token=token):
+                self.assertIn(token, packages_verified["description"])
+        for word in MOD.RELEASE_CONFIRMATION_WORDS.values():
+            with self.subTest(word=word):
+                self.assertIn(word, confirmation["description"])
+        for token in ("first package creation", "public", "immediately", "retractable"):
+            with self.subTest(token=token):
+                self.assertIn(token, confirmation["description"].lower())
+        for token in MOD.RELEASE_LEGACY_INPUTS:
+            with self.subTest(legacy=token):
+                self.assertNotIn(token, self.text)
 
     def test_resolve_job_is_read_only_and_selects_exact_candidate(self):
         resolve = _job(self.workflow, "resolve-candidate")
@@ -1490,16 +1505,28 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual(gate["env"], MOD.RELEASE_GATE_ENV)
         self.assertEqual(gate["run"].strip(), MOD.RELEASE_GATE_RUN.strip())
+        self.assertNotIn("CONFIRMATION", gate["env"])
+        self.assertNotIn("inputs.confirmation", self.text)
         self.assertIn("owner-only", gate["run"])
         self.assertIn("workflow_dispatch", gate["run"])
         self.assertIn("refs/heads/main", gate["run"])
-        self.assertIn("both manual authorizations", gate["run"])
         self.assertIn('case "$OPERATION" in', gate["run"])
         self.assertIn("initialize-migrate)", gate["run"])
+        self.assertIn("packages_verified=true", gate["run"])
+        self.assertIn('expected="PUBLISH"', gate["run"])
         self.assertIn(
-            "initialize-migrate requires all three initialization authorizations",
+            'expected="INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC"',
             gate["run"],
         )
+        self.assertIn("python3 -I -", gate["run"])
+        self.assertIn('os.environ["GITHUB_EVENT_PATH"]', gate["run"])
+        self.assertIn("json.load", gate["run"])
+        self.assertIn(MOD.RELEASE_CONFIRMATION_ERROR, gate["run"])
+        self.assertNotIn("${{", gate["run"])
+        for token in MOD.RELEASE_LEGACY_INPUTS:
+            with self.subTest(legacy=token):
+                self.assertNotIn(token.upper(), gate["env"])
+                self.assertNotIn(token, gate["run"])
         select = _step(
             self.workflow, "resolve-candidate", "Select release candidate"
         )
@@ -1630,7 +1657,10 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual(publish["env"], MOD.RELEASE_PUBLISH_ENV)
         self.assertEqual(publish["run"].strip(), MOD.RELEASE_PUBLISH_RUN.strip())
-        self.assertEqual(publish["run"].count("--bootstrap-packages"), 1)
+        self.assertNotIn("--bootstrap-packages", publish["run"])
+        self.assertNotIn("BOOTSTRAP_PACKAGES", publish["env"])
+        self.assertIn("--approve-external", publish["run"])
+        self.assertIn("--package-preconditions-verified", publish["run"])
         self.assertIn("--prepare-inputs", publish["run"])
         self.assertNotIn("--stage prepare", publish["run"])
         self.assertIn("GHCR_PACKAGE_AUDIT_TOKEN", publish["env"])
@@ -1868,23 +1898,58 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
 
     def test_mutation_input_default_true_non_boolean_or_omitted_is_rejected(self):
-        for old, new in (
-            ("default: false", "default: true"),
-            ("type: boolean", "type: string"),
+        for block, replacement, label in (
+            (
+                RELEASE_PACKAGES_VERIFIED_BLOCK,
+                RELEASE_PACKAGES_VERIFIED_BLOCK.replace(
+                    "default: false", "default: true"
+                ),
+                "packages-default-true",
+            ),
+            (
+                RELEASE_PACKAGES_VERIFIED_BLOCK,
+                RELEASE_PACKAGES_VERIFIED_BLOCK.replace(
+                    "type: boolean", "type: string"
+                ),
+                "packages-type-string",
+            ),
+            (
+                RELEASE_PACKAGES_VERIFIED_BLOCK,
+                RELEASE_PACKAGES_VERIFIED_BLOCK.replace(
+                    "required: true", "required: false"
+                ),
+                "packages-required-false",
+            ),
+            (
+                RELEASE_CONFIRMATION_BLOCK,
+                RELEASE_CONFIRMATION_BLOCK.replace(
+                    "required: true", "required: false"
+                ),
+                "confirmation-required-false",
+            ),
+            (
+                RELEASE_CONFIRMATION_BLOCK,
+                RELEASE_CONFIRMATION_BLOCK.replace(
+                    "type: string", "type: boolean"
+                ),
+                "confirmation-type-boolean",
+            ),
+            (
+                RELEASE_CONFIRMATION_BLOCK,
+                RELEASE_CONFIRMATION_BLOCK.replace(
+                    "        type: string\n",
+                    "        default: PUBLISH\n        type: string\n",
+                ),
+                "confirmation-default-present",
+            ),
         ):
-            with self.subTest(new=new):
-                text = self.text.replace(old, new, 1)
+            with self.subTest(mutation=label):
+                text = self.text.replace(block, replacement, 1)
                 self.assertNotEqual(text, self.text)
                 self.assertIn(
                     "release-workflow-trigger-inputs",
                     {issue.kind for issue in self._issues_for_mutation(text)},
                 )
-        text = self.text.replace(RELEASE_INPUT_BLOCK, "", 1)
-        self.assertNotEqual(text, self.text)
-        self.assertIn(
-            "release-workflow-trigger-inputs",
-            {issue.kind for issue in self._issues_for_mutation(text)},
-        )
 
     def test_mutation_operation_choice_is_closed(self):
         for old, new in (
@@ -1903,22 +1968,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                     {issue.kind for issue in self._issues_for_mutation(text)},
                 )
 
-    def test_mutation_initialize_inputs_missing_or_default_true_is_rejected(self):
-        for name in (
-            "initialize_authorized",
-            "initialization_preconditions_verified",
-            "public_creation_acknowledged",
+    def test_mutation_new_inputs_missing_or_reordered_is_rejected(self):
+        for name, block in (
+            ("packages_verified", RELEASE_PACKAGES_VERIFIED_BLOCK),
+            ("confirmation", RELEASE_CONFIRMATION_BLOCK),
         ):
-            description = MOD.RELEASE_INPUT_DESCRIPTIONS[name]
-            if name == "initialization_preconditions_verified":
-                description = "'" + description + "'"
-            block = (
-                f"      {name}:\n"
-                f"        description: {description}\n"
-                "        required: true\n"
-                "        default: false\n"
-                "        type: boolean\n"
-            )
             with self.subTest(name=name, mutation="missing"):
                 text = self.text.replace(block, "", 1)
                 self.assertNotEqual(text, self.text)
@@ -1926,39 +1980,95 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                     "release-workflow-trigger-inputs",
                     {issue.kind for issue in self._issues_for_mutation(text)},
                 )
-            with self.subTest(name=name, mutation="default-true"):
+        text = self.text.replace(RELEASE_CONFIRMATION_BLOCK, "", 1)
+        text = text.replace(
+            RELEASE_PACKAGES_VERIFIED_BLOCK,
+            RELEASE_CONFIRMATION_BLOCK + RELEASE_PACKAGES_VERIFIED_BLOCK,
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        self.assertIn(
+            "release-workflow-trigger-inputs",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+    def test_mutation_legacy_inputs_are_rejected(self):
+        legacy_inputs = {
+            "bootstrap_packages": (
+                "兼容开关：自动创建已暂停；仍要求两包已存在且为public；"
+                "不替代 publish_authorized 或 packages_verified"
+            ),
+            "publish_authorized": (
+                "Explicit authorization to publish the prepared pair"
+            ),
+            "initialize_authorized": (
+                "Explicit authorization to initialize only the migration package"
+            ),
+            "initialization_preconditions_verified": (
+                "Initialization preconditions verified: app is already public "
+                "and linked, migrate is absent, and no other writer is active"
+            ),
+            "public_creation_acknowledged": (
+                "Acknowledge that first package creation may become public "
+                "immediately and is irreversible; this is not a private guarantee"
+            ),
+        }
+        for name, description in legacy_inputs.items():
+            block = (
+                f"      {name}:\n"
+                f"        description: '{description}'\n"
+                "        required: true\n"
+                "        default: false\n"
+                "        type: boolean\n"
+            )
+            with self.subTest(legacy=name):
                 text = self.text.replace(
-                    block, block.replace("default: false", "default: true"), 1
+                    RELEASE_CONFIRMATION_BLOCK,
+                    RELEASE_CONFIRMATION_BLOCK + block,
+                    1,
                 )
                 self.assertNotEqual(text, self.text)
-                self.assertIn(
-                    "release-workflow-trigger-inputs",
-                    {issue.kind for issue in self._issues_for_mutation(text)},
-                )
+                kinds = {
+                    issue.kind for issue in self._issues_for_mutation(text)
+                }
+                self.assertIn("release-workflow-trigger-inputs", kinds)
+                self.assertIn("release-legacy-input", kinds)
 
     def test_mutation_old_private_or_allow_create_description_is_rejected(self):
-        for current, legacy in (
+        for name, legacy in (
             (
-                MOD.RELEASE_INPUT_DESCRIPTIONS["bootstrap_packages"],
-                "兼容开关：自动创建已暂停；仍要求两包已存在且为private；"
-                "不替代 publish_authorized 或 packages_verified",
+                "packages_verified",
+                "Package preconditions verified for normal publish only (both "
+                "existing public linked packages); not reused by migration "
+                "initialization",
             ),
             (
-                MOD.RELEASE_INPUT_DESCRIPTIONS["bootstrap_packages"],
-                "Third confirmation to bootstrap missing GHCR packages; "
-                "never replaces publish_authorized or packages_verified",
-            ),
-            (
-                MOD.RELEASE_INPUT_DESCRIPTIONS["packages_verified"],
+                "packages_verified",
                 "Package preconditions verified for normal runs (existing private "
                 "and linked packages) and bootstrap runs (owner inventory, missing "
                 "creation scope, risk)",
             ),
+            (
+                "packages_verified",
+                "兼容开关：自动创建已暂停；仍要求两包已存在且为private；"
+                "不替代 publish_authorized 或 packages_verified",
+            ),
+            (
+                "confirmation",
+                "Acknowledge that first package creation may become public "
+                "immediately and is irreversible; this is not a private guarantee",
+            ),
+            (
+                "confirmation",
+                "Third confirmation to bootstrap missing GHCR packages; "
+                "never replaces publish_authorized or packages_verified",
+            ),
         ):
-            with self.subTest(legacy=legacy[:30]):
+            with self.subTest(name=name, legacy=legacy[:30]):
+                current = MOD.RELEASE_INPUT_DESCRIPTIONS[name]
                 text = self.text.replace(
-                    f"        description: {current}\n",
-                    f"        description: {legacy}\n",
+                    f"        description: '{current}'\n",
+                    f"        description: '{legacy}'\n",
                     1,
                 )
                 self.assertNotEqual(text, self.text)
@@ -1988,6 +2098,27 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                     "release-gate-run",
                     {issue.kind for issue in self._issues_for_mutation(text)},
                 )
+
+    def test_mutation_raw_confirmation_wiring_is_rejected(self):
+        text = self.text.replace(
+            "          PACKAGES_VERIFIED: ${{ inputs.packages_verified }}\n",
+            "          PACKAGES_VERIFIED: ${{ inputs.packages_verified }}\n"
+            "          CONFIRMATION: ${{ inputs.confirmation }}\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-gate-env", kinds)
+        self.assertIn("release-confirmation-raw-input", kinds)
+        text = self.text.replace(
+            'python3 -I - "$expected" <<\'PY\'\n',
+            'python3 -I - "$expected" "${{ inputs.confirmation }}" <<\'PY\'\n',
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-gate-run", kinds)
+        self.assertIn("release-confirmation-raw-input", kinds)
 
     def test_mutation_owner_upload_guard_is_rejected(self):
         for replacement in (
@@ -2490,40 +2621,51 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             {issue.kind for issue in self._issues_for_mutation(text)},
         )
 
-    def test_mutation_bootstrap_case_or_flag_is_rejected(self):
+    def test_mutation_publish_bootstrap_flag_or_input_is_rejected(self):
         text = self.text.replace(
-            "          bootstrap_args=()\n",
-            "          bootstrap_args=(--bootstrap-packages)\n",
+            "            --prepare-inputs\n",
+            "            --prepare-inputs \\\n            --bootstrap-packages\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-publish-run", kinds)
+        self.assertIn("release-publish-unsafe", kinds)
+        text = self.text.replace(
+            "          GITHUB_TOKEN: ${{ github.token }}\n"
+            "          GHCR_PACKAGE_AUDIT_TOKEN: ${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          bash scripts/release.sh --stage publish",
+            "          GITHUB_TOKEN: ${{ github.token }}\n"
+            "          GHCR_PACKAGE_AUDIT_TOKEN: ${{ secrets.GHCR_PACKAGE_AUDIT_TOKEN }}\n"
+            "          BOOTSTRAP_PACKAGES: ${{ inputs.bootstrap_packages }}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          bash scripts/release.sh --stage publish",
             1,
         )
         self.assertNotEqual(text, self.text)
         self.assertIn(
-            "release-publish-run",
+            "release-publish-env",
             {issue.kind for issue in self._issues_for_mutation(text)},
         )
         text = self.text.replace(
-            "            *)\n"
-            '              echo "::error::BOOTSTRAP_PACKAGES must be true or false"\n'
-            "              exit 1\n"
-            "              ;;\n",
-            "",
+            RELEASE_CONFIRMATION_BLOCK,
+            RELEASE_CONFIRMATION_BLOCK
+            + (
+                "      bootstrap_packages:\n"
+                "        description: legacy\n"
+                "        required: true\n"
+                "        default: false\n"
+                "        type: boolean\n"
+            ),
             1,
         )
         self.assertNotEqual(text, self.text)
-        self.assertIn(
-            "release-publish-run",
-            {issue.kind for issue in self._issues_for_mutation(text)},
-        )
-        text = self.text.replace(
-            '            "${bootstrap_args[@]}"\n',
-            "            --bootstrap-packages\n",
-            1,
-        )
-        self.assertNotEqual(text, self.text)
-        self.assertIn(
-            "release-publish-run",
-            {issue.kind for issue in self._issues_for_mutation(text)},
-        )
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-workflow-trigger-inputs", kinds)
+        self.assertIn("release-legacy-input", kinds)
 
     def test_mutation_publish_prepare_or_builder_is_rejected(self):
         text = self.text.replace(
@@ -2685,7 +2827,15 @@ class ReleaseOwnerGateExecutionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow, _ = MOD.load_workflow(RELEASE_WORKFLOW)
 
-    def _run_gate(self, **overrides):
+    def _run_gate(
+        self,
+        *,
+        confirmation="PUBLISH",
+        event_payload=None,
+        event_path=None,
+        include_event_path=True,
+        **overrides,
+    ):
         run = _run(
             self.workflow,
             "resolve-candidate",
@@ -2693,29 +2843,38 @@ class ReleaseOwnerGateExecutionTests(unittest.TestCase):
         )
         bash = shutil.which("bash")
         self.assertIsNotNone(bash)
-        env = {
-            "RELEASE_ACTOR": "xtianxx",
-            "RELEASE_TRIGGERING_ACTOR": "xtianxx",
-            "SOURCE_SHA": "a" * 40,
-            "EVENT_NAME": "workflow_dispatch",
-            "REF_NAME": "refs/heads/main",
-            "REPOSITORY": "xtianxx/payment-hub",
-            "OPERATION": "publish",
-            "PUBLISH_AUTHORIZED": "true",
-            "PACKAGES_VERIFIED": "true",
-            "BOOTSTRAP_PACKAGES": "false",
-            "INITIALIZE_AUTHORIZED": "false",
-            "INITIALIZATION_PRECONDITIONS_VERIFIED": "false",
-            "PUBLIC_CREATION_ACKNOWLEDGED": "false",
-        }
-        env.update(overrides)
-        return subprocess.run(
-            [bash, "--noprofile", "--norc", "-c", run],
-            env=env,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(
+            prefix="release-gate-event-"
+        ) as temp:
+            if event_path is None:
+                path = Path(temp) / "event.json"
+                if event_payload is None:
+                    event_payload = json.dumps(
+                        {"inputs": {"confirmation": confirmation}}
+                    )
+                path.write_text(event_payload, encoding="utf-8")
+                event_path = str(path)
+            env = {
+                "RELEASE_ACTOR": "xtianxx",
+                "RELEASE_TRIGGERING_ACTOR": "xtianxx",
+                "SOURCE_SHA": "a" * 40,
+                "EVENT_NAME": "workflow_dispatch",
+                "REF_NAME": "refs/heads/main",
+                "REPOSITORY": "xtianxx/payment-hub",
+                "OPERATION": "publish",
+                "PACKAGES_VERIFIED": "true",
+                "GITHUB_EVENT_PATH": event_path,
+            }
+            if not include_event_path:
+                env.pop("GITHUB_EVENT_PATH")
+            env.update(overrides)
+            return subprocess.run(
+                [bash, "--noprofile", "--norc", "-c", run],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
 
     def test_owner_actor_and_triggering_actor_pass(self):
         result = self._run_gate()
@@ -2746,66 +2905,167 @@ class ReleaseOwnerGateExecutionTests(unittest.TestCase):
                 self.assertIn("::error::owner-only", output)
                 self.assertNotIn("workflow_dispatch", output)
 
-    def test_owner_does_not_replace_dual_authorization(self):
-        for key in ("PUBLISH_AUTHORIZED", "PACKAGES_VERIFIED"):
-            with self.subTest(key=key):
-                result = self._run_gate(**{key: "false"})
+    def test_owner_does_not_replace_packages_verification(self):
+        for value in ("false", "", "TRUE", "1", "yes"):
+            with self.subTest(value=value):
+                result = self._run_gate(PACKAGES_VERIFIED=value)
                 self.assertEqual(result.returncode, 1)
                 output = result.stdout + result.stderr
-                self.assertIn("both manual authorizations", output)
+                self.assertIn("packages_verified=true", output)
                 self.assertNotIn("owner-only", output)
 
-
-    def test_publish_mode_accepts_bootstrap_true_but_rejects_init_flags(self):
-        result = self._run_gate(BOOTSTRAP_PACKAGES="true")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        for key in (
-            "INITIALIZE_AUTHORIZED",
-            "INITIALIZATION_PRECONDITIONS_VERIFIED",
-            "PUBLIC_CREATION_ACKNOWLEDGED",
+    def test_publish_mode_requires_exact_confirmation_word(self):
+        for value in (
+            "",
+            "publish",
+            "Publish",
+            "PUBLISH ",
+            " PUBLISH",
+            "PUBLISHX",
+            "PUBLISH\n",
+            "INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC",
         ):
-            with self.subTest(key=key):
-                result = self._run_gate(**{key: "true"})
+            with self.subTest(value=repr(value)):
+                result = self._run_gate(confirmation=value)
                 self.assertEqual(result.returncode, 1)
-                self.assertIn("initialization flags", result.stdout)
+                output = result.stdout + result.stderr
+                self.assertIn(MOD.RELEASE_CONFIRMATION_ERROR, output)
+                self.assertNotIn("owner-only", output)
 
-    def test_initialize_mode_requires_three_flags_and_rejects_publish_flags(self):
-        base = {
-            "OPERATION": "initialize-migrate",
-            "PUBLISH_AUTHORIZED": "false",
-            "PACKAGES_VERIFIED": "false",
-            "BOOTSTRAP_PACKAGES": "false",
-            "INITIALIZE_AUTHORIZED": "true",
-            "INITIALIZATION_PRECONDITIONS_VERIFIED": "true",
-            "PUBLIC_CREATION_ACKNOWLEDGED": "true",
-        }
-        result = self._run_gate(**base)
+    def test_initialize_mode_requires_packages_and_exact_confirmation_word(self):
+        base = {"OPERATION": "initialize-migrate"}
+        result = self._run_gate(
+            confirmation="INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC", **base
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        for key in (
-            "INITIALIZE_AUTHORIZED",
-            "INITIALIZATION_PRECONDITIONS_VERIFIED",
-            "PUBLIC_CREATION_ACKNOWLEDGED",
-        ):
-            with self.subTest(key=key):
-                result = self._run_gate(**{**base, key: "false"})
+        for value in ("false", "", "TRUE", "1"):
+            with self.subTest(packages_verified=value):
+                result = self._run_gate(
+                    confirmation="INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC",
+                    **{**base, "PACKAGES_VERIFIED": value},
+                )
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(
-                    "all three initialization authorizations", result.stdout
+                    "initialize-migrate requires packages_verified=true",
+                    result.stdout,
                 )
-        for key in (
-            "PUBLISH_AUTHORIZED",
-            "PACKAGES_VERIFIED",
-            "BOOTSTRAP_PACKAGES",
+        for value in (
+            "",
+            "PUBLISH",
+            "initialize-migrate-may-become-public",
+            "INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC ",
+            " INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC",
+            "INITIALIZE-MIGRATE-MAY-BECOME-PUBLICX",
+            "INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC\n",
         ):
-            with self.subTest(key=key):
-                result = self._run_gate(**{**base, key: "true"})
+            with self.subTest(confirmation=repr(value)):
+                result = self._run_gate(confirmation=value, **base)
                 self.assertEqual(result.returncode, 1)
-                self.assertIn(
-                    "publish and bootstrap flags to remain false", result.stdout
-                )
+                output = result.stdout + result.stderr
+                self.assertIn(MOD.RELEASE_CONFIRMATION_ERROR, output)
 
-    def test_unknown_operation_or_mixed_mode_fails_closed(self):
-        for value in ("", "unknown"):
+    def test_cross_mode_confirmation_is_rejected(self):
+        result = self._run_gate(
+            OPERATION="publish",
+            confirmation="INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            MOD.RELEASE_CONFIRMATION_ERROR, result.stdout + result.stderr
+        )
+        result = self._run_gate(
+            OPERATION="initialize-migrate",
+            confirmation="PUBLISH",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            MOD.RELEASE_CONFIRMATION_ERROR, result.stdout + result.stderr
+        )
+
+    def test_confirmation_env_is_not_used(self):
+        result = self._run_gate(
+            confirmation="PUBLISH", CONFIRMATION="SENSITIVE"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_confirmation_event_failures_fail_closed(self):
+        payloads = (
+            "",
+            "{not-json",
+            "[]",
+            '"string"',
+            "null",
+            "{}",
+            '{"inputs": []}',
+            '{"inputs": {}}',
+            '{"inputs": {"confirmation": null}}',
+            '{"inputs": {"confirmation": true}}',
+            '{"inputs": {"confirmation": 1}}',
+            '{"inputs": {"confirmation": ""}}',
+            '{"inputs": {"confirmation": "PUBLISH\\n"}}',
+            '{"inputs": {"confirmation": " PUBLISH"}}',
+            '{"inputs": {"confirmation": "PUBLISH "}}',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload[:30]):
+                result = self._run_gate(event_payload=payload)
+                self.assertEqual(result.returncode, 1)
+                output = result.stdout + result.stderr
+                self.assertIn(MOD.RELEASE_CONFIRMATION_ERROR, output)
+                self.assertNotIn("Traceback", output)
+                self.assertNotIn("JSONDecodeError", output)
+
+    def test_missing_or_unreadable_event_path_fails_closed(self):
+        with tempfile.TemporaryDirectory(
+            prefix="release-gate-path-"
+        ) as temp:
+            paths = (
+                str(Path(temp) / "missing.json"),
+                temp,
+                "",
+            )
+            for event_path in paths:
+                with self.subTest(event_path=repr(event_path)):
+                    result = self._run_gate(event_path=event_path)
+                    self.assertEqual(result.returncode, 1)
+                    output = result.stdout + result.stderr
+                    self.assertIn(MOD.RELEASE_CONFIRMATION_ERROR, output)
+                    if event_path:
+                        self.assertNotIn(event_path, output)
+
+    def test_missing_event_path_env_fails_closed(self):
+        result = self._run_gate(include_event_path=False)
+        self.assertEqual(result.returncode, 1)
+        output = result.stdout + result.stderr
+        self.assertIn(MOD.RELEASE_CONFIRMATION_ERROR, output)
+        self.assertNotIn("Traceback", output)
+
+    def test_rejected_confirmation_does_not_leak_path_or_value(self):
+        sentinel = "SENSITIVE-CONFIRMATION-VALUE"
+        with tempfile.TemporaryDirectory(
+            prefix="release-gate-leak-"
+        ) as temp:
+            path = Path(temp) / "SENSITIVE-EVENT-PATH.json"
+            path.write_text(
+                json.dumps({"inputs": {"confirmation": sentinel}}),
+                encoding="utf-8",
+            )
+            result = self._run_gate(event_path=str(path))
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertIn(MOD.RELEASE_CONFIRMATION_ERROR, output)
+            self.assertNotIn(sentinel, output)
+            self.assertNotIn(str(path), output)
+            self.assertNotIn("Traceback", output)
+
+    def test_unknown_operation_fails_closed(self):
+        for value in (
+            "",
+            "unknown",
+            "Publish",
+            "INITIALIZE-MIGRATE",
+            "initialize_migrate",
+        ):
             with self.subTest(value=value):
                 result = self._run_gate(OPERATION=value)
                 self.assertEqual(result.returncode, 1)
@@ -2813,29 +3073,18 @@ class ReleaseOwnerGateExecutionTests(unittest.TestCase):
                     "OPERATION must be publish or initialize-migrate",
                     result.stdout,
                 )
-        result = self._run_gate(
-            OPERATION="initialize-migrate",
-            PUBLISH_AUTHORIZED="true",
-            INITIALIZE_AUTHORIZED="true",
-            INITIALIZATION_PRECONDITIONS_VERIFIED="true",
-            PUBLIC_CREATION_ACKNOWLEDGED="true",
-        )
-        self.assertEqual(result.returncode, 1)
-        self.assertIn(
-            "publish and bootstrap flags to remain false", result.stdout
-        )
 
 
-class ReleaseBootstrapCommandExecutionTests(unittest.TestCase):
+class ReleasePublishCommandExecutionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.workflow, _ = MOD.load_workflow(RELEASE_WORKFLOW)
 
-    def _execute(self, bootstrap_value):
+    def _execute(self):
         run = _run(self.workflow, "upload", "Publish paired images")
         bash = shutil.which("bash")
         self.assertIsNotNone(bash)
-        with tempfile.TemporaryDirectory(prefix="release-bootstrap-") as temp:
+        with tempfile.TemporaryDirectory(prefix="release-publish-") as temp:
             root = Path(temp)
             fake_go = root / "go"
             fake_go.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
@@ -2857,7 +3106,6 @@ class ReleaseBootstrapCommandExecutionTests(unittest.TestCase):
             self.assertNotEqual(script, run)
             env = {
                 "PATH": f"{root}:/usr/bin:/bin",
-                "BOOTSTRAP_PACKAGES": bootstrap_value,
                 "SOURCE_SHA": "a" * 40,
                 "EXPECTED_DESCRIPTOR_SHA": "b" * 64,
                 "RUNNER_TEMP": str(root / "runner"),
@@ -2877,31 +3125,28 @@ class ReleaseBootstrapCommandExecutionTests(unittest.TestCase):
             )
             return result, args
 
-    def test_false_does_not_pass_bootstrap_flag(self):
-        result, args = self._execute("false")
+    def test_publish_passes_required_flags_without_bootstrap(self):
+        result, args = self._execute()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNotNone(args)
-        self.assertNotIn("--bootstrap-packages", args)
         self.assertEqual(args[:2], ["--stage", "publish"])
-        self.assertIn("--package-preconditions-verified", args)
-
-    def test_true_passes_bootstrap_flag_exactly_once(self):
-        result, args = self._execute("true")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIsNotNone(args)
-        self.assertEqual(args.count("--bootstrap-packages"), 1)
-        self.assertEqual(args[-1], "--bootstrap-packages")
-
-    def test_invalid_value_fails_closed_before_release(self):
-        for value in ("", "yes", "TRUE", "1"):
-            with self.subTest(value=value):
-                result, args = self._execute(value)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn(
-                    "BOOTSTRAP_PACKAGES must be true or false",
-                    result.stdout + result.stderr,
-                )
-                self.assertIsNone(args)
+        for flag in (
+            "--approve-external",
+            "--package-preconditions-verified",
+            "--prepare-inputs",
+        ):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, args)
+        self.assertNotIn("--bootstrap-packages", args)
+        self.assertEqual(args.count("--source-sha"), 1)
+        self.assertEqual(args.count("--prepare-inputs"), 1)
+        self.assertEqual(
+            args[args.index("--source-sha") + 1], "a" * 40
+        )
+        self.assertEqual(
+            args[args.index("--expected-descriptor-sha256") + 1],
+            "b" * 64,
+        )
 
 
 class ManifestContractTests(unittest.TestCase):

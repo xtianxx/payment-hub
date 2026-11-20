@@ -339,8 +339,9 @@ scripts/               轻量 HTTP 演示与重复操作脚本
 的设计；本次只将该既有决定关联回计划，不新增支付业务需求，也不授权真实执行。
 该入口归属于本特性的补充交付恢复能力，独立于正常配对发布：
 
-- `release.yml`默认仍为正常`publish`；`initialize-migrate`需三项独立确认，
-  与正常发布写入job互斥，执行独立的`scripts/init-migrate-package.py`。
+- `release.yml`默认仍为正常`publish`；`initialize-migrate`需勾选对应前提并明确输入
+  `INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC`确认授权与公开风险，与正常发布写入job互斥，
+  执行独立的`scripts/init-migrate-package.py`。
 - 固定目标仅为`ghcr.io/xtianxx/payment-hub-migrate`，标签计算为`init-<source_sha>`；
   使用可信main CI已验收的原迁移镜像，不重建、不写app、不自动改变可见性。
 - app必须保持原public关联包身份，migrate必须确认缺失；首次可能直接公开，
