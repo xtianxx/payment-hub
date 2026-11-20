@@ -108,6 +108,15 @@ SUMMARY_REQUIRED_KEYS = frozenset(
         "cleanup_failed",
     }
 )
+REMOTE_REQUIRED_KEYS = frozenset(
+    {
+        "digest",
+        "mediaType",
+        "body_sha256",
+        "size",
+        "header_digest",
+    }
+)
 RUN_REQUIRED_KEYS = frozenset(
     {
         "id",
@@ -541,6 +550,8 @@ def _validate_summary(value: dict[str, Any]) -> dict[str, Any]:
         )
         if package_initial["id"] != package_postcheck["id"]:
             raise VerificationError("summary", "package-original-id")
+    if postcheck["app"]["id"] == postcheck["migrate"]["id"]:
+        raise VerificationError("summary", "package-id-duplicate")
     _validate_packages_projection(value, postcheck)
     push = _role_map(value.get("push"), "summary")
     remote = _role_map(value.get("remote"), "summary")
@@ -554,6 +565,8 @@ def _validate_summary(value: dict[str, Any]) -> dict[str, Any]:
             push_role.get("candidate_digest"), "summary", "push-digest"
         )
         remote_role = _mapping(remote[role], "summary", "remote")
+        if REMOTE_REQUIRED_KEYS - set(remote_role):
+            raise VerificationError("summary", "remote-keys")
         _digest(remote_role.get("digest"), "summary", "remote-digest")
         pull_role = _mapping(pull[role], "summary", "pull")
         pull_exit = pull_role.get("exit")
@@ -621,6 +634,49 @@ def _cross_check(
         raise VerificationError("evidence", "repository")
 
 
+def _verify_remote_record(
+    record: Mapping[str, Any],
+    root_descriptor: Mapping[str, Any],
+) -> str:
+    """Cross-check one summary ``remote`` record against its descriptor root.
+
+    The remote record produced by a successful publish repeats the verified
+    registry manifest facts: the content type, body hash, body size, and
+    ``Docker-Content-Digest`` header must all describe the same descriptor
+    root the handoff recorded.  Unknown extra keys stay acceptable for
+    forward-compatible summary v1 additions.
+    """
+    if REMOTE_REQUIRED_KEYS - set(record):
+        raise VerificationError("summary", "remote-keys")
+    root_digest = root_descriptor["digest"]
+    root_hex = root_digest.split(":", 1)[1]
+    media_type = record.get("mediaType")
+    if (
+        not isinstance(media_type, str)
+        or media_type != root_descriptor["mediaType"]
+    ):
+        raise VerificationError("summary", "remote-media-type")
+    size = _positive_int(record.get("size"), "summary", "remote-size")
+    if size != root_descriptor["size"]:
+        raise VerificationError("summary", "remote-size")
+    body_sha = _sha256_hex(
+        record.get("body_sha256"), "summary", "remote-body-sha"
+    )
+    if body_sha != root_hex:
+        raise VerificationError("summary", "remote-body-sha")
+    header_digest = _digest(
+        record.get("header_digest"), "summary", "remote-header-digest"
+    )
+    if header_digest != root_digest:
+        raise VerificationError("summary", "remote-header-digest")
+    remote_digest = _digest(
+        record.get("digest"), "summary", "remote-digest"
+    )
+    if remote_digest != root_digest:
+        raise VerificationError("summary", "remote-digest")
+    return remote_digest
+
+
 def _verify_roles(
     summary: dict[str, Any],
     descriptor: dict[str, Any],
@@ -637,19 +693,18 @@ def _verify_roles(
     references: dict[str, str] = {}
     for role in ROLES:
         image = descriptor["images"][role]
-        root_digest = image["root_descriptor"]["digest"]
+        root_descriptor = image["root_descriptor"]
+        root_digest = root_descriptor["digest"]
         local_id = image["local_id"]
         candidate = _digest(
             push[role].get("candidate_digest"), "summary", "push-digest"
         )
-        remote_digest = _digest(
-            remote[role].get("digest"), "summary", "remote-digest"
-        )
-        pull_id = _digest(pull[role].get("id"), "summary", "pull-id")
         if candidate != root_digest:
             raise VerificationError("summary", "push-digest")
-        if remote_digest != root_digest:
-            raise VerificationError("summary", "remote-digest")
+        remote_digest = _verify_remote_record(
+            remote[role], root_descriptor
+        )
+        pull_id = _digest(pull[role].get("id"), "summary", "pull-id")
         if pull_id != local_id:
             raise VerificationError("summary", "pull-id")
         if expected[role] is not None and expected[role] != remote_digest:
@@ -779,6 +834,12 @@ def _load_online_module() -> Any:
     except Exception as exc:
         sys.modules.pop(ONLINE_SOURCE_MODULE_NAME, None)
         raise VerificationError("source", "verification") from exc
+    except BaseException:
+        # KeyboardInterrupt, SystemExit, or a deadline signal may abort the
+        # module body after it was inserted.  Never leave a partial module for
+        # the next in-process retry.
+        sys.modules.pop(ONLINE_SOURCE_MODULE_NAME, None)
+        raise
     if not callable(getattr(module, "verify_online", None)):
         sys.modules.pop(ONLINE_SOURCE_MODULE_NAME, None)
         raise VerificationError("source", "verification")

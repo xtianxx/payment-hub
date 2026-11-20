@@ -81,6 +81,35 @@ def _descriptor_defaults(
     return source_sha, app_digest, migrate_digest
 
 
+def _descriptor_roots(
+    descriptor_bytes: bytes,
+) -> dict[str, dict[str, Any]] | None:
+    """Return each role's root descriptor fields from the fixture bytes."""
+    try:
+        descriptor = json.loads(descriptor_bytes)
+        images = descriptor["images"]
+        roots: dict[str, dict[str, Any]] = {}
+        for role in verifier.ROLES:
+            root = images[role]["root_descriptor"]
+            media_type = root["mediaType"]
+            size = root["size"]
+            digest = root["digest"]
+            if (
+                not isinstance(media_type, str)
+                or type(size) is not int
+                or not isinstance(digest, str)
+            ):
+                return None
+            roots[role] = {
+                "mediaType": media_type,
+                "size": size,
+                "digest": digest,
+            }
+        return roots
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def make_descriptor(**overrides: Any) -> dict[str, Any]:
     """Return a descriptor matching the production release-handoff v1 schema."""
     descriptor: dict[str, Any] = {
@@ -159,6 +188,17 @@ def make_summary(
     source = source_sha if source_sha is not None else default_source
     app = app_digest if app_digest is not None else default_app
     migrate = migrate_digest if migrate_digest is not None else default_migrate
+    roots = _descriptor_roots(descriptor_bytes)
+    remote: dict[str, Any] = {}
+    for role, digest in (("app", app), ("migrate", migrate)):
+        root = roots[role] if roots is not None else {}
+        remote[role] = {
+            "digest": digest,
+            "mediaType": root.get("mediaType", verifier.OCI_INDEX),
+            "body_sha256": digest.split(":", 1)[1],
+            "size": root.get("size", 1024),
+            "header_digest": digest,
+        }
     summary: dict[str, Any] = {
         "schema": verifier.SUMMARY_SCHEMA,
         "stage": "publish",
@@ -197,16 +237,7 @@ def make_summary(
             role: {"candidate_digest": digest, "exit": 0}
             for role, digest in (("app", app), ("migrate", migrate))
         },
-        "remote": {
-            role: {
-                "digest": digest,
-                "mediaType": verifier.OCI_INDEX,
-                "body_sha256": digest.split(":", 1)[1],
-                "size": 1024,
-                "header_digest": digest,
-            }
-            for role, digest in (("app", app), ("migrate", migrate))
-        },
+        "remote": remote,
         "pull": {
             role: {"exit": 0, "id": digest}
             for role, digest in (("app", app), ("migrate", migrate))
@@ -416,7 +447,15 @@ class ValidReleaseTests(VerifierTestBase):
         summary["pushed_roles"] = ["migrate", "app"]
         summary["push_attempted_roles"] = ["migrate", "app"]
         references = self.verify(summary=summary)
-        self.assertIn(APP_DIGEST, references["app"])
+        self.assertEqual(
+            references,
+            {
+                role: verifier.TARGETS[role]
+                + "@"
+                + self.descriptor["images"][role]["root_descriptor"]["digest"]
+                for role in verifier.ROLES
+            },
+        )
 
     def test_summary_v1_unknown_root_and_nested_fields_are_ignored(self) -> None:
         summary = self.changed(self.summary)
@@ -845,6 +884,87 @@ class SummaryGateTests(VerifierTestBase):
         summary["remote"]["app"]["digest"] = "sha256:" + "F" * 64
         self.assert_error("summary", "remote-digest", summary=summary)
 
+    def test_remote_records_require_the_known_registry_facts(self) -> None:
+        for role in verifier.ROLES:
+            for field in (
+                "digest",
+                "mediaType",
+                "body_sha256",
+                "size",
+                "header_digest",
+            ):
+                with self.subTest(role=role, field=field):
+                    summary = copy.deepcopy(self.summary)
+                    summary["remote"][role].pop(field)
+                    self.assert_error(
+                        "summary", "remote-keys", summary=summary
+                    )
+
+    def test_remote_records_cross_check_the_descriptor_root(self) -> None:
+        for role in verifier.ROLES:
+            other_role = "migrate" if role == "app" else "app"
+            other_digest = self.descriptor["images"][other_role][
+                "root_descriptor"
+            ]["digest"]
+            cases = (
+                (
+                    "mediaType",
+                    "application/vnd.oci.image.manifest.v1+json",
+                    "remote-media-type",
+                ),
+                ("body_sha256", "9" * 64, "remote-body-sha"),
+                ("size", 4096, "remote-size"),
+                ("header_digest", other_digest, "remote-header-digest"),
+            )
+            for field, value, kind in cases:
+                with self.subTest(role=role, field=field):
+                    summary = copy.deepcopy(self.summary)
+                    summary["remote"][role][field] = value
+                    self.assert_error("summary", kind, summary=summary)
+
+    def test_remote_records_require_canonical_registry_values(self) -> None:
+        cases = (
+            ("mediaType", None, "remote-media-type"),
+            ("mediaType", 1, "remote-media-type"),
+            ("body_sha256", APP_DIGEST, "remote-body-sha"),
+            ("body_sha256", "A" * 64, "remote-body-sha"),
+            ("body_sha256", "a" * 63, "remote-body-sha"),
+            ("size", True, "remote-size"),
+            ("size", 0, "remote-size"),
+            ("size", -1, "remote-size"),
+            ("size", "1024", "remote-size"),
+            ("header_digest", "", "remote-header-digest"),
+            ("header_digest", "sha256:" + "A" * 64, "remote-header-digest"),
+            ("header_digest", "a" * 64, "remote-header-digest"),
+        )
+        for role in verifier.ROLES:
+            for field, value, kind in cases:
+                with self.subTest(role=role, field=field, value=value):
+                    summary = copy.deepcopy(self.summary)
+                    summary["remote"][role][field] = value
+                    self.assert_error("summary", kind, summary=summary)
+
+    def test_remote_records_accept_unknown_v1_fields(self) -> None:
+        summary = self.changed(self.summary)
+        for role in verifier.ROLES:
+            summary["remote"][role]["future_remote_field"] = {
+                "nested": [1, 2, 3]
+            }
+        self.verify(summary=summary)
+
+    def test_remote_body_and_header_cannot_be_swapped_between_roles(self) -> None:
+        for field, kind in (
+            ("body_sha256", "remote-body-sha"),
+            ("header_digest", "remote-header-digest"),
+        ):
+            for role, other_role in (("app", "migrate"), ("migrate", "app")):
+                with self.subTest(field=field, role=role):
+                    summary = copy.deepcopy(self.summary)
+                    summary["remote"][role][field] = summary["remote"][
+                        other_role
+                    ][field]
+                    self.assert_error("summary", kind, summary=summary)
+
     def test_pull_exit_and_id_must_match_the_local_role(self) -> None:
         for bad in (1, -1, True, False, None, "0", 0.0):
             with self.subTest(bad=bad):
@@ -897,6 +1017,14 @@ class SummaryGateTests(VerifierTestBase):
         summary["packages_postcheck"]["app"]["id"] = MIGRATE_PACKAGE_ID
         self.assert_error(
             "summary", "package-original-id", summary=summary
+        )
+
+    def test_package_ids_must_be_unique_across_roles(self) -> None:
+        summary = self.changed(self.summary)
+        for field in ("packages_initial", "packages_postcheck", "packages"):
+            summary[field]["migrate"]["id"] = APP_PACKAGE_ID
+        self.assert_error(
+            "summary", "package-id-duplicate", summary=summary
         )
 
     def test_optional_packages_projection_is_checked_against_postcheck(
@@ -1326,6 +1454,69 @@ class CliTests(unittest.TestCase):
             "release-verification-failed: input/release-run-id\n",
         )
         self.assertEqual(result.stdout, "")
+
+
+class _FailingLoader:
+    """Source loader stub whose ``exec_module`` raises a supplied exception."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    def create_module(self, spec: Any) -> None:
+        return None
+
+    def exec_module(self, module: Any) -> None:
+        raise self._error
+
+
+class OnlineModuleLoaderTests(unittest.TestCase):
+    """Direct regressions for ``_load_online_module`` failure cleanup."""
+
+    def _spec(self, error: BaseException) -> Any:
+        spec = importlib.util.spec_from_loader(
+            verifier.ONLINE_SOURCE_MODULE_NAME, _FailingLoader(error)
+        )
+        self.assertIsNotNone(spec)
+        return spec
+
+    def test_keyboard_interrupt_propagates_and_drops_partial_module(
+        self,
+    ) -> None:
+        name = verifier.ONLINE_SOURCE_MODULE_NAME
+        spec = self._spec(KeyboardInterrupt())
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop(name, None)
+            with mock.patch.object(
+                importlib.util,
+                "spec_from_file_location",
+                return_value=spec,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    verifier._load_online_module()
+            self.assertNotIn(name, sys.modules)
+
+    def test_module_execution_error_is_fixed_and_drops_partial_module(
+        self,
+    ) -> None:
+        name = verifier.ONLINE_SOURCE_MODULE_NAME
+        canary = "CANARY-sensitive-loader-value"
+        spec = self._spec(RuntimeError(canary))
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop(name, None)
+            with mock.patch.object(
+                importlib.util,
+                "spec_from_file_location",
+                return_value=spec,
+            ):
+                with self.assertRaises(verifier.VerificationError) as caught:
+                    verifier._load_online_module()
+            self.assertNotIn(name, sys.modules)
+        self.assertEqual(
+            (caught.exception.stage, caught.exception.kind),
+            ("source", "verification"),
+        )
+        self.assertEqual(str(caught.exception), "source/verification")
+        self.assertNotIn(canary, str(caught.exception))
 
 
 class OnlineCliTests(unittest.TestCase):

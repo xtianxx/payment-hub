@@ -18,10 +18,19 @@ digest-pinned references from the offline verifier.
 The complete operation runs under one absolute ``SIGALRM`` wall deadline that
 covers API headers and bodies, the signed storage transfer, ZIP inspection,
 and offline verification.  Socket timeouts alone are inactivity limits and
-cannot bound a server that keeps sending bytes slowly.  Platforms or threads
-without ``SIGALRM`` fail closed with ``verify/deadline-unsupported``; an
-already-active ``ITIMER_REAL`` is never taken over and fails closed with
-``verify/deadline-conflict``.  The guard is never silently dropped.
+cannot bound a server that keeps sending bytes slowly.  Entry fails closed
+with ``verify/deadline-unsupported`` on platforms or threads without usable
+``SIGALRM``, when ``SIGALRM`` is blocked in the calling thread, or when the
+handler cannot be installed.  An already-active ``ITIMER_REAL`` and a
+concurrent in-process verification are never merged or waited for; both fail
+closed with ``verify/deadline-conflict``.  The guard is never silently
+dropped.
+
+A module-level lock serializes this module's own verifications, but it cannot
+serialize against unrelated components that concurrently change the
+process-level ``SIGALRM`` handler or timer.  That external mutation remains a
+known boundary: the guard detects a handler replaced while it is installed
+and leaves that external state untouched instead of overwriting it.
 
 Every GitHub API response is parsed once by a thin wrapper that rejects
 duplicate object keys, non-finite JSON constants, and excessive recursion
@@ -105,6 +114,7 @@ _SOURCE_SHA_RE = re.compile(r"[0-9a-f]{40}")
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]{8,512}")
 _SAFE_CATEGORY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
+_DEADLINE_LOCK = threading.Lock()
 
 _ALLOWED_CHECKER_FAILURES = {
     "env": {"token"},
@@ -243,11 +253,14 @@ class _WallDeadline:
     exchange indefinitely.  Signal handlers are process-wide and delivered to
     the main thread, so installing this guard from any other thread fails
     closed as ``verify/deadline-unsupported`` before any signal state is
-    touched.  An already-active ``ITIMER_REAL``, whether one-shot or periodic,
-    is never replaced or merged: that fails closed as
-    ``verify/deadline-conflict`` and leaves the caller's handler and timer
-    untouched.  Only signal state this guard successfully acquired is
-    restored on exit.
+    touched.  A calling-thread mask that blocks ``SIGALRM`` also fails closed
+    as ``verify/deadline-unsupported`` without changing that mask.  An
+    already-active ``ITIMER_REAL``, whether one-shot or periodic, is never
+    replaced or merged: that fails closed as ``verify/deadline-conflict`` and
+    leaves the caller's handler and timer untouched.  Only signal state this
+    guard successfully acquired is restored on exit, and only while its own
+    installed handler is still the current one; a handler replaced by other
+    code is never overwritten.
 
     Platforms without ``SIGALRM`` fail closed as
     ``verify/deadline-unsupported`` rather than silently dropping the guard.
@@ -263,6 +276,7 @@ class _WallDeadline:
         self.stage = stage
         self.kind = kind
         self.old_handler: Any = None
+        self.installed_handler: Any = None
         self.handler_owned = False
         self.timer_owned = False
         self.installed = False
@@ -278,6 +292,20 @@ class _WallDeadline:
             )
         if self.seconds <= 0:
             raise VerificationError(self.stage, self.kind)
+        pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+        if pthread_sigmask is not None:
+            try:
+                blocked = pthread_sigmask(signal.SIG_BLOCK, [])
+            except (AttributeError, OSError, ValueError):
+                raise VerificationError(
+                    self.stage, "deadline-unsupported"
+                ) from None
+            if signal.SIGALRM in blocked:
+                # Never unmask the caller's SIGALRM: their handler could not
+                # be guaranteed to be ours while the guard is active.
+                raise VerificationError(
+                    self.stage, "deadline-unsupported"
+                )
         try:
             old_handler = signal.getsignal(signal.SIGALRM)
             old_remaining, old_interval = signal.getitimer(signal.ITIMER_REAL)
@@ -288,8 +316,9 @@ class _WallDeadline:
         if old_remaining > 0 or old_interval > 0:
             raise VerificationError(self.stage, "deadline-conflict")
         self.old_handler = old_handler
+        self.installed_handler = self._handler
         try:
-            signal.signal(signal.SIGALRM, self._handler)
+            signal.signal(signal.SIGALRM, self.installed_handler)
         except (AttributeError, OSError, ValueError):
             raise VerificationError(
                 self.stage, "deadline-unsupported"
@@ -312,19 +341,38 @@ class _WallDeadline:
     def _handler(self, _signum: int, _frame: Any) -> None:
         raise _DeadlineExceeded
 
+    def _owns_signal_state(self) -> bool:
+        try:
+            return (
+                signal.getsignal(signal.SIGALRM) is self.installed_handler
+            )
+        except (AttributeError, OSError, ValueError):
+            return False
+
     def _restore(self) -> None:
-        if self.timer_owned:
-            self.timer_owned = False
-            try:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-            except (AttributeError, OSError, ValueError):
-                pass
-        if self.handler_owned:
-            self.handler_owned = False
-            try:
-                signal.signal(signal.SIGALRM, self.old_handler)
-            except (AttributeError, OSError, ValueError):
-                pass
+        try:
+            if not self._owns_signal_state():
+                # Another component replaced the process-level handler.  Its
+                # handler and timer decision wins; never overwrite them.
+                self.timer_owned = False
+                self.handler_owned = False
+                return
+            if self.timer_owned:
+                self.timer_owned = False
+                try:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                except (AttributeError, OSError, ValueError):
+                    pass
+        finally:
+            # Restore the handler even if clearing the timer raised, including
+            # a signal-delivered ``_DeadlineExceeded`` from that call.
+            if self.handler_owned:
+                self.handler_owned = False
+                if self._owns_signal_state():
+                    try:
+                        signal.signal(signal.SIGALRM, self.old_handler)
+                    except (AttributeError, OSError, ValueError):
+                        pass
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         if not self.installed:
@@ -354,6 +402,11 @@ def _load_script(module_name: str, filename: str) -> Any:
         except Exception:
             sys.modules.pop(module_name, None)
             raise VerificationError("internal", "unexpected") from None
+        except BaseException:
+            # Interrupt-style exits (KeyboardInterrupt, SystemExit) must not
+            # leave the half-initialized module cached for a later call.
+            sys.modules.pop(module_name, None)
+            raise
     except VerificationError:
         raise
     except Exception:
@@ -478,6 +531,41 @@ def _response_body(response: Any) -> bytes:
     if not isinstance(body, bytes):
         raise VerificationError("api", "schema")
     return body
+
+
+_HISTORY_WORKFLOW_STATES = frozenset(
+    {
+        "active",
+        "disabled_manually",
+        "disabled_inactivity",
+        "disabled_fork",
+    }
+)
+
+
+def _workflow_id_for_history(data: Any, expected_path: str) -> int:
+    """Return the workflow ID for an already-completed release or CI run.
+
+    A run stays verifiable after its workflow is disabled; the run and
+    artifact identities are bound separately.  Deleted workflows are reported
+    as not found and unknown states as schema failures.  The path must still
+    name the expected workflow file.
+    """
+
+    if not isinstance(data, Mapping):
+        raise VerificationError("workflow", "schema")
+    workflow_id = _positive_int(data.get("id"), "workflow", "schema")
+    path = data.get("path")
+    state = data.get("state")
+    if not isinstance(path, str) or not isinstance(state, str):
+        raise VerificationError("workflow", "schema")
+    if not ci._path_matches(path, expected_path):
+        raise VerificationError("workflow", "path")
+    if state == "deleted":
+        raise VerificationError("workflow", "not-found")
+    if state not in _HISTORY_WORKFLOW_STATES:
+        raise VerificationError("workflow", "schema")
+    return workflow_id
 
 
 def _parse_release_run(
@@ -1132,32 +1220,41 @@ def verify_online(
     ``verifier`` defaults to the canonical offline verifier, loaded lazily.
     It must expose ``verify_release`` with the same contract.
 
+    Calls within this process are serialized by a deadline guard lock; a
+    concurrent call fails with ``verify/deadline-conflict`` before network
+    access instead of waiting.
+
     Raises :class:`VerificationError` with a fixed ``stage``/``kind`` on every
     failure.  No partial reference mapping is returned.
     """
 
+    if not _DEADLINE_LOCK.acquire(blocking=False):
+        raise VerificationError("verify", "deadline-conflict")
     try:
-        with _WallDeadline(TOTAL_TIMEOUT_SECONDS):
-            return _verify_online(
-                token=token,
-                expected_source_sha=expected_source_sha,
-                release_run_id=release_run_id,
-                release_run_attempt=release_run_attempt,
-                expected_app_digest=expected_app_digest,
-                expected_migrate_digest=expected_migrate_digest,
-                api_transport=api_transport,
-                download_transport=download_transport,
-                verifier=verifier,
-                clock=clock,
-            )
-    except _DeadlineExceeded:
-        raise VerificationError("verify", "deadline") from None
-    except VerificationError:
-        raise
-    except ci.PreflightError as exc:
-        _raise_checker_failure(exc)
-    except Exception:
-        raise VerificationError("internal", "unexpected") from None
+        try:
+            with _WallDeadline(TOTAL_TIMEOUT_SECONDS):
+                return _verify_online(
+                    token=token,
+                    expected_source_sha=expected_source_sha,
+                    release_run_id=release_run_id,
+                    release_run_attempt=release_run_attempt,
+                    expected_app_digest=expected_app_digest,
+                    expected_migrate_digest=expected_migrate_digest,
+                    api_transport=api_transport,
+                    download_transport=download_transport,
+                    verifier=verifier,
+                    clock=clock,
+                )
+        except _DeadlineExceeded:
+            raise VerificationError("verify", "deadline") from None
+        except VerificationError:
+            raise
+        except ci.PreflightError as exc:
+            _raise_checker_failure(exc)
+        except Exception:
+            raise VerificationError("internal", "unexpected") from None
+    finally:
+        _DEADLINE_LOCK.release()
 
 
 def _verify_online(
@@ -1207,7 +1304,7 @@ def _verify_online(
     api = ci.GitHubApi(token, transport=transport, clock=now)
 
     release_workflow = api.workflow(RELEASE_WORKFLOW_PATH)
-    release_workflow_id = ci._workflow_id(
+    release_workflow_id = _workflow_id_for_history(
         release_workflow, RELEASE_WORKFLOW_PATH
     )
 
@@ -1291,7 +1388,7 @@ def _verify_online(
     ci_run_attempt = binding["ci_run_attempt"]
 
     ci_workflow = api.workflow(CI_WORKFLOW_PATH)
-    ci_workflow_id = ci._workflow_id(ci_workflow, CI_WORKFLOW_PATH)
+    ci_workflow_id = _workflow_id_for_history(ci_workflow, CI_WORKFLOW_PATH)
     ci_run_raw = api.run_attempt(ci_run_id, ci_run_attempt)
     ci_repository_id = _validate_ci_run(
         ci_run_raw,

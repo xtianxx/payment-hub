@@ -294,6 +294,8 @@ class ReleaseConsumabilityIntegrationTests(SUPPORT.ReleaseTestBase):
         files: Mapping[str, Any],
         *,
         run_metadata: bytes | None = None,
+        stage: str | None = None,
+        kind: str | None = None,
         **kwargs: Any,
     ) -> None:
         with self.assertRaises(VERIFY.VerificationError) as caught:
@@ -303,6 +305,10 @@ class ReleaseConsumabilityIntegrationTests(SUPPORT.ReleaseTestBase):
         self.assertIsInstance(error.kind, str)
         self.assertTrue(error.stage)
         self.assertTrue(error.kind)
+        if stage is not None:
+            self.assertEqual(error.stage, stage)
+        if kind is not None:
+            self.assertEqual(error.kind, kind)
 
     # -- positive path ------------------------------------------------------
 
@@ -561,12 +567,15 @@ class ReleaseConsumabilityIntegrationTests(SUPPORT.ReleaseTestBase):
                 summary = json.loads(delivery["summary"])
                 original = summary["packages_initial"][role]["id"]
                 summary["packages_postcheck"][role]["id"] = original + 1000
+                summary["packages"][role]["id"] = original + 1000
                 files = self._files_from(
                     summary_bytes=_json_bytes(summary),
                     descriptor_bytes=delivery["descriptor"],
                     label="package-id-" + role,
                 )
-                self._assert_rejected(files)
+                self._assert_rejected(
+                    files, stage="summary", kind="package-original-id"
+                )
 
 
 if __name__ == "__main__":

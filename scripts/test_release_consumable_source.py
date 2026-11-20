@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import signal
 import socket
 import ssl
 import stat
@@ -578,12 +579,34 @@ class ReleaseWorkflowRunTests(SourceTestBase):
         run.update(overrides)
         self.fixture.api.routes[RELEASE_RUN_URL] = json_response(run)
 
-    def test_disabled_release_workflow_is_rejected(self) -> None:
-        self._set_release_workflow(state="disabled_manually")
-        self.assert_error("workflow", "disabled")
+    def test_disabled_release_workflow_is_allowed_for_history(self) -> None:
+        for state in (
+            "disabled_manually",
+            "disabled_inactivity",
+            "disabled_fork",
+        ):
+            with self.subTest(state=state):
+                self._set_release_workflow(state=state)
+                self.verify()
+
+    def test_deleted_release_workflow_is_not_found(self) -> None:
+        self._set_release_workflow(state="deleted")
+        self.assert_error("workflow", "not-found")
+
+    def test_unknown_release_workflow_state_is_schema(self) -> None:
+        self._set_release_workflow(state="archived")
+        self.assert_error("workflow", "schema")
 
     def test_release_workflow_path_mismatch_is_rejected(self) -> None:
         self._set_release_workflow(path=source.CI_WORKFLOW_PATH)
+        self.assert_error("workflow", "path")
+
+    def test_deleted_release_workflow_with_wrong_path_reports_path(
+        self,
+    ) -> None:
+        self._set_release_workflow(
+            state="deleted", path=source.CI_WORKFLOW_PATH
+        )
         self.assert_error("workflow", "path")
 
     def test_release_run_wrong_workflow_id(self) -> None:
@@ -1002,7 +1025,11 @@ class SignedHttpsTransportTests(unittest.TestCase):
         self.assertTrue(connection.closed)
         method, target, headers = connection.requests[0]
         self.assertEqual(method, "GET")
-        self.assertTrue(target.startswith("/actions-results/"))
+        self.assertEqual(
+            target,
+            "/actions-results/run/artifact.zip"
+            "?sv=2024-01-01&sig=secret-signature",
+        )
         lowered = {name.lower(): value for name, value in headers.items()}
         self.assertNotIn("authorization", lowered)
         self.assertNotIn("cookie", lowered)
@@ -1070,6 +1097,7 @@ class SignedHttpsTransportTests(unittest.TestCase):
         )
         self.assertTrue(response.read_sizes)
         self.assertLessEqual(max(response.read_sizes), 65536)
+        self.assertEqual(response.offset, source.MAX_ARCHIVE_BYTES + 1)
 
     def test_declared_length_mismatch_is_rejected(self) -> None:
         response = _FakeStorageResponse(
@@ -1292,9 +1320,27 @@ class CiSourceTests(SourceTestBase):
         workflow.update(overrides)
         self.fixture.api.routes[CI_WORKFLOW_URL] = json_response(workflow)
 
-    def test_disabled_ci_workflow_is_rejected(self) -> None:
-        self._set_ci_workflow(state="disabled_manually")
-        self.assert_error("workflow", "disabled")
+    def test_disabled_ci_workflow_is_allowed_for_history(self) -> None:
+        for state in (
+            "disabled_manually",
+            "disabled_inactivity",
+            "disabled_fork",
+        ):
+            with self.subTest(state=state):
+                self._set_ci_workflow(state=state)
+                self.verify()
+
+    def test_deleted_ci_workflow_is_not_found(self) -> None:
+        self._set_ci_workflow(state="deleted")
+        self.assert_error("workflow", "not-found")
+
+    def test_unknown_ci_workflow_state_is_schema(self) -> None:
+        self._set_ci_workflow(state="archived")
+        self.assert_error("workflow", "schema")
+
+    def test_ci_workflow_path_mismatch_is_rejected(self) -> None:
+        self._set_ci_workflow(path=source.RELEASE_WORKFLOW_PATH)
+        self.assert_error("workflow", "path")
 
     def test_ci_run_wrong_workflow_id(self) -> None:
         self._set_ci_run(workflow_id=RELEASE_WORKFLOW_ID)
@@ -1443,6 +1489,52 @@ class ApiJsonStrictnessTests(SourceTestBase):
         self.assert_error("api", "server-error")
 
 
+class ModuleLoadingTests(unittest.TestCase):
+    def _load_with_loader(self, module_name: str, error: BaseException) -> None:
+        sys.modules.pop(module_name, None)
+        spec = importlib.util.spec_from_file_location(
+            module_name, source._SCRIPT_DIR / "release_consumable_source.py"
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        with mock.patch.object(
+            spec.loader, "exec_module", side_effect=error
+        ):
+            with mock.patch.object(
+                source.importlib.util,
+                "spec_from_file_location",
+                return_value=spec,
+            ):
+                source._load_script(
+                    module_name, "release_consumable_source.py"
+                )
+
+    def test_interrupted_module_load_leaves_no_partial_module(self) -> None:
+        module_name = "payment_hub_release_consumable_interrupted_test"
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self._load_with_loader(module_name, KeyboardInterrupt())
+        finally:
+            self.assertNotIn(module_name, sys.modules)
+            sys.modules.pop(module_name, None)
+
+    def test_ordinary_module_failure_is_sanitized_and_removed(self) -> None:
+        module_name = "payment_hub_release_consumable_failure_test"
+        try:
+            with self.assertRaises(source.VerificationError) as caught:
+                self._load_with_loader(
+                    module_name, RuntimeError("secret-loader-failure")
+                )
+            self.assertEqual(
+                (caught.exception.stage, caught.exception.kind),
+                ("internal", "unexpected"),
+            )
+            self.assertNotIn("secret", str(caught.exception))
+        finally:
+            self.assertNotIn(module_name, sys.modules)
+            sys.modules.pop(module_name, None)
+
+
 class WallDeadlineTests(SourceTestBase):
     def _install_main_timer(
         self, delay: float, interval: float = 0.0
@@ -1533,16 +1625,91 @@ class WallDeadlineTests(SourceTestBase):
         finally:
             self._restore_main_timer(old_handler)
 
+    @unittest.skipUnless(
+        hasattr(signal, "pthread_sigmask") and hasattr(signal, "SIGALRM"),
+        "pthread_sigmask is unavailable",
+    )
+    def test_blocked_sigalrm_fails_closed_without_unblocking(self) -> None:
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        try:
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK, old_mask | {signal.SIGALRM}
+            )
+            self.assert_error("verify", "deadline-unsupported")
+            self.assertEqual(self.fixture.api.calls, [])
+            self.assertIn(
+                signal.SIGALRM,
+                signal.pthread_sigmask(signal.SIG_BLOCK, []),
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+    def test_concurrent_verification_is_rejected_without_network(self) -> None:
+        acquired = source._DEADLINE_LOCK.acquire(blocking=False)
+        self.assertTrue(acquired)
+        try:
+            self.assert_error("verify", "deadline-conflict")
+            self.assertEqual(self.fixture.api.calls, [])
+            self.assertEqual(self.fixture.download.calls, [])
+        finally:
+            source._DEADLINE_LOCK.release()
+        self.assertFalse(source._DEADLINE_LOCK.locked())
+
+    def test_timer_cleanup_failure_still_restores_handler(self) -> None:
+        old_handler = source.signal.getsignal(source.signal.SIGALRM)
+        deadline = source._WallDeadline(60.0)
+        with mock.patch.object(
+            source.signal,
+            "setitimer",
+            side_effect=[None, source._DeadlineExceeded()],
+        ):
+            with self.assertRaises(source._DeadlineExceeded):
+                with deadline:
+                    pass
+        self.assertIs(
+            source.signal.getsignal(source.signal.SIGALRM), old_handler
+        )
+
+    def test_externally_replaced_handler_is_left_untouched(self) -> None:
+        old_handler = source.signal.getsignal(source.signal.SIGALRM)
+        deadline = source._WallDeadline(60.0)
+        deadline.__enter__()
+        external_handler = lambda _signum, _frame: None
+        source.signal.signal(source.signal.SIGALRM, external_handler)
+        try:
+            with mock.patch.object(
+                source.signal, "setitimer", wraps=source.signal.setitimer
+            ) as setitimer_mock:
+                with mock.patch.object(
+                    source.signal, "signal", wraps=source.signal.signal
+                ) as signal_mock:
+                    deadline.__exit__(None, None, None)
+                setitimer_mock.assert_not_called()
+                signal_mock.assert_not_called()
+            self.assertIs(
+                source.signal.getsignal(source.signal.SIGALRM),
+                external_handler,
+            )
+        finally:
+            source.signal.setitimer(source.signal.ITIMER_REAL, 0)
+            source.signal.signal(source.signal.SIGALRM, old_handler)
+
     def test_continuous_download_body_cannot_outlive_wall_deadline(self) -> None:
         class EndlessResponse:
             status = 200
+
+            def __init__(self) -> None:
+                self.limit = time.monotonic() + 5.0
 
             @staticmethod
             def getheaders() -> list[tuple[str, str]]:
                 return []
 
-            @staticmethod
-            def read(_size: int) -> bytes:
+            def read(self, _size: int) -> bytes:
+                if time.monotonic() >= self.limit:
+                    raise AssertionError(
+                        "wall deadline did not interrupt the download"
+                    )
                 time.sleep(0.01)
                 return b"x"
 
@@ -1573,37 +1740,61 @@ class WallDeadlineTests(SourceTestBase):
 
     def test_slow_api_response_cannot_outlive_wall_deadline(self) -> None:
         class SlowApiTransport:
-            def get(self, _url: str, _token: str, _timeout: float) -> Any:
-                while True:
-                    time.sleep(0.01)
+            def __init__(self) -> None:
+                self.entered = False
 
+            def get(self, _url: str, _token: str, _timeout: float) -> Any:
+                self.entered = True
+                limit = time.monotonic() + 5.0
+                while time.monotonic() < limit:
+                    time.sleep(0.01)
+                raise AssertionError(
+                    "wall deadline did not interrupt the slow API request"
+                )
+
+        transport = SlowApiTransport()
         started = time.monotonic()
         with mock.patch.object(source, "TOTAL_TIMEOUT_SECONDS", 0.3):
             self.assert_error(
-                "verify", "deadline", api_transport=SlowApiTransport()
+                "verify", "deadline", api_transport=transport
             )
         self.assertLess(time.monotonic() - started, 2.0)
+        self.assertTrue(transport.entered)
 
     def test_slow_ci_request_cannot_return_success_after_wall_deadline(self) -> None:
+        state = {"entered": False}
+
         def on_get(url: str) -> None:
             if url == CI_WORKFLOW_URL:
-                while True:
+                state["entered"] = True
+                limit = time.monotonic() + 5.0
+                while time.monotonic() < limit:
                     time.sleep(0.01)
+                raise AssertionError(
+                    "wall deadline did not interrupt the slow CI request"
+                )
 
         self.fixture.api.on_get = on_get
         with mock.patch.object(source, "TOTAL_TIMEOUT_SECONDS", 0.3):
             self.assert_error("verify", "deadline")
+        self.assertTrue(state["entered"])
 
     def test_shared_transport_cannot_swallow_wall_deadline(self) -> None:
         class EndlessResponse:
             status = 200
 
+            def __init__(self) -> None:
+                self.limit = time.monotonic() + 5.0
+
             @staticmethod
             def getheaders() -> list[tuple[str, str]]:
                 return []
 
-            @staticmethod
-            def read(_size: int) -> bytes:
+            def read(self, _size: int) -> bytes:
+                if time.monotonic() >= self.limit:
+                    raise AssertionError(
+                        "wall deadline did not interrupt the shared transport"
+                    )
                 time.sleep(0.01)
                 return b"x"
 
@@ -1622,13 +1813,21 @@ class WallDeadlineTests(SourceTestBase):
         self.assertTrue(connection.closed)
 
     def test_slow_offline_verification_is_covered(self) -> None:
+        state = {"entered": False}
+
         def slow(*_args: Any, **_kwargs: Any) -> Any:
-            while True:
+            state["entered"] = True
+            limit = time.monotonic() + 5.0
+            while time.monotonic() < limit:
                 time.sleep(0.01)
+            raise AssertionError(
+                "wall deadline did not interrupt offline verification"
+            )
 
         verifier = types.SimpleNamespace(verify_release=slow)
         with mock.patch.object(source, "TOTAL_TIMEOUT_SECONDS", 0.3):
             self.assert_error("verify", "deadline", verifier=verifier)
+        self.assertTrue(state["entered"])
 
     def test_unsupported_wall_deadline_fails_closed(self) -> None:
         with mock.patch.object(
