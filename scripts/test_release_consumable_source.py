@@ -1676,14 +1676,46 @@ class WallDeadlineTests(SourceTestBase):
             ):
                 with mock.patch.object(
                     source.signal,
-                    "setitimer",
-                    wraps=source.signal.setitimer,
-                ) as setitimer_mock:
-                    deadline.__enter__()
-                    deadline.__exit__(None, None, None)
-                setitimer_mock.assert_any_call(
-                    source.signal.ITIMER_REAL, 0
-                )
+                    "getitimer",
+                    side_effect=[(0.0, 0.0), (60.0, 0.0)],
+                ):
+                    with mock.patch.object(
+                        source.signal, "setitimer"
+                    ) as setitimer_mock:
+                        deadline.__enter__()
+                        deadline.__exit__(None, None, None)
+                    setitimer_mock.assert_any_call(
+                        source.signal.ITIMER_REAL, 0
+                    )
+            self.assertIs(
+                source.signal.getsignal(source.signal.SIGALRM), old_handler
+            )
+        finally:
+            source.signal.setitimer(source.signal.ITIMER_REAL, 0)
+            source.signal.signal(source.signal.SIGALRM, old_handler)
+
+    def test_timer_cleanup_survives_interrupt_after_arming(self) -> None:
+        old_handler = source.signal.getsignal(source.signal.SIGALRM)
+        deadline = source._WallDeadline(60.0)
+        try:
+            with mock.patch.object(
+                source.time,
+                "monotonic",
+                side_effect=[0.0, KeyboardInterrupt(), 0.0, 0.0],
+            ):
+                with mock.patch.object(
+                    source.signal,
+                    "getitimer",
+                    side_effect=[(0.0, 0.0), (60.0, 0.0)],
+                ):
+                    with mock.patch.object(
+                        source.signal, "setitimer"
+                    ) as setitimer_mock:
+                        with self.assertRaises(KeyboardInterrupt):
+                            deadline.__enter__()
+                    setitimer_mock.assert_any_call(
+                        source.signal.ITIMER_REAL, 0
+                    )
             self.assertIs(
                 source.signal.getsignal(source.signal.SIGALRM), old_handler
             )

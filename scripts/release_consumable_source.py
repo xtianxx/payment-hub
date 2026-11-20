@@ -344,11 +344,16 @@ class _WallDeadline:
         self.timer_owned = True
         try:
             before = time.monotonic()
+            # Establish a cleanup boundary before arming the timer.  If the
+            # post-arm sample is interrupted, the upper bound stays open
+            # enough to identify this guard's own timer, while a previously
+            # short external timer remains below the lower bound.
+            self.deadline_low = before + self.seconds
+            self.deadline_high = float("inf")
             try:
                 signal.setitimer(signal.ITIMER_REAL, self.seconds)
             finally:
                 after = time.monotonic()
-                self.deadline_low = before + self.seconds
                 self.deadline_high = after + self.seconds
         except (AttributeError, OSError, ValueError):
             self._restore()
