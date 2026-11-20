@@ -125,6 +125,79 @@ app标签仍可能已经被匿名读取；失败不会隐藏、撤销或自动�
 也不新增自动部署或原子发布服务。
 不满足上述条件时只能保留诊断和部分副作用记录，等待负责人另行处置。
 
+#### 发布消费验收工具
+
+正常发布成功后，同一 `release-summary-<run_id>-<attempt>` Actions artifact
+保留原有 `release-summary.json`，并归档原始 `descriptor.json` 和
+`release-evidence.json`。交接记录绑定发布 run/attempt、预期源码、源 CI 候选及其
+descriptor 摘要；摘要记录实际核验到的包 owner。诊断用的失败摘要不是消费凭证，
+初始化也不会生成这份配对凭证。历史运行若缺少这些证据，不能自动视作通过。
+
+`scripts/verify-release-consumable.py` 只有在四条消费判据均成立时才输出两条
+`镜像名@sha256:…` 引用。可提供独立预期的 app 和 migrate digest，必须成对提供，
+并且分别匹配自己的角色。离线模式只证明输入文件彼此一致，不能证明它们来自
+GitHub，也不能把本地自填的运行元数据当成发布凭证。
+
+在线取证须独立提供预期源码 SHA、发布 run ID 和 attempt，不从摘要反推预期值。
+先从独立来源填写下列变量；示例使用带引号变量，避免 Bash 把 `<…>` 当作重定向：
+
+```bash
+SOURCE_SHA="<40位源码SHA>"
+RELEASE_RUN_ID="<发布run-id>"
+RELEASE_RUN_ATTEMPT="<attempt>"
+
+python3 -B scripts/verify-release-consumable.py --online \
+  --expected-source-sha "$SOURCE_SHA" \
+  --release-run-id "$RELEASE_RUN_ID" \
+  --release-run-attempt "$RELEASE_RUN_ATTEMPT"
+```
+
+凭据仅从 `GH_TOKEN`（优先）或 `GITHUB_TOKEN` 环境变量读取，不放进命令行。
+凭据需要能只读访问该仓库的 Actions 运行和 artifact；
+本工具不需要 `write:packages`，也不使用发布专用的包审计凭据。
+在线模式按指定 attempt 的完整 artifact 名选择唯一 ID，验证下载 ZIP 的 API 摘要，
+再核对该发布及其交接记录指定的源 CI run/attempt 和 bundle artifact 身份。
+缺失、过期、重名、摘要或来源不符均失败，不回退到旧 attempt 或其他候选。
+签名下载地址不输出；存储端请求不携带 GitHub bearer token。
+在线取证在支持 `SIGALRM` 的主线程中运行，整次操作有 90 秒 Python 层时限；
+阻塞在原生调用（例如系统域名解析）时，信号处理要等该调用返回，实际退出
+可能超过 90 秒。不支持该机制的平台或线程会直接拒绝，不降级为仅有 socket
+空闲超时。
+若调用进程已有活动的 `ITIMER_REAL` 计时器，或主线程屏蔽了 `SIGALRM`，
+在线接口同样拒绝执行，不接管、清除或解除调用方的信号状态。无法通过
+Python 恢复的 `SIGALRM` handler（`getsignal` 返回 `None`）也会被拒绝。
+同一进程内并发的在线验收会被拒绝。外部组件仍不应与验收过程同时修改
+进程级 `SIGALRM` 状态；工具只能尽力避免覆盖已经检测到的 handler 和计时器。
+在线验收不要求发布或 CI workflow 当前处于启用状态，但路径不符、已删除或
+无法读取仍会拒绝。
+签名地址仅接受 HTTPS 的 GitHubusercontent 或 Azure Blob 固定主机域；
+若 GitHub 更换存储域名，工具会拒绝，需要先审查并更新允许列表。
+
+离线复核使用四份本地文件，其中运行元数据应是指定 attempt API 的原始 JSON 对象：
+
+```bash
+python3 -B scripts/verify-release-consumable.py \
+  --summary release-summary.json --descriptor descriptor.json \
+  --evidence release-evidence.json --run-metadata run-attempt.json \
+  --expected-source-sha "$SOURCE_SHA" \
+  --release-run-id "$RELEASE_RUN_ID" \
+  --release-run-attempt "$RELEASE_RUN_ATTEMPT"
+```
+
+两种模式都可追加 `--expected-app-digest sha256:<64位摘要>` 和
+`--expected-migrate-digest sha256:<64位摘要>`；必须成对，且不能交换角色。
+成功输出 `mode=online` 或 `mode=offline` 以及 `app=`、`migrate=` 固定引用；
+失败非零退出，仅输出脱敏分类，不输出部分镜像对。
+`mode=online` 表示完成 GitHub 来源核验，不是独立签名或实时 GHCR 探测；
+`mode=offline` 仅表示输入一致。
+证据包不含 `pair.tar`，消费者不重新计算其归档字节摘要，也不重新执行镜像验收。
+工具信任仓库及 GitHub Actions 运行与 artifact 的权限边界，不防御拥有相应权限者
+对整套工作流和证据的恶意替换。
+
+CI 只执行验证器的离线回归，不要求 PR 或 `main` 已经发布，不新增分支保护门禁。
+真正消费时，凭证通过后仍须以输出的 digest 拉取同一对镜像；凭证不是实时
+GHCR 可用性检测，不触发拉取、数据库迁移或部署，也不授予这些动作的权限。
+
 ### 暂停创建策略的上线与发布检查清单
 
 以下是操作门禁，不是新增的平台锁或自动取消功能。合并只影响后续使用新提交的运行，

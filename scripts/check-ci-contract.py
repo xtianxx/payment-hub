@@ -550,6 +550,7 @@ RELEASE_UPLOAD_STEP_NAMES = (
     "Verify release handoff",
     "Require successful main CI",
     "Publish paired images",
+    "Write release evidence",
     "Upload release summary",
 )
 RELEASE_AUDIT_SECRET_NAME = "GHCR_PACKAGE_AUDIT_TOKEN"
@@ -650,9 +651,151 @@ bash scripts/release.sh --stage publish \\
 RELEASE_SUMMARY_NAME = (
     "release-summary-${{ github.run_id }}-${{ github.run_attempt }}"
 )
-RELEASE_SUMMARY_PATH = (
-    "${{ runner.temp }}/payment-hub-release-publish/release-summary.json"
+RELEASE_EVIDENCE_STEP_NAME = "Write release evidence"
+RELEASE_EVIDENCE_SCHEMA = "payment-hub.release-evidence.v1"
+RELEASE_EVIDENCE_ENV = {
+    "SOURCE_SHA": "${{ github.sha }}",
+    "RELEASE_RUN_ID": "${{ github.run_id }}",
+    "RELEASE_RUN_ATTEMPT": "${{ github.run_attempt }}",
+    "CI_RUN_ID": "${{ needs.resolve-candidate.outputs.ci_run_id }}",
+    "CI_RUN_ATTEMPT": (
+        "${{ needs.resolve-candidate.outputs.ci_run_attempt }}"
+    ),
+    "BUNDLE_ARTIFACT_ID": (
+        "${{ needs.resolve-candidate.outputs.bundle_artifact_id }}"
+    ),
+    "BUNDLE_ARTIFACT_DIGEST": (
+        "${{ needs.resolve-candidate.outputs.bundle_artifact_digest }}"
+    ),
+    "EXPECTED_DESCRIPTOR_SHA": (
+        "${{ needs.resolve-candidate.outputs.descriptor_sha256 }}"
+    ),
+    "REPOSITORY": "${{ github.repository }}",
+}
+RELEASE_EVIDENCE_RUN = r"""set -euo pipefail
+python3 -I - "$SOURCE_SHA" "$RELEASE_RUN_ID" "$RELEASE_RUN_ATTEMPT" "$CI_RUN_ID" "$CI_RUN_ATTEMPT" "$BUNDLE_ARTIFACT_ID" "$BUNDLE_ARTIFACT_DIGEST" "$EXPECTED_DESCRIPTOR_SHA" "$REPOSITORY" <<'PY'
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+TRUSTED_REPOSITORY = "xtianxx/payment-hub"
+EVIDENCE_SCHEMA = "payment-hub.release-evidence.v1"
+MAX_DESCRIPTOR_BYTES = 64 * 1024
+DESCRIPTOR_SOURCE = Path("payment-hub-release-bundle") / "descriptor.json"
+PUBLISH_ROOT = Path("payment-hub-release-publish")
+SUMMARY_FILE = "release-summary.json"
+DESCRIPTOR_FILE = "descriptor.json"
+EVIDENCE_FILE = "release-evidence.json"
+def fail(message):
+    print("::error::" + message)
+    raise SystemExit(1)
+def positive(value):
+    if re.fullmatch(r"[1-9][0-9]*", value) is None:
+        fail("release evidence requires a positive decimal identifier")
+    return int(value)
+def write_exclusive(path, data):
+    try:
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+    except OSError:
+        fail("release evidence destination is unavailable")
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        fail("release evidence write failed")
+def main():
+    if len(sys.argv) != 10:
+        fail("release evidence arguments are incomplete")
+    (
+        source_sha,
+        release_run_id,
+        release_run_attempt,
+        ci_run_id,
+        ci_run_attempt,
+        bundle_artifact_id,
+        bundle_artifact_digest,
+        descriptor_sha256,
+        repository,
+    ) = sys.argv[1:]
+    if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+        fail("release evidence requires a 40-hex source SHA")
+    if repository != TRUSTED_REPOSITORY:
+        fail("release evidence requires the trusted repository")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", bundle_artifact_digest) is None:
+        fail("release evidence requires a canonical bundle artifact digest")
+    if re.fullmatch(r"[0-9a-f]{64}", descriptor_sha256) is None:
+        fail("release evidence requires a bare 64-hex descriptor digest")
+    evidence = {
+        "schema": EVIDENCE_SCHEMA,
+        "repository": TRUSTED_REPOSITORY,
+        "source_sha": source_sha,
+        "release_run_id": positive(release_run_id),
+        "release_run_attempt": positive(release_run_attempt),
+        "ci_run_id": positive(ci_run_id),
+        "ci_run_attempt": positive(ci_run_attempt),
+        "bundle_artifact_id": positive(bundle_artifact_id),
+        "bundle_artifact_digest": bundle_artifact_digest,
+        "descriptor_sha256": descriptor_sha256,
+    }
+    runner_temp = os.environ.get("RUNNER_TEMP", "")
+    if not runner_temp or not os.path.isabs(runner_temp):
+        fail("release evidence requires an absolute RUNNER_TEMP")
+    root = Path(runner_temp) / PUBLISH_ROOT
+    source = Path(runner_temp) / DESCRIPTOR_SOURCE
+    summary = root / SUMMARY_FILE
+    destination = root / DESCRIPTOR_FILE
+    evidence_path = root / EVIDENCE_FILE
+    try:
+        root_info = root.lstat()
+        summary_info = summary.lstat()
+        source_info = source.lstat()
+    except OSError:
+        fail("release evidence inputs are missing")
+    if (
+        root.is_symlink()
+        or not stat.S_ISDIR(root_info.st_mode)
+        or summary.is_symlink()
+        or not stat.S_ISREG(summary_info.st_mode)
+        or source.is_symlink()
+        or not stat.S_ISREG(source_info.st_mode)
+    ):
+        fail("release evidence inputs are not regular files")
+    if source_info.st_size <= 0 or source_info.st_size > MAX_DESCRIPTOR_BYTES:
+        fail("downloaded descriptor size is invalid")
+    try:
+        original = source.read_bytes()
+    except OSError:
+        fail("downloaded descriptor cannot be read")
+    if hashlib.sha256(original).hexdigest() != descriptor_sha256:
+        fail("downloaded descriptor does not match the trusted digest")
+    write_exclusive(destination, original)
+    try:
+        copied = destination.read_bytes()
+        original_after = source.read_bytes()
+    except OSError:
+        fail("copied descriptor cannot be read")
+    if hashlib.sha256(copied).hexdigest() != descriptor_sha256:
+        fail("copied descriptor does not match the trusted digest")
+    if hashlib.sha256(original_after).hexdigest() != descriptor_sha256:
+        fail("downloaded descriptor changed during copy")
+    text = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+    write_exclusive(evidence_path, text.encode("utf-8"))
+if __name__ == "__main__":
+    main()
+PY"""
+RELEASE_SUMMARY_FILES = (
+    "${{ runner.temp }}/payment-hub-release-publish/release-summary.json",
+    "${{ runner.temp }}/payment-hub-release-publish/descriptor.json",
+    "${{ runner.temp }}/payment-hub-release-publish/release-evidence.json",
 )
+RELEASE_SUMMARY_PATH = "\n".join(RELEASE_SUMMARY_FILES)
 RELEASE_CI_GATE_SUMMARY = (
     "${{ runner.temp }}/payment-hub-ci-gate/ci-preflight.json"
 )
@@ -2544,6 +2687,50 @@ def validate_release_workflow(
             ):
                 if token in run:
                     add("release-publish-unsafe")
+        evidence = _find_step(upload, RELEASE_EVIDENCE_STEP_NAME)
+        if evidence is None:
+            add("release-evidence-missing")
+        else:
+            if set(evidence) != {"name", "shell", "env", "run"}:
+                add("release-evidence-shape")
+            if evidence.get("shell") != "bash":
+                add("release-evidence-shell")
+            if "if" in evidence or "continue-on-error" in evidence:
+                add("release-evidence-skip")
+            if evidence.get("env") != RELEASE_EVIDENCE_ENV:
+                add("release-evidence-env")
+            if evidence.get("run", "").strip() != RELEASE_EVIDENCE_RUN.strip():
+                add("release-evidence-run")
+            run = evidence.get("run", "")
+            for token in (
+                "set -euo pipefail",
+                "python3 -I -",
+                RELEASE_EVIDENCE_SCHEMA,
+                "xtianxx/payment-hub",
+                "os.O_EXCL",
+                "hashlib.sha256",
+                "release-summary.json",
+                "descriptor.json",
+                "release-evidence.json",
+                "RUNNER_TEMP",
+            ):
+                if token not in run:
+                    add("release-evidence-run")
+            for token in (
+                "GITHUB_TOKEN",
+                RELEASE_AUDIT_SECRET_NAME,
+                "secrets.",
+                "docker",
+                "ghcr.io",
+                "curl",
+                "wget",
+                "--stage publish",
+                "--stage prepare",
+                "set -x",
+                "printenv",
+            ):
+                if token in run:
+                    add("release-evidence-unsafe")
         summary = _find_step(upload, "Upload release summary")
         if summary is None:
             add("release-summary-missing")
@@ -2563,7 +2750,13 @@ def validate_release_workflow(
                 add("release-summary-with")
             if summary_with.get("name") != RELEASE_SUMMARY_NAME:
                 add("release-summary-name")
-            if summary_with.get("path") != RELEASE_SUMMARY_PATH:
+            summary_path = summary_with.get("path")
+            if summary_path != RELEASE_SUMMARY_PATH:
+                add("release-summary-path")
+            if (
+                not isinstance(summary_path, str)
+                or tuple(summary_path.splitlines()) != RELEASE_SUMMARY_FILES
+            ):
                 add("release-summary-path")
             if summary_with.get("if-no-files-found") != "error":
                 add("release-summary-missing-policy")
@@ -2571,7 +2764,9 @@ def validate_release_workflow(
                 add("release-summary-retention")
             if summary_with.get("include-hidden-files") is not False:
                 add("release-summary-hidden")
-            if "*" in str(summary_with.get("path", "")):
+            if not isinstance(summary_path, str) or any(
+                marker in summary_path for marker in ("*", "?", "[")
+            ):
                 add("release-summary-wildcard")
 
     if isinstance(initialize, dict):
