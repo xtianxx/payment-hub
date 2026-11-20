@@ -12,8 +12,8 @@
 `xtianxx/payment-hub`；否则在准备发布输入、Docker load/login/tag/push前停止。
 缺失分别报告`package/app-absent`或`package/migrate-absent`。
 
-保留`bootstrap_packages`输入、`--bootstrap-packages`参数和摘要的
-`bootstrap_requested`以兼容已有调用，但它们不再授权创建包。
+工作流不再提供`bootstrap_packages`输入；底层仍保留`--bootstrap-packages`参数和摘要的
+`bootstrap_requested`以兼容已有脚本调用，但它们不授权创建包。
 设为true且任一目标缺失时仍失败；两包已满足要求时只执行同样的正常更新。
 缺失判断、空清单`last=0`兼容和只读审计保留，不能将空清单解释为创建许可。
 负责人已明确将两包的目标可见性从private改为public；private和internal包不满足当前策略。
@@ -261,8 +261,8 @@ owner、包可见性、仓库关联、镜像内容和推送前后验证门禁保
 
 ### 正常更新与兼容输入
 
-- **正常发布**：默认`bootstrap_packages=false`；两个目标包必须已存在、为public、属于`xtianxx`并关联`xtianxx/payment-hub`。任一缺失、不可见、元数据不符均失败。
-- **兼容开关**：`bootstrap_packages=true`及publish阶段的`--bootstrap-packages`不再允许创建。两包全缺失或仅一个缺失都失败；两包已存在且有效时仅正常更新。原`publish_authorized=true`、`packages_verified=true`及两个CLI确认参数仍必须满足。
+- **正常发布**：选择`publish`，勾选`packages_verified`并输入`PUBLISH`。两个目标包必须已存在、为public、属于`xtianxx`并关联`xtianxx/payment-hub`。任一缺失、不可见、元数据不符均失败。
+- **兼容参数**：publish脚本仍接受`--bootstrap-packages`，但它不允许创建，也不替代两个CLI确认参数。工作流不再传递它。
 - 不为private、internal、未关联仓库、owner或名称不符的现存包提供豁免。
 - **包与源码仓库的可见性独立**：当前要求GHCR包为public；源码仓库的`repository.private`不决定包自身是否公开，仓库身份仍必须精确匹配。
 - prepare不读取包审计Secret、不查询包，也不接收初始化CLI参数。PR和定时检查不获得包凭据或写权限。
@@ -272,7 +272,7 @@ owner、包可见性、仓库关联、镜像内容和推送前后验证门禁保
 
 正常更新（含设置兼容开关的调用）只允许`xtianxx`发起，并且重跑发起者也必须是`xtianxx`。`github.actor`与`github.triggering_actor`缺失或任一不符时拒绝，不回退为“原调用者曾获批准即可重跑”。此限制不恢复已暂停的初始化创建能力。
 
-prepare首个前置检查明确失败；upload在job条件中复核两项身份，非owner不启动带`packages: write`的作业。脚本在受信上下文检查中再次验证；原有两项主确认仍必须满足，把三个输入均设为true也不能授权创建缺失包。
+手动操作入口在首步校验操作者、前提复选框和与操作匹配的确认词；upload在job条件中复核两项身份，非owner不启动带`packages: write`的作业。脚本在受信上下文检查中再次验证；正常发布不能创建缺失包。
 
 这是owner单人操作授权，不是多人独立审批。本次不配置GitHub Environment或改变仓库权限；受信工作流内的allowlist不能替代平台级Secret隔离，也不授权通过修改其他分支的工作流绕过策略。以后增加发布者或独立审批须另行确认。
 
@@ -355,7 +355,8 @@ main在镜像标签仍存在时从同一对镜像导出四文件bundle，
 镜像移除仅限确认归属的隔离临时daemon，禁止影响普通本地daemon及无关资源。
 
 `release.yml`仍为main人工操作，不执行镜像builder。
-默认`publish`执行正常发布；`initialize-migrate`只在独立三项初始化确认满足时执行，
+默认选择`publish`；两种操作都要确认各自的前提并输入对应的确认词，
+`initialize-migrate`的确认词明确提示首次可能公开。
 两种写入job互斥。初始化只写迁移包，不能作为完整配对发布成功。
 候选解析和真正发布入口前均由`check-main-ci.py`核验同SHA的`ci.yml`最新push/main成功运行，
 并锁定run ID和attempt。精确选取并校验该运行的pointer及bundle artifact ID/digest，

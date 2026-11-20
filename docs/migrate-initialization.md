@@ -21,21 +21,21 @@ public包不能直接改回private，已经被外部下载的内容无法撤回�
 
 ## 与正常发布互斥
 
-`operation`默认是`publish`，初始化确认默认全部关闭。
+`operation`默认是`publish`，前提复选框默认不勾选，操作确认词默认留空。
 两种操作共用只读候选解析，但只有相应的写入job可以执行。
 
 | 输入 | 正常发布 | 初始化迁移包 |
 | --- | --- | --- |
 | `operation` | `publish` | `initialize-migrate` |
-| `publish_authorized` | `true` | `false` |
-| `packages_verified` | `true` | `false` |
-| `bootstrap_packages` | 建议`false`；旧兼容值不创建包 | 必须`false` |
-| `initialize_authorized` | `false` | `true` |
-| `initialization_preconditions_verified` | `false` | `true` |
-| `public_creation_acknowledged` | `false` | `true` |
+| `packages_verified` | 勾选：两包已存在、公开且正确关联 | 勾选：app已公开且正确关联，migrate确实不存在，维护窗口内无其他写者 |
+| `confirmation` | `PUBLISH` | `INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC` |
 
-未知操作、缺少任一初始化确认、同时勾选两种模式的授权、
-或试图用旧bootstrap开关创建包，均拒绝执行。
+初始化确认词同时表示授权本次初始化、知悉首次可能立即公开且无法保证撤回。
+未知操作、未勾选前提或确认词不完全匹配（包括大小写及空白差异）都在候选解析前拒绝。
+门禁直接从工作流事件读取确认词，不把原文放进步骤环境变量或输出日志。
+确认框只用于输入表中的固定文字，不要填凭据。
+旧表单字段不再接受；使用CLI/API触发此工作流的调用方须改用表中三项。
+底层脚本的确认参数不变，复选框不能替代程序复核。
 初始化与正常发布仍要求本仓库main人工触发，原始actor与重跑actor均为`xtianxx`。
 
 正常发布的两包现存、public、owner、仓库关联及原ID门禁不变；

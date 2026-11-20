@@ -371,39 +371,33 @@ NIGHTLY_STEP_NAMES = (
 )
 
 RELEASE_WORKFLOW_NAME = "Manual paired image release / 人工配对镜像发布"
-RELEASE_INPUT_NAMES = (
-    "operation",
-    "publish_authorized",
-    "packages_verified",
+RELEASE_INPUT_NAMES = ("operation", "packages_verified", "confirmation")
+RELEASE_OPERATION_OPTIONS = ("publish", "initialize-migrate")
+RELEASE_CONFIRMATION_WORDS = {
+    "publish": "PUBLISH",
+    "initialize-migrate": "INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC",
+}
+RELEASE_LEGACY_INPUTS = (
     "bootstrap_packages",
+    "publish_authorized",
     "initialize_authorized",
     "initialization_preconditions_verified",
     "public_creation_acknowledged",
 )
-RELEASE_OPERATION_OPTIONS = ("publish", "initialize-migrate")
 RELEASE_INPUT_DESCRIPTIONS = {
     "operation": (
         "Operation: normal paired publish, or migration package initialization only"
     ),
-    "publish_authorized": "Explicit authorization to publish the prepared pair",
     "packages_verified": (
-        "Package preconditions verified for normal publish only (both existing "
-        "public linked packages); not reused by migration initialization"
+        "Package preconditions verified: publish requires both packages existing, "
+        "public and correctly linked; initialize-migrate requires the app already "
+        "public and linked, migrate absent, and no other writer active"
     ),
-    "bootstrap_packages": (
-        "兼容开关：自动创建已暂停；仍要求两包已存在且为public；"
-        "不替代 publish_authorized 或 packages_verified"
-    ),
-    "initialize_authorized": (
-        "Explicit authorization to initialize only the migration package"
-    ),
-    "initialization_preconditions_verified": (
-        "Initialization preconditions verified: app is already public and linked, "
-        "migrate is absent, and no other writer is active"
-    ),
-    "public_creation_acknowledged": (
-        "Acknowledge that first package creation may become public immediately "
-        "and is irreversible; this is not a private guarantee"
+    "confirmation": (
+        "Confirmation word: PUBLISH for normal publish, or "
+        "INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC for initialization; first package "
+        "creation may become public immediately and public content is not "
+        "guaranteed retractable"
     ),
 }
 RELEASE_JOBS = ("resolve-candidate", "upload", "initialize-migrate")
@@ -453,17 +447,9 @@ RELEASE_GATE_ENV = {
     "RELEASE_ACTOR": "${{ github.actor }}",
     "RELEASE_TRIGGERING_ACTOR": "${{ github.triggering_actor }}",
     "OPERATION": "${{ inputs.operation }}",
-    "PUBLISH_AUTHORIZED": "${{ inputs.publish_authorized }}",
     "PACKAGES_VERIFIED": "${{ inputs.packages_verified }}",
-    "BOOTSTRAP_PACKAGES": "${{ inputs.bootstrap_packages }}",
-    "INITIALIZE_AUTHORIZED": "${{ inputs.initialize_authorized }}",
-    "INITIALIZATION_PRECONDITIONS_VERIFIED": (
-        "${{ inputs.initialization_preconditions_verified }}"
-    ),
-    "PUBLIC_CREATION_ACKNOWLEDGED": (
-        "${{ inputs.public_creation_acknowledged }}"
-    ),
 }
+RELEASE_CONFIRMATION_ERROR = "confirmation input is missing or invalid"
 RELEASE_GATE_RUN = """set -euo pipefail
 if [[ "$RELEASE_ACTOR" != "xtianxx" || "$RELEASE_TRIGGERING_ACTOR" != "xtianxx" ]]; then
   echo "::error::owner-only publish requires actor and triggering actor xtianxx"
@@ -487,30 +473,48 @@ if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 case "$OPERATION" in
   publish)
-    if [[ "$PUBLISH_AUTHORIZED" != "true" || "$PACKAGES_VERIFIED" != "true" ]]; then
-      echo "::error::publish requires both manual authorizations"
+    if [[ "$PACKAGES_VERIFIED" != "true" ]]; then
+      echo "::error::publish requires packages_verified=true"
       exit 1
     fi
-    if [[ "$INITIALIZE_AUTHORIZED" != "false" || "$INITIALIZATION_PRECONDITIONS_VERIFIED" != "false" || "$PUBLIC_CREATION_ACKNOWLEDGED" != "false" ]]; then
-      echo "::error::publish requires initialization flags to remain false"
-      exit 1
-    fi
+    expected="PUBLISH"
     ;;
   initialize-migrate)
-    if [[ "$INITIALIZE_AUTHORIZED" != "true" || "$INITIALIZATION_PRECONDITIONS_VERIFIED" != "true" || "$PUBLIC_CREATION_ACKNOWLEDGED" != "true" ]]; then
-      echo "::error::initialize-migrate requires all three initialization authorizations"
+    if [[ "$PACKAGES_VERIFIED" != "true" ]]; then
+      echo "::error::initialize-migrate requires packages_verified=true"
       exit 1
     fi
-    if [[ "$PUBLISH_AUTHORIZED" != "false" || "$PACKAGES_VERIFIED" != "false" || "$BOOTSTRAP_PACKAGES" != "false" ]]; then
-      echo "::error::initialize-migrate requires publish and bootstrap flags to remain false"
-      exit 1
-    fi
+    expected="INITIALIZE-MIGRATE-MAY-BECOME-PUBLIC"
     ;;
   *)
     echo "::error::OPERATION must be publish or initialize-migrate"
     exit 1
     ;;
 esac
+python3 -I - "$expected" <<'PY'
+import json
+import os
+import sys
+def fail():
+    print("::error::confirmation input is missing or invalid")
+    raise SystemExit(1)
+try:
+    expected = sys.argv[1]
+    with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as handle:
+        event = json.load(handle)
+    if not isinstance(event, dict):
+        fail()
+    inputs = event.get("inputs")
+    if not isinstance(inputs, dict):
+        fail()
+    confirmation = inputs.get("confirmation")
+    if not isinstance(confirmation, str) or confirmation != expected:
+        fail()
+except SystemExit:
+    raise
+except Exception:
+    fail()
+PY
 """
 RELEASE_BUNDLE_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 RELEASE_BUNDLE_DIGEST_ERROR = (
@@ -630,21 +634,8 @@ RELEASE_PUBLISH_ENV = {
     "EXPECTED_DESCRIPTOR_SHA": "${{ needs.resolve-candidate.outputs.descriptor_sha256 }}",
     "GITHUB_TOKEN": "${{ github.token }}",
     "GHCR_PACKAGE_AUDIT_TOKEN": RELEASE_AUDIT_SECRET_EXPRESSION,
-    "BOOTSTRAP_PACKAGES": "${{ inputs.bootstrap_packages }}",
 }
 RELEASE_PUBLISH_RUN = """set -euo pipefail
-bootstrap_args=()
-case "$BOOTSTRAP_PACKAGES" in
-  true)
-    bootstrap_args+=(--bootstrap-packages)
-    ;;
-  false)
-    ;;
-  *)
-    echo "::error::BOOTSTRAP_PACKAGES must be true or false"
-    exit 1
-    ;;
-esac
 bash scripts/release.sh --stage publish \\
   --source-sha "$SOURCE_SHA" \\
   --go "$(command -v go)" \\
@@ -654,8 +645,7 @@ bash scripts/release.sh --stage publish \\
   --expected-descriptor-sha256 "$EXPECTED_DESCRIPTOR_SHA" \\
   --approve-external \\
   --package-preconditions-verified \\
-  --prepare-inputs \\
-  "${bootstrap_args[@]}"
+  --prepare-inputs
 """
 RELEASE_SUMMARY_NAME = (
     "release-summary-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -2086,7 +2076,7 @@ def _release_inputs_ok(workflow: dict[str, Any]) -> bool:
     if not isinstance(dispatch, dict) or set(dispatch) != {"inputs"}:
         return False
     inputs = dispatch["inputs"]
-    if not isinstance(inputs, dict) or set(inputs) != set(RELEASE_INPUT_NAMES):
+    if not isinstance(inputs, dict) or tuple(inputs) != RELEASE_INPUT_NAMES:
         return False
     for name in RELEASE_INPUT_NAMES:
         body = inputs.get(name)
@@ -2111,12 +2101,17 @@ def _release_inputs_ok(workflow: dict[str, Any]) -> bool:
                 return False
             if body.get("options") != list(RELEASE_OPERATION_OPTIONS):
                 return False
-        else:
+        elif name == "packages_verified":
             if set(body) != {"description", "required", "default", "type"}:
                 return False
             if body.get("default") is not False:
                 return False
             if body.get("type") != "boolean":
+                return False
+        else:
+            if set(body) != {"description", "required", "type"}:
+                return False
+            if body.get("type") != "string":
                 return False
     return True
 
@@ -2135,6 +2130,11 @@ def validate_release_workflow(
         add("release-workflow-name")
     if not _release_inputs_ok(workflow):
         add("release-workflow-trigger-inputs")
+    for token in RELEASE_LEGACY_INPUTS:
+        if token in text:
+            add("release-legacy-input")
+    if "inputs.confirmation" in text:
+        add("release-confirmation-raw-input")
     if workflow.get("permissions") != {"contents": "read"}:
         add("release-workflow-permissions")
     if workflow.get("concurrency") != RELEASE_CONCURRENCY:
@@ -2524,16 +2524,11 @@ def validate_release_workflow(
                 "--approve-external",
                 "--package-preconditions-verified",
                 "--prepare-inputs",
-                "bootstrap_args=()",
-                'case "$BOOTSTRAP_PACKAGES" in',
-                "bootstrap_args+=(--bootstrap-packages)",
-                '"${bootstrap_args[@]}"',
             ):
                 if token not in run:
                     add("release-publish-run")
-            if run.count("--bootstrap-packages") != 1:
-                add("release-publish-run")
             for token in (
+                "--bootstrap-packages",
                 "secrets.",
                 "GHCR_PACKAGE_AUDIT_TOKEN",
                 "set -x",

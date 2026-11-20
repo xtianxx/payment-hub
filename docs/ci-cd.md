@@ -70,7 +70,7 @@ descriptor SHA。它必须来自选定的可信CI运行，不能把任意本地p
 ## release只提升已验收产物
 
 1. 仅可信仓库的main人工触发；原始及重跑actor均须为`xtianxx`，
-   原有两项发布确认仍必须满足。
+   选择对应操作、勾选包前提并输入匹配的确认词。
 2. 查询当前源码SHA对应`ci.yml`最新push/main运行，要求已经完成且成功。
    PR、nightly、其他SHA、旧成功以及最新失败或进行中的运行不能替代。
 3. 锁定CI run ID和attempt，按精确artifact ID下载对应pointer；
@@ -98,7 +98,7 @@ release不执行builder，也不重新构建镜像来替代丢失、过期或失
 ## 未改变的发布边界
 
 - 两个固定目标必须已经存在、为public、owner和仓库关联正确，原包ID稳定。
-- 缺失包自动创建继续暂停；`bootstrap_packages`只作兼容输入。
+- 正常发布不自动创建缺失包；旧`bootstrap_packages`工作流输入已移除，底层CLI兼容参数仍不授权创建。
 - 独立`initialize-migrate`不是正常发布的自动缺包恢复；
   需要额外初始化、前提及首次可能公开风险确认，仅允许固定迁移包，
   不自动改可见性，摘要始终`published=false`。详见[初始化说明](migrate-initialization.md)。

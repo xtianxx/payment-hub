@@ -521,10 +521,11 @@ builder各构建一次配对镜像并验收原产物，不认证、上传或部�
 |---|---|---|---|
 | `ci.yml` | Format、Vet、Build、Unit、Integration、配对镜像验收、漏洞扫描及CI Gate；main产出候选 | 目标分支为main的PR创建/更新；push main | `contents: read`；仅本仓库push/main上传release候选，无GHCR登录或上传 |
 | `nightly.yml` | 每日漏洞扫描；其他长期实验另行定义 | 每日02:17 UTC（北京时间10:17） | `contents: read`；无候选产出、包凭据或发布 |
-| `release.yml` | 共用可信CI候选，正常发布或仅初始化缺失迁移包；两种写入job互斥 | 仅main人工触发；正常发布需两项确认，初始化需独立授权、前提及首次可能公开风险确认 | 解析只读；正常upload和初始化job才有`packages: write`，audit Secret仅显式进入各自执行步骤；不重建镜像、不自动部署 |
+| `release.yml` | 共用可信CI候选，正常发布或仅初始化缺失迁移包；两种写入job互斥 | 仅main人工触发；勾选对应包前提并输入操作专用确认词，初始化确认词明确提示首次可能公开 | 解析只读；正常upload和初始化job才有`packages: write`，audit Secret仅显式进入各自执行步骤；不重建镜像、不自动部署 |
 
 迁移包初始化的固定目标、真实可见性记录、失败副作用及后续正常发布边界见
-[初始化说明](migrate-initialization.md)。`bootstrap_packages`仍不授权创建；
+[初始化说明](migrate-initialization.md)。旧`bootstrap_packages`工作流输入已移除，
+保留的底层CLI参数不授权创建；
 代码实现与实际首次推送、公开或发布是不同授权。本轮不执行这些外部操作。
 
 仅推送功能分支而未创建目标为main的PR，不触发CI。`pull_request.branches: main`
