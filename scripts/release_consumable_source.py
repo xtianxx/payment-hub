@@ -401,7 +401,11 @@ class _WallDeadline:
         if remaining <= 0.0:
             return True
         lower = self.deadline_low - after
-        upper = self.deadline_high - before
+        # With an interrupted post-arm sample the upper bound is still open.
+        # A timer this guard armed can never have more than ``seconds`` left,
+        # so cap the unknown upper bound instead of accepting an arbitrary
+        # external timer installed from a signal callback.
+        upper = min(self.deadline_high - before, self.seconds)
         return (
             lower - _TIMER_RESOLUTION_SECONDS
             <= remaining

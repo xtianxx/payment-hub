@@ -1753,6 +1753,22 @@ class WallDeadlineTests(SourceTestBase):
             ):
                 self.assertFalse(deadline._timer_is_ours())
 
+    def test_timer_ownership_does_not_claim_unknown_upper_bound(
+        self,
+    ) -> None:
+        deadline = source._WallDeadline(60.0)
+        deadline.deadline_low = 60.0
+        deadline.deadline_high = float("inf")
+        with mock.patch.object(
+            source.time, "monotonic", side_effect=[0.0, 0.0]
+        ):
+            with mock.patch.object(
+                source.signal,
+                "getitimer",
+                return_value=(120.0, 0.0),
+            ):
+                self.assertFalse(deadline._timer_is_ours())
+
     def test_timer_cleanup_failure_still_restores_handler(self) -> None:
         old_handler = source.signal.getsignal(source.signal.SIGALRM)
         deadline = source._WallDeadline(60.0)
