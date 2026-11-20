@@ -2281,6 +2281,30 @@ class PackageAuditBoundaryTests(unittest.TestCase):
                 })
                 self.assertEqual(json.dumps(metadata, sort_keys=True), original)
 
+    def test_verified_owner_is_an_opt_in_projection(self):
+        for role in release.ROLES:
+            with self.subTest(role=role):
+                metadata = package_metadata(role)
+                self.assertEqual(
+                    set(release._validate_package_metadata(metadata, role)),
+                    {"name", "visibility", "repository", "id"},
+                )
+                projection = release._validate_package_metadata(
+                    metadata, role, include_owner=True
+                )
+                self.assertEqual(projection["owner"], release.OWNER_LOGIN)
+                self.assertEqual(
+                    set(projection),
+                    {"name", "visibility", "repository", "id", "owner"},
+                )
+                metadata["owner"] = {"login": "not-the-owner"}
+                self.assert_error(
+                    role + "-owner",
+                    lambda: release._validate_package_metadata(
+                        metadata, role, include_owner=True
+                    ),
+                )
+
     def test_fetch_package_metadata_keeps_normal_public_gate_and_taxonomy(self):
         metadata = package_metadata("app")
         self.http.return_value = release.HttpResult(
@@ -2799,6 +2823,11 @@ class PackageInventoryTests(ReleaseTestBase):
                 summary["packages_postcheck"][role]["visibility"],
                 "public",
             )
+            self.assertEqual(
+                summary["packages_postcheck"][role]["owner"],
+                release.OWNER_LOGIN,
+            )
+            self.assertNotIn("owner", summary["packages"][role])
         self.assertEqual(summary["revalidation"]["result"], "pass")
         self.assertEqual(self.fake.login_input, GITHUB_TOKEN)
         self.assertNotEqual(self.fake.login_input, AUDIT_TOKEN)

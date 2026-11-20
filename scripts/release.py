@@ -409,14 +409,20 @@ def _parse_link_header(
 
 
 def _validate_package_metadata(
-    value: Any, role: str, stage: str = "package"
+    value: Any,
+    role: str,
+    stage: str = "package",
+    *,
+    include_owner: bool = False,
 ) -> dict[str, Any]:
     """Return a small safe projection only after every fixed field matches.
 
     Package ``visibility`` must be public; repository identity is the fixed
     ``REPOSITORY`` full name.  ``repository.private`` describes the linked
     repository, not the package, and is intentionally ignored so a public
-    package may be linked to a public or private repository.
+    package may be linked to a public or private repository.  The verified
+    owner login is included only when the caller asks for it, keeping every
+    historical projection and the initialization path unchanged.
     """
     if not isinstance(value, dict):
         raise ReleaseError(stage, role + "-metadata")
@@ -434,12 +440,15 @@ def _validate_package_metadata(
     if not isinstance(repository, dict) or repository.get("full_name") != REPOSITORY:
         raise ReleaseError(stage, role + "-repository")
     package_id = _positive_package_id(value.get("id"), stage, role + "-id")
-    return {
+    projection = {
         "name": name,
         "visibility": "public",
         "repository": REPOSITORY,
         "id": package_id,
     }
+    if include_owner:
+        projection["owner"] = owner["login"]
+    return projection
 
 
 def _positive_size(value: Any, stage: str, kind: str, maximum: int) -> int:
@@ -2752,7 +2761,7 @@ class Release:
         return targets
 
     def _inventory_packages(
-        self, token: str
+        self, token: str, *, include_owner: bool = False
     ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         """Freeze target states from one complete inventory plus strict GETs."""
         listed = self._list_owner_packages(token)
@@ -2763,8 +2772,15 @@ class Release:
             if item is None:
                 states[role] = {"status": "ABSENT_CONFIRMED", "id": None}
                 continue
-            listed_projection = _validate_package_metadata(item, role)
-            checked = self._check_package(role, token)
+            listed_projection = _validate_package_metadata(
+                item, role, include_owner=include_owner
+            )
+            if include_owner:
+                checked = self._check_package(
+                    role, token, include_owner=True
+                )
+            else:
+                checked = self._check_package(role, token)
             if checked != listed_projection:
                 raise ReleaseError("package", role + "-metadata")
             states[role] = {"status": "EXISTING_VALID", "id": checked["id"]}
@@ -2775,6 +2791,8 @@ class Release:
         self,
         token: str,
         expected: Mapping[str, Mapping[str, Any]],
+        *,
+        include_owner: bool = False,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         """Refresh the complete inventory before a push and fail closed.
 
@@ -2782,7 +2800,12 @@ class Release:
         initially absent package must remain absent.  Publish now passes only
         existing expectations; any other transition stops the run.
         """
-        states, metadata = self._inventory_packages(token)
+        if include_owner:
+            states, metadata = self._inventory_packages(
+                token, include_owner=True
+            )
+        else:
+            states, metadata = self._inventory_packages(token)
         for role in ROLES:
             current = states[role]
             frozen = expected[role]
@@ -2827,9 +2850,13 @@ class Release:
             raise ReleaseError("package", role + "-json") from exc
         return value
 
-    def _check_package(self, role: str, token: str) -> dict[str, Any]:
+    def _check_package(
+        self, role: str, token: str, *, include_owner: bool = False
+    ) -> dict[str, Any]:
         value = self._fetch_package_metadata(role, token)
-        return _validate_package_metadata(value, role)
+        return _validate_package_metadata(
+            value, role, include_owner=include_owner
+        )
 
     def _registry_manifest(
         self,
@@ -3361,10 +3388,17 @@ class Release:
                     )
                     state["push_side_effects"][role] = "verified"
                 _final_states, final_metadata = self._refresh_package_expectations(
-                    audit_token, expected_states
+                    audit_token, expected_states, include_owner=True
                 )
                 state["packages_postcheck"] = dict(final_metadata)
-                state["packages"] = dict(final_metadata)
+                state["packages"] = {
+                    role: {
+                        key: value
+                        for key, value in final_metadata[role].items()
+                        if key != "owner"
+                    }
+                    for role in ROLES
+                }
                 for role in ROLES:
                     remote_ref = (
                         TARGETS[role] + "@" + state["remote"][role]["digest"]

@@ -1796,6 +1796,68 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIs(summary["with"]["include-hidden-files"], False)
         self.assertNotIn("release-summary", summary["with"]["name"])
 
+    def test_release_evidence_step_and_archive_paths_are_exact(self):
+        evidence = _step(
+            self.workflow, "upload", MOD.RELEASE_EVIDENCE_STEP_NAME
+        )
+        self.assertEqual(set(evidence), {"name", "shell", "env", "run"})
+        self.assertEqual(evidence["shell"], "bash")
+        self.assertNotIn("if", evidence)
+        self.assertNotIn("continue-on-error", evidence)
+        self.assertEqual(evidence["env"], MOD.RELEASE_EVIDENCE_ENV)
+        self.assertEqual(
+            evidence["run"].strip(), MOD.RELEASE_EVIDENCE_RUN.strip()
+        )
+        for token in (
+            "python3 -I -",
+            "hashlib.sha256",
+            "os.O_EXCL",
+            MOD.RELEASE_EVIDENCE_SCHEMA,
+            '"repository": TRUSTED_REPOSITORY',
+            '"descriptor_sha256": descriptor_sha256',
+            "release-summary.json",
+            "descriptor.json",
+            "release-evidence.json",
+        ):
+            self.assertIn(token, evidence["run"])
+        for token in (
+            "GITHUB_TOKEN",
+            "GHCR_PACKAGE_AUDIT_TOKEN",
+            "secrets.",
+            "docker",
+            "ghcr.io",
+            "curl",
+            "wget",
+        ):
+            self.assertNotIn(token, evidence["run"])
+            self.assertNotIn(token, evidence["env"])
+        names = [step["name"] for step in _steps(self.workflow, "upload")]
+        self.assertLess(
+            names.index("Publish paired images"),
+            names.index(MOD.RELEASE_EVIDENCE_STEP_NAME),
+        )
+        self.assertLess(
+            names.index(MOD.RELEASE_EVIDENCE_STEP_NAME),
+            names.index("Upload release summary"),
+        )
+        summary = _step(self.workflow, "upload", "Upload release summary")
+        self.assertEqual(summary["if"], "always()")
+        self.assertEqual(
+            tuple(summary["with"]["path"].splitlines()),
+            MOD.RELEASE_SUMMARY_FILES,
+        )
+        self.assertEqual(summary["with"]["path"], MOD.RELEASE_SUMMARY_PATH)
+        self.assertEqual(
+            MOD.RELEASE_SUMMARY_FILES,
+            (
+                "${{ runner.temp }}/payment-hub-release-publish/release-summary.json",
+                "${{ runner.temp }}/payment-hub-release-publish/descriptor.json",
+                "${{ runner.temp }}/payment-hub-release-publish/release-evidence.json",
+            ),
+        )
+        for marker in ("*", "?", "["):
+            self.assertNotIn(marker, summary["with"]["path"])
+
     def test_summary_and_actions_are_exact(self):
         summary = _step(
             self.workflow, "upload", "Upload release summary"
@@ -1865,7 +1927,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             for step in job.get("steps", [])
             if step.get("shell") == "bash"
         ]
-        self.assertEqual(len(scripts), 19)
+        self.assertEqual(len(scripts), 20)
         for index, script in enumerate(scripts):
             result = subprocess.run(
                 [bash, "-n"],
@@ -2704,6 +2766,189 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             {issue.kind for issue in self._issues_for_mutation(text)},
         )
 
+    def test_mutation_evidence_step_removal_reorder_or_condition_is_rejected(self):
+        text = self.text.replace(
+            _step_block(self.text, MOD.RELEASE_EVIDENCE_STEP_NAME), "", 1
+        )
+        self.assertNotEqual(text, self.text)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-upload-steps", kinds)
+        self.assertIn("release-evidence-missing", kinds)
+
+        # The summary step is last in the job; move it within the job bounds.
+        start = self.text.index("      - name: Upload release summary\n")
+        end = self.text.index("  initialize-migrate:\n", start)
+        summary_block = self.text[start:end]
+        text = self.text[:start] + self.text[end:]
+        evidence_start = text.index(
+            f"      - name: {MOD.RELEASE_EVIDENCE_STEP_NAME}\n"
+        )
+        text = text[:evidence_start] + summary_block + text[evidence_start:]
+        self.assertNotEqual(text, self.text)
+        self.assertIn(
+            "release-upload-steps",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+        text = self.text.replace(
+            f"      - name: {MOD.RELEASE_EVIDENCE_STEP_NAME}\n",
+            f"      - name: {MOD.RELEASE_EVIDENCE_STEP_NAME}\n"
+            "        if: always()\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-evidence-shape", kinds)
+        self.assertIn("release-evidence-skip", kinds)
+        self.assertIn("release-upload-step-if", kinds)
+
+        text = self.text.replace(
+            f"      - name: {MOD.RELEASE_EVIDENCE_STEP_NAME}\n",
+            f"      - name: {MOD.RELEASE_EVIDENCE_STEP_NAME}\n"
+            "        continue-on-error: true\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-evidence-shape", kinds)
+        self.assertIn("release-evidence-skip", kinds)
+
+    def test_mutation_evidence_env_run_or_token_is_rejected(self):
+        text = self.text.replace(
+            "          EXPECTED_DESCRIPTOR_SHA: "
+            "${{ needs.resolve-candidate.outputs.descriptor_sha256 }}\n"
+            "          REPOSITORY: ${{ github.repository }}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          python3 -I -",
+            "          EXPECTED_DESCRIPTOR_SHA: ${{ github.sha }}\n"
+            "          REPOSITORY: ${{ github.repository }}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          python3 -I -",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        self.assertIn(
+            "release-evidence-env",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+        text = self.text.replace(
+            "          REPOSITORY: ${{ github.repository }}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          python3 -I -",
+            "          REPOSITORY: ${{ github.repository }}\n"
+            "          GITHUB_TOKEN: ${{ github.token }}\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          python3 -I -",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-evidence-env", kinds)
+        self.assertIn("release-token-location", kinds)
+
+        text = self.text.replace(
+            "hashlib.sha256(original).hexdigest() != descriptor_sha256",
+            "hashlib.sha256(original).hexdigest() == descriptor_sha256",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        self.assertIn(
+            "release-evidence-run",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+        text = self.text.replace(
+            '"descriptor_sha256": descriptor_sha256,',
+            '"descriptor_sha256": hashlib.sha256(original).hexdigest(),',
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        self.assertIn(
+            "release-evidence-run",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+    def test_mutation_evidence_archive_path_is_exact(self):
+        text = self.text.replace(
+            "          path: |\n"
+            "            ${{ runner.temp }}/payment-hub-release-publish/release-summary.json\n"
+            "            ${{ runner.temp }}/payment-hub-release-publish/descriptor.json\n"
+            "            ${{ runner.temp }}/payment-hub-release-publish/release-evidence.json\n",
+            "          path: |\n"
+            "            ${{ runner.temp }}/payment-hub-release-publish/*.json\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-summary-path", kinds)
+        self.assertIn("release-summary-wildcard", kinds)
+
+        text = self.text.replace(
+            "            ${{ runner.temp }}/payment-hub-release-publish/descriptor.json\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        self.assertIn(
+            "release-summary-path",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+        text = self.text.replace(
+            "            ${{ runner.temp }}/payment-hub-release-publish/release-evidence.json\n",
+            "            ${{ runner.temp }}/payment-hub-release-publish/release-evidence.json\n"
+            "            ${{ runner.temp }}/payment-hub-release-publish/extra.json\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        self.assertIn(
+            "release-summary-path",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+        text = self.text.replace(
+            "          path: |\n"
+            "            ${{ runner.temp }}/payment-hub-release-publish/release-summary.json\n"
+            "            ${{ runner.temp }}/payment-hub-release-publish/descriptor.json\n"
+            "            ${{ runner.temp }}/payment-hub-release-publish/release-evidence.json\n",
+            "          path: ${{ runner.temp }}/payment-hub-release-publish/release-summary.json\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        self.assertIn(
+            "release-summary-path",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
+        text = self.text.replace(
+            "      - name: Upload release summary\n"
+            "        if: always()\n",
+            "      - name: Upload release summary\n"
+            "        if: success()\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        kinds = {issue.kind for issue in self._issues_for_mutation(text)}
+        self.assertIn("release-summary-condition", kinds)
+        self.assertIn("release-upload-step-if", kinds)
+
+        text = self.text.replace(
+            "          name: release-summary-"
+            "${{ github.run_id }}-${{ github.run_attempt }}\n",
+            "          name: release-summary-latest\n",
+            1,
+        )
+        self.assertNotEqual(text, self.text)
+        self.assertIn(
+            "release-summary-name",
+            {issue.kind for issue in self._issues_for_mutation(text)},
+        )
+
     def test_mutation_forbidden_triggers_or_candidate_script_is_rejected(self):
         text = self.text.replace(
             "on:\n", "on:\n  push:\n    branches:\n      - main\n", 1
@@ -2780,6 +3025,217 @@ class ReleaseIdentityGateExecutionTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("expected descriptor digest is not 64-hex", result.stdout)
+
+
+class ReleaseEvidenceStepExecutionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow, _ = MOD.load_workflow(RELEASE_WORKFLOW)
+        cls.step_run = _run(
+            cls.workflow, "upload", "Write release evidence"
+        )
+
+    def _execute(
+        self,
+        *,
+        descriptor=b'{"schema":"payment-hub.release-handoff.v1"}',
+        descriptor_sha=None,
+        create_descriptor=True,
+        create_summary=True,
+        summary=b'{"outcome":"pass"}',
+        prepare=None,
+        **overrides,
+    ):
+        temp = tempfile.TemporaryDirectory(prefix="release-evidence-")
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        bundle = base / "payment-hub-release-bundle"
+        root = base / "payment-hub-release-publish"
+        bundle.mkdir()
+        root.mkdir()
+        if create_descriptor:
+            (bundle / "descriptor.json").write_bytes(descriptor)
+        if create_summary:
+            (root / "release-summary.json").write_bytes(summary)
+        if descriptor_sha is None:
+            descriptor_sha = hashlib.sha256(descriptor).hexdigest()
+        if prepare is not None:
+            prepare(base, bundle, root)
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "RUNNER_TEMP": str(base),
+            "SOURCE_SHA": "a" * 40,
+            "RELEASE_RUN_ID": "123",
+            "RELEASE_RUN_ATTEMPT": "2",
+            "CI_RUN_ID": "456",
+            "CI_RUN_ATTEMPT": "3",
+            "BUNDLE_ARTIFACT_ID": "789",
+            "BUNDLE_ARTIFACT_DIGEST": "sha256:" + "b" * 64,
+            "EXPECTED_DESCRIPTOR_SHA": descriptor_sha,
+            "REPOSITORY": "xtianxx/payment-hub",
+        }
+        env.update(overrides)
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        result = subprocess.run(
+            [bash, "--noprofile", "--norc", "-c", self.step_run],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return result, base, bundle, root
+
+    def test_success_writes_exact_evidence_and_copies_descriptor_bytes(self):
+        descriptor = b'{"schema":"payment-hub.release-handoff.v1","x":1}\n'
+        result, _, _, root = self._execute(descriptor=descriptor)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            (root / "descriptor.json").read_bytes(), descriptor
+        )
+        self.assertEqual(
+            (root / "release-summary.json").read_bytes(),
+            b'{"outcome":"pass"}',
+        )
+        evidence = json.loads((root / "release-evidence.json").read_text())
+        self.assertEqual(
+            set(evidence),
+            {
+                "schema",
+                "repository",
+                "source_sha",
+                "release_run_id",
+                "release_run_attempt",
+                "ci_run_id",
+                "ci_run_attempt",
+                "bundle_artifact_id",
+                "bundle_artifact_digest",
+                "descriptor_sha256",
+            },
+        )
+        self.assertEqual(evidence["schema"], MOD.RELEASE_EVIDENCE_SCHEMA)
+        self.assertEqual(evidence["repository"], "xtianxx/payment-hub")
+        self.assertEqual(evidence["source_sha"], "a" * 40)
+        self.assertEqual(evidence["release_run_id"], 123)
+        self.assertEqual(evidence["release_run_attempt"], 2)
+        self.assertEqual(evidence["ci_run_id"], 456)
+        self.assertEqual(evidence["ci_run_attempt"], 3)
+        self.assertEqual(evidence["bundle_artifact_id"], 789)
+        self.assertEqual(
+            evidence["bundle_artifact_digest"], "sha256:" + "b" * 64
+        )
+        self.assertEqual(
+            evidence["descriptor_sha256"],
+            hashlib.sha256(descriptor).hexdigest(),
+        )
+        for key in (
+            "release_run_id",
+            "release_run_attempt",
+            "ci_run_id",
+            "ci_run_attempt",
+            "bundle_artifact_id",
+        ):
+            self.assertIs(type(evidence[key]), int)
+        self.assertEqual(
+            (root / "release-evidence.json").stat().st_mode & 0o777, 0o600
+        )
+        self.assertEqual(
+            (root / "descriptor.json").stat().st_mode & 0o777, 0o600
+        )
+
+    def test_no_token_is_required(self):
+        result, _, _, _ = self._execute()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("GITHUB_TOKEN", self.step_run)
+
+    def test_missing_or_mismatched_inputs_fail_without_evidence(self):
+        cases = (
+            ("missing-descriptor", {"create_descriptor": False}),
+            ("missing-summary", {"create_summary": False}),
+            (
+                "mismatched-descriptor",
+                {"descriptor_sha": "c" * 64},
+            ),
+            ("relative-runner-temp", {"RUNNER_TEMP": "relative"}),
+            ("missing-runner-temp", {"RUNNER_TEMP": ""}),
+            ("zero-release-run-id", {"RELEASE_RUN_ID": "0"}),
+            ("padded-release-attempt", {"RELEASE_RUN_ATTEMPT": "02"}),
+            ("zero-ci-run-id", {"CI_RUN_ID": "0"}),
+            ("zero-ci-attempt", {"CI_RUN_ATTEMPT": "0"}),
+            ("zero-bundle-id", {"BUNDLE_ARTIFACT_ID": "0"}),
+            ("bare-bundle-digest", {"BUNDLE_ARTIFACT_DIGEST": "b" * 64}),
+            (
+                "uppercase-bundle-digest",
+                {"BUNDLE_ARTIFACT_DIGEST": "sha256:" + "B" * 64},
+            ),
+            (
+                "prefixed-descriptor-sha",
+                {"EXPECTED_DESCRIPTOR_SHA": "sha256:" + "c" * 64},
+            ),
+            ("bad-source-sha", {"SOURCE_SHA": "a" * 39}),
+            ("wrong-repository", {"REPOSITORY": "other/repository"}),
+        )
+        for label, overrides in cases:
+            with self.subTest(case=label):
+                result, base, _, root = self._execute(**overrides)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("::error::", result.stdout)
+                self.assertFalse((root / "release-evidence.json").exists())
+                self.assertFalse((root / "descriptor.json").exists())
+
+    def test_oversized_descriptor_is_rejected(self):
+        result, _, _, root = self._execute(descriptor=b"x" * (64 * 1024 + 1))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("descriptor size is invalid", result.stdout)
+        self.assertFalse((root / "release-evidence.json").exists())
+
+    def test_existing_destination_files_are_never_overwritten(self):
+        def prepare(base, bundle, root):
+            (root / "descriptor.json").write_bytes(b"existing")
+
+        result, _, _, root = self._execute(prepare=prepare)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual((root / "descriptor.json").read_bytes(), b"existing")
+        self.assertFalse((root / "release-evidence.json").exists())
+
+        def prepare_evidence(base, bundle, root):
+            (root / "release-evidence.json").write_bytes(b"existing")
+
+        result, _, _, root = self._execute(prepare=prepare_evidence)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            (root / "release-evidence.json").read_bytes(), b"existing"
+        )
+
+    def test_symlinked_descriptor_is_rejected(self):
+        def symlink_descriptor(base, bundle, root):
+            (bundle / "descriptor.json").unlink()
+            (bundle / "descriptor.json").symlink_to(
+                base / "elsewhere.json"
+            )
+
+        result, _, _, root = self._execute(
+            prepare=symlink_descriptor
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not regular files", result.stdout)
+        self.assertFalse((root / "release-evidence.json").exists())
+
+        def symlink_summary(base, bundle, root):
+            (root / "release-summary.json").unlink()
+            (root / "release-summary.json").symlink_to(
+                base / "elsewhere.json"
+            )
+
+        result, _, _, root = self._execute(prepare=symlink_summary)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not regular files", result.stdout)
+        self.assertFalse((root / "release-evidence.json").exists())
+
+    def test_evidence_is_not_written_before_publish_summary_exists(self):
+        result, _, _, root = self._execute(create_summary=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse((root / "release-evidence.json").exists())
 
 
 class CiGateExecutionTests(unittest.TestCase):
