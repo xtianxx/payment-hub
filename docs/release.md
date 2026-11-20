@@ -164,9 +164,10 @@ python3 -B scripts/verify-release-consumable.py --online \
 可能超过 90 秒。不支持该机制的平台或线程会直接拒绝，不降级为仅有 socket
 空闲超时。
 若调用进程已有活动的 `ITIMER_REAL` 计时器，或主线程屏蔽了 `SIGALRM`，
-在线接口同样拒绝执行，不接管、清除或解除调用方的信号状态。
+在线接口同样拒绝执行，不接管、清除或解除调用方的信号状态。无法通过
+Python 恢复的 `SIGALRM` handler（`getsignal` 返回 `None`）也会被拒绝。
 同一进程内并发的在线验收会被拒绝。外部组件仍不应与验收过程同时修改
-进程级 `SIGALRM` 状态；工具只能尽力避免覆盖已经检测到的计时器。
+进程级 `SIGALRM` 状态；工具只能尽力避免覆盖已经检测到的 handler 和计时器。
 在线验收不要求发布或 CI workflow 当前处于启用状态，但路径不符、已删除或
 无法读取仍会拒绝。
 签名地址仅接受 HTTPS 的 GitHubusercontent 或 Azure Blob 固定主机域；

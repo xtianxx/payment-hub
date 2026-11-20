@@ -257,10 +257,10 @@ class _WallDeadline:
     as ``verify/deadline-unsupported`` without changing that mask.  An
     already-active ``ITIMER_REAL``, whether one-shot or periodic, is never
     replaced or merged: that fails closed as ``verify/deadline-conflict`` and
-    leaves the caller's handler and timer untouched.  Only signal state this
-    guard successfully acquired is restored on exit, and only while its own
-    installed handler is still the current one; a handler replaced by other
-    code is never overwritten.
+    leaves the caller's handler and timer untouched.  On exit the guard
+    restores its handler only while that handler is still installed, and
+    clears its timer only while the timer still matches the deadline it set;
+    an externally replaced handler or timer is never overwritten.
 
     Platforms without ``SIGALRM`` fail closed as
     ``verify/deadline-unsupported`` rather than silently dropping the guard.
@@ -277,6 +277,7 @@ class _WallDeadline:
         self.kind = kind
         self.old_handler: Any = None
         self.installed_handler: Any = None
+        self.deadline_at: float | None = None
         self.handler_owned = False
         self.timer_owned = False
         self.installed = False
@@ -315,6 +316,13 @@ class _WallDeadline:
             ) from None
         if old_remaining > 0 or old_interval > 0:
             raise VerificationError(self.stage, "deadline-conflict")
+        if old_handler is None:
+            # ``getsignal`` returns ``None`` for a handler that was not
+            # installed from Python (for example a C-level handler).  Such a
+            # handler cannot be restored through ``signal.signal``.
+            raise VerificationError(
+                self.stage, "deadline-unsupported"
+            )
         self.old_handler = old_handler
         self.installed_handler = self._handler
         try:
@@ -324,6 +332,11 @@ class _WallDeadline:
                 self.stage, "deadline-unsupported"
             ) from None
         self.handler_owned = True
+        # Record ownership before arming the timer: a signal delivered just
+        # after ``setitimer`` returns must still let cleanup identify and
+        # cancel this guard's own timer.
+        self.deadline_at = time.monotonic() + self.seconds
+        self.timer_owned = True
         try:
             signal.setitimer(signal.ITIMER_REAL, self.seconds)
         except (AttributeError, OSError, ValueError):
@@ -334,7 +347,6 @@ class _WallDeadline:
         except BaseException:
             self._restore()
             raise
-        self.timer_owned = True
         self.installed = True
         return self
 
@@ -349,23 +361,43 @@ class _WallDeadline:
         except (AttributeError, OSError, ValueError):
             return False
 
+    def _timer_is_ours(self) -> bool:
+        """Whether the active ``ITIMER_REAL`` is the one this guard set.
+
+        Fully restored timers are already cancelled (``remaining <= 0``).  A
+        live timer must be one-shot and its remaining time must agree with the
+        recorded absolute deadline within a small tolerance; anything else is
+        treated as an external replacement and is left running.
+        """
+
+        if self.deadline_at is None:
+            return False
+        try:
+            remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+        except (AttributeError, OSError, ValueError):
+            return False
+        if interval != 0:
+            return False
+        if remaining <= 0.0:
+            return True
+        expected = self.deadline_at - time.monotonic()
+        return abs(remaining - expected) <= 0.25
+
     def _restore(self) -> None:
         try:
-            if not self._owns_signal_state():
-                # Another component replaced the process-level handler.  Its
-                # handler and timer decision wins; never overwrite them.
-                self.timer_owned = False
-                self.handler_owned = False
-                return
             if self.timer_owned:
                 self.timer_owned = False
-                try:
-                    signal.setitimer(signal.ITIMER_REAL, 0)
-                except (AttributeError, OSError, ValueError):
-                    pass
+                if self._timer_is_ours():
+                    try:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                    except (AttributeError, OSError, ValueError):
+                        pass
         finally:
             # Restore the handler even if clearing the timer raised, including
-            # a signal-delivered ``_DeadlineExceeded`` from that call.
+            # a signal-delivered ``_DeadlineExceeded`` from that call.  Timer
+            # and handler ownership are decided independently: an external
+            # handler replacement must not strand this guard's timer, and an
+            # external timer must not suppress handler restoration.
             if self.handler_owned:
                 self.handler_owned = False
                 if self._owns_signal_state():

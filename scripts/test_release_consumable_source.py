@@ -1655,6 +1655,16 @@ class WallDeadlineTests(SourceTestBase):
             source._DEADLINE_LOCK.release()
         self.assertFalse(source._DEADLINE_LOCK.locked())
 
+    def test_unknown_installed_handler_is_rejected_before_network(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            source.signal, "getsignal", return_value=None
+        ):
+            self.assert_error("verify", "deadline-unsupported")
+        self.assertEqual(self.fixture.api.calls, [])
+        self.assertEqual(self.fixture.download.calls, [])
+
     def test_timer_cleanup_failure_still_restores_handler(self) -> None:
         old_handler = source.signal.getsignal(source.signal.SIGALRM)
         deadline = source._WallDeadline(60.0)
@@ -1684,15 +1694,54 @@ class WallDeadlineTests(SourceTestBase):
                     source.signal, "signal", wraps=source.signal.signal
                 ) as signal_mock:
                     deadline.__exit__(None, None, None)
-                setitimer_mock.assert_not_called()
+                setitimer_mock.assert_called_once_with(
+                    source.signal.ITIMER_REAL, 0
+                )
                 signal_mock.assert_not_called()
             self.assertIs(
                 source.signal.getsignal(source.signal.SIGALRM),
                 external_handler,
             )
+            remaining, interval = source.signal.getitimer(
+                source.signal.ITIMER_REAL
+            )
+            self.assertEqual(remaining, 0.0)
+            self.assertEqual(interval, 0.0)
         finally:
             source.signal.setitimer(source.signal.ITIMER_REAL, 0)
             source.signal.signal(source.signal.SIGALRM, old_handler)
+
+    def test_externally_replaced_timer_is_not_cleared(self) -> None:
+        old_handler = source.signal.getsignal(source.signal.SIGALRM)
+        for delay, interval in ((5.0, 1.0), (5.0, 0.0)):
+            with self.subTest(delay=delay, interval=interval):
+                deadline = source._WallDeadline(60.0)
+                deadline.__enter__()
+                try:
+                    source.signal.setitimer(
+                        source.signal.ITIMER_REAL, delay, interval
+                    )
+                    with mock.patch.object(
+                        source.signal,
+                        "setitimer",
+                        wraps=source.signal.setitimer,
+                    ) as setitimer_mock:
+                        deadline.__exit__(None, None, None)
+                    setitimer_mock.assert_not_called()
+                    remaining, current_interval = source.signal.getitimer(
+                        source.signal.ITIMER_REAL
+                    )
+                    self.assertGreater(remaining, 0.0)
+                    self.assertEqual(current_interval, interval)
+                    self.assertIs(
+                        source.signal.getsignal(source.signal.SIGALRM),
+                        old_handler,
+                    )
+                finally:
+                    source.signal.setitimer(source.signal.ITIMER_REAL, 0)
+                    source.signal.signal(
+                        source.signal.SIGALRM, old_handler
+                    )
 
     def test_continuous_download_body_cannot_outlive_wall_deadline(self) -> None:
         class EndlessResponse:
@@ -1745,6 +1794,9 @@ class WallDeadlineTests(SourceTestBase):
 
             def get(self, _url: str, _token: str, _timeout: float) -> Any:
                 self.entered = True
+                source.signal.setitimer(
+                    source.signal.ITIMER_REAL, 0.05
+                )
                 limit = time.monotonic() + 5.0
                 while time.monotonic() < limit:
                     time.sleep(0.01)
@@ -1754,7 +1806,7 @@ class WallDeadlineTests(SourceTestBase):
 
         transport = SlowApiTransport()
         started = time.monotonic()
-        with mock.patch.object(source, "TOTAL_TIMEOUT_SECONDS", 0.3):
+        with mock.patch.object(source, "TOTAL_TIMEOUT_SECONDS", 5.0):
             self.assert_error(
                 "verify", "deadline", api_transport=transport
             )
@@ -1767,6 +1819,9 @@ class WallDeadlineTests(SourceTestBase):
         def on_get(url: str) -> None:
             if url == CI_WORKFLOW_URL:
                 state["entered"] = True
+                source.signal.setitimer(
+                    source.signal.ITIMER_REAL, 0.05
+                )
                 limit = time.monotonic() + 5.0
                 while time.monotonic() < limit:
                     time.sleep(0.01)
@@ -1775,7 +1830,7 @@ class WallDeadlineTests(SourceTestBase):
                 )
 
         self.fixture.api.on_get = on_get
-        with mock.patch.object(source, "TOTAL_TIMEOUT_SECONDS", 0.3):
+        with mock.patch.object(source, "TOTAL_TIMEOUT_SECONDS", 5.0):
             self.assert_error("verify", "deadline")
         self.assertTrue(state["entered"])
 
@@ -1817,6 +1872,7 @@ class WallDeadlineTests(SourceTestBase):
 
         def slow(*_args: Any, **_kwargs: Any) -> Any:
             state["entered"] = True
+            source.signal.setitimer(source.signal.ITIMER_REAL, 0.05)
             limit = time.monotonic() + 5.0
             while time.monotonic() < limit:
                 time.sleep(0.01)
@@ -1825,7 +1881,7 @@ class WallDeadlineTests(SourceTestBase):
             )
 
         verifier = types.SimpleNamespace(verify_release=slow)
-        with mock.patch.object(source, "TOTAL_TIMEOUT_SECONDS", 0.3):
+        with mock.patch.object(source, "TOTAL_TIMEOUT_SECONDS", 5.0):
             self.assert_error("verify", "deadline", verifier=verifier)
         self.assertTrue(state["entered"])
 
