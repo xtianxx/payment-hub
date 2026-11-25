@@ -22,6 +22,15 @@ const (
 	httpAddrEnvName    = "PAYMENT_HUB_HTTP_ADDR"
 )
 
+// runtimePoolConfigure and runtimePoolEmit are no-op hooks in the default
+// build. The paymenthub_benchmark build replaces them in init to pin the pool
+// size and emit one fixed-structure POOL_CONFIG line. Default application
+// behavior and output are unchanged.
+var (
+	runtimePoolConfigure = func(*pgxpool.Config) {}
+	runtimePoolEmit      = func(int32, io.Writer) {}
+)
+
 var (
 	// ErrRuntimeConfig is the fixed invalid runtime configuration error.
 	ErrRuntimeConfig = errors.New("app: invalid runtime configuration")
@@ -117,6 +126,7 @@ func openRuntimeDatabase(ctx context.Context, databaseURL string) (runtimeDataba
 	if err != nil {
 		return nil, err
 	}
+	runtimePoolConfigure(config)
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, err
@@ -124,6 +134,7 @@ func openRuntimeDatabase(ctx context.Context, databaseURL string) (runtimeDataba
 	if pool == nil {
 		return nil, ErrStartup
 	}
+	runtimePoolEmit(pool.Stat().MaxConns(), os.Stdout)
 	return &pgxpoolRuntimeDatabase{pool: pool}, nil
 }
 
