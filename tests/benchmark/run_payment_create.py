@@ -1854,6 +1854,7 @@ class Runner:
         record = self.begin_round(index)
         fatal_reasons: list[str] = []
         measurement_reasons: list[str] = []
+        interrupt_exit = None
         try:
             self.start_compose()
             self.start_app()
@@ -1920,13 +1921,12 @@ class Runner:
         except (RunError, PreconditionError, OSError, CpuPlanError) as exc:
             # Safety/environment failure: stop the sequence, preserve volumes.
             fatal_reasons.append(f"{type(exc).__name__}: {exc}")
-        except SystemExit:
-            # Keep the in-flight round record before propagating the signal so
-            # the final summary is not written with an empty rounds list.
+        except SystemExit as exc:
+            # Finish the record before propagating so the final summary is not
+            # written with an empty or half-finalized round.
+            interrupt_exit = exc.code if isinstance(exc.code, int) and exc.code else 1
             fatal_reasons.append("interrupted by signal")
             record["interrupted"] = True
-            self.round_records.append(record)
-            raise
         finally:
             self.ensure_stage_markers(
                 record, fatal_reasons or measurement_reasons
@@ -2026,6 +2026,9 @@ class Runner:
             "app_binary_sha256": self.app_sha256,
         }
         record["evidence_bytes"] = self.tree_bytes(self.run_dir)
+        if interrupt_exit is not None:
+            self.round_records.append(record)
+            raise SystemExit(interrupt_exit)
         return record
 
     def run(self):

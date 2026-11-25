@@ -534,5 +534,58 @@ class StageLogicTest(unittest.TestCase):
         self.assertIn("no HTTP responses received", record["incomplete_reasons"])
 
 
+class InterruptRecordTest(unittest.TestCase):
+    def test_system_exit_finalizes_and_saves_round(self):
+        runner = Runner.__new__(Runner)
+        runner.base_run_id = "abc123"
+        runner.profile = "200"
+        runner.target_rate = 200
+        runner.round_index = 1
+        runner.round_records = []
+        runner.stage_records = []
+        runner.volumes = []
+        runner.cleanup_warnings = []
+        runner.cpu_plan = {}
+        runner.pool_config = None
+        runner.volume = None
+        runner.cleanup_warning = None
+        runner.compose_started = False
+        runner.compose_project = None
+        runner.compose_network = None
+        runner.app_port = 0
+        runner.pg_port = 0
+        runner.app_sha256 = None
+        runner.app_log = Path("/tmp/opencode/unused-app.log")
+        runner.env_dir = Path("/tmp/opencode/unused-env")
+        runner.run_dir = Path("/tmp/opencode/unused-run")
+        runner.begin_round = lambda index: {
+            "round": index,
+            "round_id": "abc123r1",
+            "started_at_utc": "2026-11-25T00:00:00+00:00",
+            "status": "running",
+            "stages": [],
+            "fatal": False,
+            "fatal_reasons": [],
+        }
+
+        def interrupt():
+            raise SystemExit(143)
+
+        runner.start_compose = interrupt
+        runner.stop_app = lambda: {"ok": True, "exit": 0}
+        runner.stop_compose = lambda: {"ok": True, "exit": 0}
+        runner.cap_log = lambda path: False
+        runner.tree_bytes = lambda path: 0
+
+        with self.assertRaises(SystemExit):
+            runner.run_round(1)
+
+        record = runner.round_records[0]
+        self.assertTrue(record["interrupted"])
+        self.assertEqual(record["status"], "aborted")
+        self.assertIn("finished_at_utc", record)
+        self.assertFalse(record["complete"])
+
+
 if __name__ == "__main__":
     unittest.main()
