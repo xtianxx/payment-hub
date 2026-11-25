@@ -16,7 +16,9 @@ CPU 分组隔离的是 WSL2 guest 中的直接竞争，不保证 Windows 宿主�
 
 ## 手动重跑
 
-从仓库根目录运行。前置条件：Ubuntu WSL2 或具有相同 CPU 拓扑的 Linux、本地 Docker/Compose、`psql`、Python 3、`taskset`、符合 `go.mod` 的已安装 Go、已安装的 k6 v2.4.0，以及已在本地的固定 PostgreSQL 镜像和与当前 `migrations/` 对应的迁移镜像。入口不安装工具、不自动拉镜像；需要另行准备镜像时，先核对其来源和迁移版本。
+从仓库根目录运行。前置条件：Ubuntu WSL2 或具有相同 CPU 拓扑的 Linux、本地 Docker/Compose、`psql`、Python 3.9+、`taskset`、符合 `go.mod` 的已安装 Go、已安装的 k6 v2.4.0，以及已在本地的固定 PostgreSQL 镜像和与当前 `migrations/` 对应的迁移镜像。入口不安装工具、不自动拉镜像；需要另行准备镜像时，先核对其来源和迁移版本。
+
+首次运行前，在入口使用的 Go 环境中联网执行一次 `go mod download` 预热模块缓存；入口以 `GOPROXY=off` 构建应用，缓存未准备时会在测量前失败。k6 版本必须是 v2.4.0，其他版本会被拒绝；Docker 守护进程须与 k6 和应用处于同一 CPU 域（可见 CPU 数一致），否则入口拒绝起跑。
 
 ```bash
 python3 -B tests/benchmark/run_payment_create.py --check-cpu-plan

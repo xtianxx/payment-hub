@@ -32,6 +32,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -94,6 +95,7 @@ K6_CPU_SATURATION_RATIO = 0.90
 K6_CPUS = DEFAULT_GROUPS["k6"]
 PG_CPUS = DEFAULT_GROUPS["postgres"]
 APP_CPUS = DEFAULT_GROUPS["app"]
+K6_REQUIRED_VERSION = "v2.4.0"
 
 
 class PreconditionError(RuntimeError):
@@ -102,6 +104,13 @@ class PreconditionError(RuntimeError):
 
 class RunError(RuntimeError):
     """The experiment ran but did not complete successfully."""
+
+
+def validate_artifacts_root(run_root):
+    if run_root == REPO or REPO in run_root.parents:
+        raise PreconditionError(
+            f"artifacts root must be outside the repository: {run_root}"
+        )
 
 
 def utc_now():
@@ -231,6 +240,7 @@ class Runner:
             if getattr(args, "artifacts_dir", None)
             else DEFAULT_ARTIFACTS_ROOT
         )
+        artifacts_root = artifacts_root.resolve()
         self.run_root = artifacts_root / "load-runs" / f"{timestamp}-{self.base_run_id}"
         self.run_dir = self.run_root
         self.env_dir = self.run_root / "env"
@@ -254,6 +264,7 @@ class Runner:
         self.round_index = 0
         self.cpu_plan = None
         self.pool_config = None
+        self.started_stages = set()
         self.app_binary = None
         self.app_sha256 = None
         self.migrate_image = None
@@ -523,6 +534,7 @@ class Runner:
         return matches[0]
 
     def preflight(self):
+        validate_artifacts_root(self.run_root)
         try:
             self.cpu_plan = build_cpu_plan()
         except CpuPlanError as exc:
@@ -541,11 +553,42 @@ class Runner:
                 f"fixed local Docker socket {DOCKER_HOST} is not usable"
             )
         self.docker_server_version = docker_version.stdout.strip()
+        compose_version = self.capture_cmd(
+            ["docker", "compose", "version"],
+            env=self.docker_env(),
+        )
+        if compose_version.returncode != 0:
+            raise PreconditionError(
+                "docker compose plugin is not available in the isolated Docker environment"
+            )
+        docker_ncpu = self.capture_cmd(
+            ["docker", "info", "--format", "{{.NCPU}}"],
+            env=self.docker_env(),
+        )
+        if docker_ncpu.returncode != 0:
+            raise PreconditionError("cannot read Docker daemon CPU count")
+        try:
+            self.docker_ncpu = int(docker_ncpu.stdout.strip())
+        except ValueError as exc:
+            raise PreconditionError(
+                f"Docker daemon CPU count is not numeric: {docker_ncpu.stdout.strip()}"
+            ) from exc
+        self.guest_ncpu = os.cpu_count() or 0
+        if self.docker_ncpu != self.guest_ncpu:
+            raise PreconditionError(
+                "Docker daemon CPU domain "
+                f"({self.docker_ncpu}) differs from guest CPUs ({self.guest_ncpu}); "
+                "container cpuset would not isolate PostgreSQL on the same guest"
+            )
         self.k6_path = self.resolve_k6()
         k6_version = self.capture_cmd([self.k6_path, "version"], env=sanitized_env())
         if k6_version.returncode != 0:
             raise PreconditionError(f"k6 version check failed: {self.k6_path}")
         self.k6_version = (k6_version.stdout or k6_version.stderr).strip()
+        if not re.match(rf"^k6 {re.escape(K6_REQUIRED_VERSION)}(\s|$)", self.k6_version):
+            raise PreconditionError(
+                f"k6 version must be {K6_REQUIRED_VERSION}, got: {self.k6_version}"
+            )
         self.go_path = self.resolve_executable(self.args.go, "go")
         go_version = self.capture_cmd([self.go_path, "version"], env=sanitized_env())
         if go_version.returncode != 0:
@@ -1232,6 +1275,11 @@ class Runner:
         return data.get("metrics", {}).get(name, {}).get("values", {})
 
     def stage_record(self, stage, rate, duration_s, prefix, pre_vus, max_vus):
+        started_stages = getattr(self, "started_stages", None)
+        if started_stages is None:
+            started_stages = set()
+            self.started_stages = started_stages
+        started_stages.add(stage)
         k6_exit, data, summary_path, observation = self.run_k6(
             stage, rate, duration_s, prefix, pre_vus, max_vus
         )
@@ -1686,6 +1734,8 @@ class Runner:
         self.app_proc = None
         self.volume = None
         self.cleanup_warning = None
+        self.pool_config = None
+        self.started_stages = set()
         self.pg_affinity = None
         self.app_affinity = None
         self.prepare_round_dirs()
@@ -1772,15 +1822,16 @@ class Runner:
         except Exception as exc:
             self.cleanup_warning = f"docker compose down failed: {exc}"
             return {"ok": False, "exit": None, "error": str(exc)}
-        self.compose_started = False
         if proc.returncode != 0:
             self.cleanup_warning = f"docker compose down exit {proc.returncode}"
             return {"ok": False, "exit": proc.returncode}
+        self.compose_started = False
         return {"ok": True, "exit": 0}
 
     def ensure_stage_markers(self, record, reason):
         reason_text = "; ".join(reason) or "round terminated before stage completion"
         existing = {stage.get("stage") for stage in record.get("stages", [])}
+        started_stages = getattr(self, "started_stages", set())
         stages = [
             ("smoke", SMOKE_RATE, SMOKE_DURATION_S),
             ("warmup", WARMUP_RATE, WARMUP_DURATION_S),
@@ -1790,6 +1841,12 @@ class Runner:
             if name in existing:
                 continue
             marker = self.not_run_stage(name, rate, duration_s, reason_text)
+            if name in started_stages:
+                marker["not_run"] = False
+                marker["status"] = "failed"
+                marker["incomplete_reasons"] = [
+                    f"stage started but no complete record: {reason_text}"
+                ]
             record["stages"].append(marker)
             self.stage_records.append(marker)
 
@@ -1911,13 +1968,18 @@ class Runner:
             if self.cleanup_warning:
                 self.cleanup_warnings.append(self.cleanup_warning)
                 fatal_reasons.append(f"cleanup warning: {self.cleanup_warning}")
-            try:
-                shutil.rmtree(self.env_dir)
-            except FileNotFoundError:
-                pass
-            except Exception as exc:
-                self.cleanup_warnings.append(f"credential directory cleanup failed: {exc}")
-                fatal_reasons.append("credential directory cleanup failed")
+            if compose_stop.get("ok"):
+                try:
+                    shutil.rmtree(self.env_dir)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:
+                    self.cleanup_warnings.append(f"credential directory cleanup failed: {exc}")
+                    fatal_reasons.append("credential directory cleanup failed")
+            else:
+                self.cleanup_warnings.append(
+                    "credential directory retained for compose teardown retry"
+                )
 
         record["finished_at_utc"] = utc_now()
         record["fatal"] = bool(fatal_reasons)
@@ -1936,6 +1998,8 @@ class Runner:
             "k6": K6_CPUS,
             "postgres": PG_CPUS,
             "app": APP_CPUS,
+            "docker_ncpu": getattr(self, "docker_ncpu", None),
+            "guest_ncpu": getattr(self, "guest_ncpu", None),
             "pg_affinity": getattr(self, "pg_affinity", None),
             "app_affinity": getattr(self, "app_affinity", None),
             "app_shares_pg": bool(
@@ -2289,12 +2353,21 @@ def main(argv=None):
         print("ERROR: --migrate-image is required for a load run")
         print("RESULT: PRECONDITION_FAILED")
         return 2
+
+    def _terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _terminate)
     runner = Runner(args)
     exit_code = 0
     error = None
     try:
         complete = runner.run()
         exit_code = 0 if complete else 1
+    except SystemExit as exc:
+        error = f"interrupted by signal (exit {exc.code})"
+        exit_code = exc.code if isinstance(exc.code, int) and exc.code else 1
+        raise
     except PreconditionError as exc:
         error = f"precondition failed: {exc}"
         exit_code = 2

@@ -38,7 +38,7 @@ class CpuSetTest(unittest.TestCase):
 
     def test_disjoint_and_inside_guest_required(self):
         topology = parse_lscpu_topology(
-            "0,0,0\n1,0,0\n2,1,0\n3,1,0\n"
+            "0,0,0\n1,0,0\n2,1,0\n3,1,0\n4,2,0\n5,2,0\n"
         )
         with self.assertRaises(CpuPlanError):
             validate_groups(
@@ -46,12 +46,25 @@ class CpuSetTest(unittest.TestCase):
                 topology,
                 {0, 1, 2, 3},
             )
-        with self.assertRaises(CpuPlanError):
+        with self.assertRaises(CpuPlanError) as caught:
             validate_groups(
                 {"k6": "0-1", "postgres": "2-3", "app": "4-5"},
                 topology,
                 {0, 1, 2, 3},
             )
+        self.assertIn("outside the guest-allowed set", str(caught.exception))
+
+    def test_single_thread_core_rejected(self):
+        topology = parse_lscpu_topology(
+            "0,0,0\n1,1,0\n2,2,0\n3,3,0\n"
+        )
+        with self.assertRaises(CpuPlanError) as caught:
+            validate_groups(
+                {"k6": "0-1", "postgres": "2-3"},
+                topology,
+                {0, 1, 2, 3},
+            )
+        self.assertIn("not a two-thread core", str(caught.exception))
 
     def test_valid_plan(self):
         topology = parse_lscpu_topology(

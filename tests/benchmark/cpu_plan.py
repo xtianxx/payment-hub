@@ -223,6 +223,12 @@ def validate_groups(
             if key is None:
                 continue
             full_pair = siblings[key]
+            if len(full_pair) != 2:
+                reasons.append(
+                    f"group {name} uses CPU {cpu} whose sibling set "
+                    f"is not a two-thread core: {sorted(full_pair)}"
+                )
+                continue
             if not full_pair.issubset(cpus):
                 reasons.append(
                     f"group {name} splits sibling pair {sorted(full_pair)} at CPU {cpu}"

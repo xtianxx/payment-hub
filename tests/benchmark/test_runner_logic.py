@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -15,11 +16,13 @@ from run_payment_create import (  # noqa: E402
     PROFILE,
     REQUIRED_ROUNDS,
     REPO,
+    PreconditionError,
     RunError,
     Runner,
     parse_args,
     read_process_affinity,
     summarize_cpu_windows,
+    validate_artifacts_root,
 )
 
 
@@ -83,6 +86,21 @@ class CliConfigTest(unittest.TestCase):
         self.assertFalse(DEFAULT_ARTIFACTS_ROOT.resolve().is_relative_to(REPO.resolve()))
         self.assertEqual(parse_args(["--check-cpu-plan"]).artifacts_dir, None)
 
+    def test_relative_artifacts_dir_is_resolved(self):
+        runner = Runner(parse_args(["--migrate-image", "local/migrate:test",
+                                    "--artifacts-dir", "evidence"]))
+        self.assertTrue(runner.run_root.is_absolute())
+
+    def test_artifacts_root_inside_repository_is_rejected(self):
+        with self.assertRaises(PreconditionError):
+            validate_artifacts_root(REPO)
+        with self.assertRaises(PreconditionError):
+            validate_artifacts_root(REPO / "artifacts" / "run")
+
+    def test_artifacts_root_outside_repository_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            validate_artifacts_root(Path(tmp) / "run")
+
 
 class CpuWindowTest(unittest.TestCase):
     def test_short_saturated_window_is_not_hidden_by_average(self):
@@ -112,33 +130,49 @@ class ExecRaceTest(unittest.TestCase):
             self.skipTest("sched_getaffinity unavailable")
         if not self.app_cpus <= allowed:
             self.skipTest(f"{sorted(self.app_cpus)} not in guest affinity {sorted(allowed)}")
+        start = sorted(allowed - self.app_cpus)
+        if not start:
+            self.skipTest("no CPU outside the app mask to start the launcher")
+        self.start_cpus = {start[0]}
         self.sleep_path = shutil.which("sleep")
         if not self.sleep_path:
             self.skipTest("sleep executable unavailable")
 
     def test_wait_for_exec_waits_for_late_affinity_launcher(self):
-        # A local launcher starts unrestricted, sleeps, then pins itself and
-        # execs sleep. This reproduces the read-before-exec window without
-        # Docker, PostgreSQL, k6 or any network access.
-        launcher = (
-            "import os,time\n"
-            "time.sleep(2.0)\n"
-            f"os.sched_setaffinity(0,{sorted(self.app_cpus)!r})\n"
-            f"os.execv({self.sleep_path!r}, ['sleep','2'])\n"
-        )
-        proc = subprocess.Popen([sys.executable, "-c", launcher])
-        try:
-            pre = read_process_affinity(proc.pid)
-            self.assertNotEqual(pre, self.app_cpus)
-            actual = Runner.__new__(Runner).wait_for_exec(
-                proc, Path(self.sleep_path), "sleep", 10
+        # A local launcher starts on a CPU outside the app mask, waits for the
+        # parent's go-ahead, then pins itself and execs sleep. This reproduces
+        # the read-before-exec window without depending on the caller's own
+        # affinity or on a fixed sleep delay.
+        with tempfile.TemporaryDirectory() as tmp:
+            ready = Path(tmp) / "ready"
+            proceed = Path(tmp) / "proceed"
+            launcher = (
+                "import os,time,pathlib\n"
+                f"os.sched_setaffinity(0,{sorted(self.start_cpus)!r})\n"
+                f"pathlib.Path({str(ready)!r}).write_text('ready')\n"
+                f"while not pathlib.Path({str(proceed)!r}).exists():\n"
+                "    time.sleep(0.02)\n"
+                f"os.sched_setaffinity(0,{sorted(self.app_cpus)!r})\n"
+                f"os.execv({self.sleep_path!r}, ['sleep','2'])\n"
             )
-            self.assertEqual(actual, Path(self.sleep_path).resolve())
-            self.assertEqual(read_process_affinity(proc.pid), self.app_cpus)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait(timeout=5)
+            proc = subprocess.Popen([sys.executable, "-c", launcher])
+            try:
+                deadline = time.time() + 5
+                while not ready.exists() and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "launcher did not reach ready state")
+                pre = read_process_affinity(proc.pid)
+                self.assertNotEqual(pre, self.app_cpus)
+                proceed.write_text("go", encoding="utf-8")
+                actual = Runner.__new__(Runner).wait_for_exec(
+                    proc, Path(self.sleep_path), "sleep", 10
+                )
+                self.assertEqual(actual, Path(self.sleep_path).resolve())
+                self.assertEqual(read_process_affinity(proc.pid), self.app_cpus)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
 
     def test_wait_for_exec_with_real_taskset(self):
         if not shutil.which("taskset"):
