@@ -1920,6 +1920,13 @@ class Runner:
         except (RunError, PreconditionError, OSError, CpuPlanError) as exc:
             # Safety/environment failure: stop the sequence, preserve volumes.
             fatal_reasons.append(f"{type(exc).__name__}: {exc}")
+        except SystemExit:
+            # Keep the in-flight round record before propagating the signal so
+            # the final summary is not written with an empty rounds list.
+            fatal_reasons.append("interrupted by signal")
+            record["interrupted"] = True
+            self.round_records.append(record)
+            raise
         finally:
             self.ensure_stage_markers(
                 record, fatal_reasons or measurement_reasons
