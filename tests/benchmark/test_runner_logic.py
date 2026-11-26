@@ -8,9 +8,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import run_payment_create  # noqa: E402
 from cpu_plan import DEFAULT_GROUPS, parse_cpu_set  # noqa: E402
 from run_payment_create import (  # noqa: E402
     DEFAULT_ARTIFACTS_ROOT,
@@ -149,35 +151,63 @@ class FixedPortTest(unittest.TestCase):
 
 
 class RunLockTest(unittest.TestCase):
-    @staticmethod
-    def make_runner(artifacts_dir):
-        return Runner(parse_args([
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lock_path = Path(self.tmp.name) / "payment-hub-load.lock"
+        patcher = mock.patch.object(
+            run_payment_create, "run_lock_path", return_value=self.lock_path
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_runner(self, name):
+        artifacts = Path(self.tmp.name) / name
+        artifacts.mkdir()
+        runner = Runner(parse_args([
             "--migrate-image", "local/migrate:test",
-            "--artifacts-dir", str(artifacts_dir),
+            "--artifacts-dir", str(artifacts),
         ]))
+        runner.prepare_dirs()
+        return runner
 
-    def test_lock_is_exclusive_and_records_holder(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            first = self.make_runner(tmp)
-            first.prepare_dirs()
-            first.acquire_run_lock()
-            lock_path = Path(tmp) / ".payment-hub-load.lock"
-            holder = lock_path.read_text(encoding="utf-8")
-            self.assertIn(f"pid={os.getpid()}", holder)
-            self.assertIn(first.base_run_id, holder)
-            self.assertNotIn("password", holder.lower())
+    def test_lock_is_host_wide_and_records_holder(self):
+        first = self.make_runner("run-a")
+        first.acquire_run_lock()
+        holder = self.lock_path.read_text(encoding="utf-8")
+        self.assertIn(f"pid={os.getpid()}", holder)
+        self.assertIn(first.base_run_id, holder)
+        self.assertNotIn("password", holder.lower())
 
-            second = self.make_runner(tmp)
-            second.prepare_dirs()
-            with self.assertRaises(PreconditionError) as caught:
-                second.acquire_run_lock()
-            self.assertIn(str(lock_path), str(caught.exception))
-            self.assertIn(f"pid={os.getpid()}", str(caught.exception))
-
-            first.release_run_lock()
-            first.release_run_lock()
+        # A different artifacts root must not bypass the host-wide lock.
+        second = self.make_runner("run-b")
+        with self.assertRaises(PreconditionError) as caught:
             second.acquire_run_lock()
-            second.release_run_lock()
+        self.assertIn(str(self.lock_path), str(caught.exception))
+        self.assertIn(f"pid={os.getpid()}", str(caught.exception))
+
+        first.release_run_lock()
+        first.release_run_lock()
+        second.acquire_run_lock()
+        second.release_run_lock()
+
+    def test_symlink_lock_path_is_rejected_without_touching_target(self):
+        target = Path(self.tmp.name) / "target"
+        target.write_text("keep\n", encoding="utf-8")
+        self.lock_path.symlink_to(target)
+        runner = self.make_runner("run-link")
+        with self.assertRaises(PreconditionError) as caught:
+            runner.acquire_run_lock()
+        self.assertIn("symlink", str(caught.exception))
+        self.assertEqual(target.read_text(encoding="utf-8"), "keep\n")
+
+    def test_hard_linked_lock_file_is_rejected(self):
+        self.lock_path.write_text("", encoding="utf-8")
+        os.link(self.lock_path, Path(self.tmp.name) / "second-link")
+        runner = self.make_runner("run-hardlink")
+        with self.assertRaises(PreconditionError) as caught:
+            runner.acquire_run_lock()
+        self.assertIn("hard links", str(caught.exception))
 
 
 class CpuWindowTest(unittest.TestCase):

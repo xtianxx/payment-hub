@@ -54,6 +54,22 @@ class MonitorPasswordFileTest(unittest.TestCase):
                     runner.read_monitor_password()
                 self.assertNotIn("first", str(multiline.exception))
 
+    def test_password_with_surrounding_whitespace_is_rejected(self):
+        for raw in ("  secret  \n", "\tsecret\n", "secret\t\n"):
+            with self.subTest(raw=raw.strip()):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "monitor-password"
+                    path.write_text(raw, encoding="utf-8")
+                    os.chmod(path, 0o600)
+                    with mock.patch.dict(
+                        os.environ,
+                        {"PAYMENT_HUB_MONITOR_PASSWORD_FILE": str(path)},
+                    ):
+                        with self.assertRaises(PreconditionError) as caught:
+                            make_runner(Path(tmp) / "runs").read_monitor_password()
+                self.assertIn("whitespace", str(caught.exception))
+                self.assertNotIn("secret", str(caught.exception))
+
     def test_missing_password_file_fails_without_reading_a_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "absent"
@@ -67,6 +83,25 @@ class MonitorPasswordFileTest(unittest.TestCase):
 
 
 class MonitorRoleSecretHygieneTest(unittest.TestCase):
+    def test_role_sql_sets_password_and_cannot_be_closed_early(self):
+        tricky = "a$$b'c$ph$d"
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = make_runner(Path(tmp) / "runs")
+            runner.monitor_password = tricky
+            sql = runner.monitor_role_sql()
+
+        self.assertTrue(sql.startswith("DO $"))
+        delimiter = sql[3:sql.index("\n")]
+        body = sql.split("\n", 1)[1]
+        body = body[:body.index(delimiter)]
+        self.assertNotIn(delimiter, body)
+        escaped = tricky.replace("'", "''")
+        self.assertEqual(body.count(f"PASSWORD '{escaped}'"), 2)
+        self.assertIn("b''c", body)
+        self.assertIn(f"CREATE ROLE {MONITOR_ROLE} LOGIN", body)
+        self.assertIn(f"ALTER ROLE {MONITOR_ROLE} WITH LOGIN", body)
+        self.assertIn(f"GRANT pg_monitor TO {MONITOR_ROLE};", sql)
+
     def test_role_creation_keeps_password_out_of_argv_logs_and_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             runner = make_runner(Path(tmp) / "runs")
@@ -84,6 +119,7 @@ class MonitorRoleSecretHygieneTest(unittest.TestCase):
 
             self.assertIn(MONITOR_ROLE, calls["input"])
             self.assertIn("pg_monitor", calls["input"])
+            self.assertIn(f"PASSWORD '{PASSWORD}'", calls["input"])
             self.assertNotIn(PASSWORD, shlex.join(str(part) for part in calls["cmd"]))
             self.assertNotIn(PASSWORD, runner.commands_log.read_text(encoding="utf-8"))
 

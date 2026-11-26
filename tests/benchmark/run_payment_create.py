@@ -24,6 +24,7 @@ stage when the effective masks do not match. This is guest affinity, not host
 physical isolation.
 """
 import argparse
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -38,6 +39,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,7 +78,28 @@ METRICS_HOST_PORT = 9091
 MONITOR_PASSWORD_ENV = "PAYMENT_HUB_MONITOR_PASSWORD_FILE"
 DEFAULT_MONITOR_PASSWORD_FILE = Path("~/.config/payment-hub/monitor-password")
 MONITOR_ROLE = "postgres_exporter"
-RUN_LOCK_NAME = ".payment-hub-load.lock"
+RUN_LOCK_NAME = "payment-hub-load.lock"
+
+
+def run_lock_path():
+    """Host-wide lock shared by every artifacts root.
+
+    The fixed 55432/9091 ports are host resources, so a per-artifacts-root lock
+    cannot serialize two runs that use different evidence directories.
+    """
+    return Path(tempfile.gettempdir()) / RUN_LOCK_NAME
+
+
+def dollar_tag(*texts, base="ph"):
+    """Return a dollar-quote delimiter that does not occur in any text.
+
+    PostgreSQL ends a dollar-quoted string only at the exact matching delimiter,
+    so a delimiter absent from the body cannot be closed early by user input.
+    """
+    tag = base
+    while any(f"${tag}$" in text for text in texts):
+        tag += "_"
+    return f"${tag}$"
 TARGET_RATE = 200
 SMOKE_RATE = 2
 SMOKE_DURATION_S = 5
@@ -290,22 +313,53 @@ class Runner:
     # ---------- run lock / monitor credential ----------
 
     def acquire_run_lock(self):
-        """Hold one exclusive lock for the whole run so two benchmarks cannot share
-        the fixed PostgreSQL port, metrics port or benchmark volumes."""
-        self.artifacts_root.mkdir(parents=True, exist_ok=True)
-        path = self.artifacts_root / RUN_LOCK_NAME
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        """Hold one host-wide exclusive lock for the whole run.
+
+        The fixed PostgreSQL and metrics ports are host resources, so the lock
+        file lives outside the artifacts root and every run shares it. The file
+        is opened without following symlinks and must be a regular, single-link
+        file owned by the current user before it is truncated.
+        """
+        path = run_lock_path()
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            holder = os.read(descriptor, 4096).decode("utf-8", errors="replace").strip()
+            descriptor = os.open(
+                path,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise PreconditionError(f"run lock path is a symlink: {path}") from exc
+            raise PreconditionError(f"cannot open run lock {path}: {exc}") from exc
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise PreconditionError(f"run lock is not a regular file: {path}")
+            if info.st_nlink != 1:
+                raise PreconditionError(
+                    f"run lock has {info.st_nlink} hard links: {path}"
+                )
+            if info.st_uid != os.geteuid():
+                raise PreconditionError(
+                    f"run lock is owned by uid {info.st_uid}, not the current user: {path}"
+                )
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                holder = os.read(descriptor, 4096).decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                detail = f"; holder: {holder}" if holder else ""
+                raise PreconditionError(f"another benchmark run holds {path}{detail}")
+            os.ftruncate(descriptor, 0)
+            holder = f"pid={os.getpid()} started={self.started_at} run={self.base_run_id}\n"
+            os.write(descriptor, holder.encode("utf-8"))
+            os.fsync(descriptor)
+        except BaseException:
             os.close(descriptor)
-            detail = f"; holder: {holder}" if holder else ""
-            raise PreconditionError(f"another benchmark run holds {path}{detail}")
-        os.ftruncate(descriptor, 0)
-        holder = f"pid={os.getpid()} started={self.started_at} run={self.base_run_id}\n"
-        os.write(descriptor, holder.encode("utf-8"))
-        os.fsync(descriptor)
+            raise
         self.lock_fd = descriptor
         self.lock_path = path
         self.log_command(f"# run lock acquired {path} pid={os.getpid()}")
@@ -348,6 +402,11 @@ class Runner:
             raise PreconditionError(
                 f"monitor password file must contain one non-empty line: {path}"
             )
+        if password != password.strip():
+            raise PreconditionError(
+                "monitor password must not start or end with whitespace "
+                f"(postgres-exporter trims it when reading the file): {path}"
+            )
         self.monitor_password = password
         self.monitor_password_path = path
         return password
@@ -355,17 +414,22 @@ class Runner:
     def monitor_role_sql(self):
         if self.monitor_password is None:
             raise PreconditionError("monitor password was not loaded before role creation")
+        # A standard string literal only needs doubled quotes; the DO delimiter is
+        # then chosen to be absent from the whole body so characters such as `$$`
+        # in the password cannot terminate the block early.
         literal = self.monitor_password.replace("'", "''")
-        return (
-            "DO $$\n"
+        body = (
             "BEGIN\n"
             f"  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{MONITOR_ROLE}') THEN\n"
             f"    CREATE ROLE {MONITOR_ROLE} LOGIN PASSWORD '{literal}';\n"
             "  ELSE\n"
             f"    ALTER ROLE {MONITOR_ROLE} WITH LOGIN PASSWORD '{literal}';\n"
             "  END IF;\n"
-            "END\n"
-            "$$;\n"
+            "END"
+        )
+        delimiter = dollar_tag(body)
+        return (
+            f"DO {delimiter}\n{body}\n{delimiter};\n"
             f"GRANT pg_monitor TO {MONITOR_ROLE};\n"
         )
 
