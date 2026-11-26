@@ -6,7 +6,7 @@
 
 ## 当前实现范围（MVP）
 
-本文件描述目标形态的完整流程。当前只完成 T001–T014：`deploy/compose.observability.yaml` 仍是 `services: {}` 骨架，`check_metrics_evidence.py` 与 `export_metrics.py` 仍是占位脚本，基准入口仍是 3 轮且不会设置 `PAYMENT_HUB_METRICS_ADDR`。因此第 2、3、4、7 步的 Compose 启动、5 轮参数、证据检查和导出在执行时还不可用，将在 US2–US4 实现；第 1、5、6 步的边界与目录约定已确定，但需要真实数据目录才能执行。
+本文件描述目标形态的完整流程。当前完成 T001–T019：HTTP 指标与连接池指标（US1/US2）已实现，设置 `PAYMENT_HUB_METRICS_ADDR` 后可从 `/metrics` 读取 `payment_hub_http_*` 与 `payment_hub_db_pool_*`。以下仍未实现：`deploy/compose.observability.yaml` 仍是 `services: {}` 骨架，`check_metrics_evidence.py` 与 `export_metrics.py` 仍是占位脚本，基准入口仍是 3 轮且不会设置 `PAYMENT_HUB_METRICS_ADDR`。因此第 2、3、4、7 步的 Compose 启动、5 轮参数、证据检查和导出在执行时还不可用，将在 US3–US4 实现；第 1、5、6 步的边界与目录约定已确定，但需要真实数据目录才能执行。
 
 ## 前置条件
 

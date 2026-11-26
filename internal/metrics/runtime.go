@@ -25,8 +25,19 @@ type Runtime struct {
 // literal are rejected with 403 so a DNS-rebinding page cannot read the
 // unauthenticated scrape through a victim browser.
 func NewRuntime() *Runtime {
+	return NewRuntimeWithPool(nil)
+}
+
+// NewRuntimeWithPool also collects the single business pool from the given
+// snapshot function. A nil function keeps the pool collector unregistered, so
+// the HTTP-only runtime stays usable in tests; production always passes the
+// existing pool's Stat method and never opens a second pool.
+func NewRuntimeWithPool(pool func() PoolStats) *Runtime {
 	registry := NewRegistry()
 	httpMetrics := NewHTTPMetrics(registry)
+	if pool != nil {
+		NewPoolMetrics(registry, pool)
+	}
 	scrape := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
 		MaxRequestsInFlight: 2,
 		Timeout:             4 * time.Second,

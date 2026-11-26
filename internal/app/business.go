@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"payment-hub/internal/httpapi"
+	"payment-hub/internal/metrics"
 	"payment-hub/internal/mock"
 	"payment-hub/internal/payment"
 	"payment-hub/internal/postgres"
@@ -17,6 +18,14 @@ import (
 // wrapper implements it; old test fakes are not forced to grow this method.
 type businessPoolProvider interface {
 	BusinessPool() *pgxpool.Pool
+}
+
+// poolStatsProvider exposes the same production pool's current statistics to
+// the metrics collector. Returning the snapshot function, not a single
+// snapshot, keeps every scrape fresh. Only the production database wrapper
+// implements it, so the metrics path cannot open a second pool.
+type poolStatsProvider interface {
+	BusinessPoolStats() metrics.PoolStats
 }
 
 // businessPool resolves the production pool from the already-open runtime
