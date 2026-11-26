@@ -245,7 +245,7 @@ def redact_prometheus_url(url):
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
-        return url
+        return "<invalid-url>"
     if "@" not in parts.netloc:
         return url
     netloc = parts.netloc.rsplit("@", 1)[1]
@@ -406,28 +406,28 @@ def detect_sample_gaps(label, series, start_epoch, end_epoch):
     check_from = start_epoch + MAX_SAMPLE_GAP_SECONDS
     messages = []
     for _metric, samples in series:
-        zero_points = [
+        gap_points = [
             timestamp
             for timestamp, value in samples
             if check_from - 1e-9 <= timestamp <= end_epoch + 1e-9
-            and value <= 0
+            and value > 0
         ]
-        if not zero_points:
+        if not gap_points:
             continue
-        if len(zero_points) == 1:
+        if len(gap_points) == 1:
             messages.append(
                 "%s 窗口内 7.5 秒无原始抓取：评估时刻 %.3f 的 "
-                "count_over_time 为 0" % (label, zero_points[0])
+                "absent_over_time 为 1" % (label, gap_points[0])
             )
         else:
             messages.append(
                 "%s 窗口内 7.5 秒无原始抓取：评估时刻 %.3f 至 %.3f "
-                "共 %d 个点为 0"
+                "共 %d 个点的 absent_over_time 为 1"
                 % (
                     label,
-                    zero_points[0],
-                    zero_points[-1],
-                    len(zero_points),
+                    gap_points[0],
+                    gap_points[-1],
+                    len(gap_points),
                 )
             )
     if len(messages) > 10:
@@ -585,7 +585,7 @@ def evaluate_stage(window, client):
             ('up{job="postgres"}', "postgres exporter"),
             ("pg_up", "pg_up"),
         ):
-            gap_query = "count_over_time(%s[%s])" % (
+            gap_query = "absent_over_time(%s[%s])" % (
                 expression,
                 GAP_QUERY_DURATION,
             )

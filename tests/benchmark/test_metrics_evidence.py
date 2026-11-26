@@ -213,29 +213,42 @@ class FakePrometheusState(object):
     def range(self, query, start, end, step):
         self.requests.append(("range", query, start, end, step))
         gaps = {
-            'count_over_time(up{job="payment-hub"}[7500ms])':
+            'absent_over_time(up{job="payment-hub"}[7500ms])':
                 self.up_gap_after,
-            'count_over_time(up{job="postgres"}[7500ms])':
+            'absent_over_time(up{job="postgres"}[7500ms])':
                 self.exporter_gap_after,
-            "count_over_time(pg_up[7500ms])": self.pg_gap_after,
+            "absent_over_time(pg_up[7500ms])": self.pg_gap_after,
         }
         if query not in gaps:
             return {"resultType": "matrix", "result": []}
 
         raw_start = start - check_metrics_evidence.MAX_SAMPLE_GAP_SECONDS
-        raw_times = sample_timestamps(raw_start, end, gaps[query])
+        if (
+            (query.startswith("absent_over_time(up{job=\"payment-hub\"}")
+             and self.up_observed == 0)
+            or (query.startswith("absent_over_time(up{job=\"postgres\"}")
+                and self.exporter_observed == 0)
+            or (query.startswith("absent_over_time(pg_up")
+                and self.pg_observed == 0)
+        ):
+            raw_times = []
+        else:
+            raw_times = sample_timestamps(raw_start, end, gaps[query])
         step_seconds = step_to_seconds(step)
         count = int(math.floor((end - start) / step_seconds + 1e-9)) + 1
         values = []
         for index in range(max(0, count)):
             timestamp = round(start + index * step_seconds, 3)
-            samples = sum(
-                1
-                for raw
-                in raw_times
-                if timestamp - 7.5 + 1e-9 < raw <= timestamp + 1e-9
+            has_sample = any(
+                timestamp - 7.5 + 1e-9 < raw <= timestamp + 1e-9
+                for raw in raw_times
             )
-            values.append([timestamp, str(samples)])
+            if not has_sample:
+                # 真实 absent_over_time 只在“无样本”的评估点返回值 1，
+                # 有样本的点直接省略，不返回 0。
+                values.append([timestamp, "1"])
+        if not values:
+            return {"resultType": "matrix", "result": []}
         return {
             "resultType": "matrix",
             "result": [
@@ -601,6 +614,13 @@ class MetricsEvidenceTest(unittest.TestCase):
             any("exporter" in reason for reason in stage["missing"]),
             stage["missing"],
         )
+        self.assertTrue(
+            any(
+                "absent_over_time 为 1" in reason
+                for reason in stage["missing"]
+            ),
+            stage["missing"],
+        )
 
     def test_target_absent_is_incomplete_even_when_expected_is_zero(self):
         self.write_summary(rounds=1, requested=1, duration=1.0)
@@ -688,7 +708,7 @@ class MetricsEvidenceTest(unittest.TestCase):
         self.assertEqual(stage["status"], "incomplete")
         self.assertTrue(
             any(
-                "7.5" in reason and "为 0" in reason
+                "7.5" in reason and "absent_over_time 为 1" in reason
                 for reason in stage["missing"]
             ),
             stage["missing"],
@@ -696,6 +716,21 @@ class MetricsEvidenceTest(unittest.TestCase):
         queries = [str(request[1]) for request in state.requests]
         self.assertTrue(
             any("[7500ms]" in query for query in queries), queries
+        )
+        self.assertTrue(
+            any(
+                query.startswith("absent_over_time(")
+                for query in queries
+            ),
+            queries,
+        )
+        self.assertFalse(
+            any(
+                query.startswith("count_over_time(")
+                and "[7500ms]" in query
+                for query in queries
+            ),
+            queries,
         )
         self.assertFalse(
             any("7.5s" in query for query in queries), queries
@@ -710,7 +745,7 @@ class MetricsEvidenceTest(unittest.TestCase):
         self.write_summary(rounds=1, requested=1)
         with fake_prometheus(exporter_gap_after=55) as (
             base_url,
-            _state,
+            state,
         ):
             result = self.run_cli(base_url)
         self.assertEqual(result.returncode, 3, result.stderr)
@@ -721,10 +756,20 @@ class MetricsEvidenceTest(unittest.TestCase):
         self.assertEqual(stage["targets"]["postgres"], "up")
         self.assertTrue(
             any(
-                "postgres exporter" in reason and "7.5" in reason
+                "postgres exporter" in reason
+                and "7.5" in reason
+                and "absent_over_time 为 1" in reason
                 for reason in stage["missing"]
             ),
             stage["missing"],
+        )
+        self.assertTrue(
+            any(
+                str(request[1]).startswith(
+                    'absent_over_time(up{job="postgres"}'
+                )
+                for request in state.requests
+            )
         )
 
     def test_single_stage_failure_keeps_later_stages(self):
@@ -814,6 +859,14 @@ class MetricsEvidenceTest(unittest.TestCase):
                 check_metrics_evidence.redact_prometheus_url(raw),
                 expected,
             )
+
+    def test_invalid_prometheus_url_is_replaced_with_placeholder(self):
+        redacted = check_metrics_evidence.redact_prometheus_url(
+            "http://user:pw@[::1"
+        )
+        self.assertEqual(redacted, "<invalid-url>")
+        self.assertNotIn("user", redacted)
+        self.assertNotIn("pw", redacted)
 
     def test_out_of_range_epoch_is_skipped_without_crash(self):
         summary = make_summary(rounds=3, requested=3)
