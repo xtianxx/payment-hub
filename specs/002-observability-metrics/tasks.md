@@ -131,19 +131,19 @@
 
 ### Tests for User Story 4
 
-- [ ] T035 [P] [US4] 新增 `tests/benchmark/test_metrics_evidence.py`：用 fake Prometheus HTTP 服务器覆盖完整、缺阶段、`up=0`、`pg_up=0`、抓取次数不足、Prometheus 不可达和原子写入
-- [ ] T036 [P] [US4] 新增 `tests/benchmark/test_export_metrics.py`：覆盖每个契约查询的 CSV、JSON 汇总、时间窗和 PromQL 记录、退出码 0/2/4
-- [ ] T037 [P] [US4] 新增 `tests/benchmark/test_metrics_store.py`：归档复制到 `metrics.tmp/`、校验 `wal/`、rename 为 `metrics/`；回看复制到 `VIEW_DIR` 后归档目录哈希不变
-- [ ] T038 [P] [US4] 新增 `tests/benchmark/test_dashboard_json.py`：解析 `overview.json`，断言经典 JSON 结构、固定 UID、四类指标面板和契约查询名存在
+- [x] T035 [P] [US4] 新增 `tests/benchmark/test_metrics_evidence.py`：用 fake Prometheus HTTP 服务器覆盖完整、缺阶段、`up=0`、`pg_up=0`、抓取次数不足、Prometheus 不可达和原子写入
+- [x] T036 [P] [US4] 新增 `tests/benchmark/test_export_metrics.py`：覆盖每个契约查询的 CSV、JSON 汇总、时间窗和 PromQL 记录、退出码 0/2/4
+- [x] T037 [P] [US4] 新增 `tests/benchmark/test_metrics_store.py`：归档复制到 `metrics.tmp/`、校验 `wal/`、rename 为 `metrics/`；回看复制到 `VIEW_DIR` 后归档目录哈希不变
+- [x] T038 [P] [US4] 新增 `tests/benchmark/test_dashboard_json.py`：解析 `overview.json`，断言经典 JSON 结构、固定 UID、四类指标面板和契约查询名存在
 
 ### Implementation for User Story 4
 
-- [ ] T039 [US4] 实现 `tests/benchmark/check_metrics_evidence.py`：从 `summary.json` 读取 5 个 `load200` 阶段的 `k6_started_epoch`/`k6_finished_epoch`；按阶段查询 `up`、`pg_up`、`count_over_time` 和关键序列；`expected = max(0, floor(窗口秒数 / 5) - 1)`；写入 `payment-hub.metrics-evidence.v2`；`status` 只有 `complete`/`incomplete`，`run_id` 必须等于 `summary.json`；退出码 0 完整、3 不完整、2 参数/IO、4 Prometheus 不可达；先写临时文件再 `os.replace`
-- [ ] T040 [US4] 实现 `tests/benchmark/export_metrics.py`：按 `contracts/metrics.md` 查询，写入 `$RUN_DIR/metrics-export/`，每个查询一份 CSV 加 `queries.json`；退出码 0/2/4
-- [ ] T041 [US4] 实现 `tests/benchmark/metrics_store.py` 的 `archive` 和 `view` 子命令：归档复制到 `metrics.tmp/`、校验 `wal/`、rename 为 `metrics/`；回看复制到 `VIEW_DIR`，归档保持不变
-- [ ] T042 [US4] 实现 `deploy/observability/grafana/provisioning/datasources/prometheus.yml`、`provisioning/dashboards/provider.yml` 和 `dashboards/overview.json`：数据源 `editable: false`，看板 `allowUiUpdates: false`，匿名 Viewer，关闭 basic auth/登录表单/注册
-- [ ] T043 [US4] 新增 `tests/benchmark/verify_grafana.py`：用 `grafana/grafana:13.2.7` 启动，断言数据源和看板 UID 自动加载、3000 只绑回环；失败时记录回退到 12.4.16 或 V2 的决策
-- [ ] T044 [US4] 更新 `docs/observability.md`：写入手工起停、归档、回看、导出和清理命令；清理必须按 `summary.json.overall.volumes` 删除基准数据库卷，不能把 `down -v` 当基准卷清理
+- [x] T039 [US4] 实现 `tests/benchmark/check_metrics_evidence.py`：从 `summary.json` 读取 5 个 `load200` 阶段的 `k6_started_epoch`/`k6_finished_epoch`；按阶段查询 `up`、`pg_up`、`count_over_time` 和关键序列；`expected = max(0, floor(窗口秒数 / 5) - 1)`；写入 `payment-hub.metrics-evidence.v2`；`status` 只有 `complete`/`incomplete`，`run_id` 必须等于 `summary.json`；退出码 0 完整、3 不完整、2 参数/IO、4 Prometheus 不可达；先写临时文件再 `os.replace`
+- [x] T040 [US4] 实现 `tests/benchmark/export_metrics.py`：按 `contracts/metrics.md` 查询，写入 `$RUN_DIR/metrics-export/`，每个查询一份 CSV 加 `queries.json`；退出码 0/2/4
+- [x] T041 [US4] 实现 `tests/benchmark/metrics_store.py` 的 `archive` 和 `view` 子命令：归档复制到 `metrics.tmp/`、校验 `wal/`、rename 为 `metrics/`；回看复制到 `VIEW_DIR`，归档保持不变
+- [x] T042 [US4] 实现 `deploy/observability/grafana/provisioning/datasources/prometheus.yml`、`provisioning/dashboards/provider.yml` 和 `dashboards/overview.json`：数据源 `editable: false`，看板 `allowUiUpdates: false`，匿名 Viewer，关闭 basic auth/登录表单/注册
+- [x] T043 [US4] 新增 `tests/benchmark/verify_grafana.py`：用 `grafana/grafana:13.2.7` 启动，断言数据源和看板 UID 自动加载、3000 只绑回环；失败时记录回退到 12.4.16 或 V2 的决策
+- [x] T044 [US4] 更新 `docs/observability.md`：写入手工起停、归档、回看、导出和清理命令；清理必须按 `summary.json.overall.volumes` 删除基准数据库卷，不能把 `down -v` 当基准卷清理
 
 **Checkpoint**: US4 可独立用已归档数据回看；指标证据不影响基准资格。
 

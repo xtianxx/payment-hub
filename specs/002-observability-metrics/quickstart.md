@@ -6,7 +6,7 @@
 
 ## 当前实现范围（MVP）
 
-本文件描述目标形态的完整流程。当前完成 T001–T034（US1–US3）：HTTP、连接池和 PostgreSQL 指标已实现；观测栈 Compose、固定 `55432`、5 轮基准、运行锁和监控密码文件均已落地，设置 `PAYMENT_HUB_METRICS_ADDR` 后可从 `/metrics` 读取应用指标。仍未实现：`check_metrics_evidence.py` 与 `export_metrics.py` 仍是占位脚本，归档/回看脚本化（T041）和 Grafana 看板内容（T042）待完成。因此第 4、7 步不可用；第 2、3、5、6 步可按本文执行，回看时看板仍为占位。
+本文件描述目标形态的完整流程。当前完成 T001–T044（US1–US4）：HTTP、连接池和 PostgreSQL 指标、观测栈、固定 `55432`、5 轮基准、运行锁、监控密码、证据检查、导出、归档/回看脚本和 Grafana 看板均已落地。Phase 7（基数测试、完整 quickstart 实跑与最终检查）仍待执行；第 1–8 步的命令与参数已与实现对齐，首次完整实跑前请核对本地镜像和工具版本。
 
 ## 前置条件
 
@@ -106,24 +106,14 @@ python3 -m json.tool "$RUN_DIR/metrics-evidence.json"
 ## 5. 停止并归档指标数据
 
 ```bash
-set -euo pipefail
 docker compose -f deploy/compose.observability.yaml down
 
-test -d "$PROMETHEUS_DATA_DIR"
-test ! -e "$RUN_DIR/metrics"
-test ! -e "$RUN_DIR/metrics.tmp"
-
-mkdir -p "$RUN_DIR/metrics.tmp"
-if ! cp -a "$PROMETHEUS_DATA_DIR"/. "$RUN_DIR/metrics.tmp/"; then
-  echo "archive copy failed; keeping $RUN_DIR/metrics.tmp" >&2
-  exit 1
-fi
-test -d "$RUN_DIR/metrics.tmp/wal"
-du -sh "$RUN_DIR/metrics.tmp"
-mv "$RUN_DIR/metrics.tmp" "$RUN_DIR/metrics"
+python3 tests/benchmark/metrics_store.py archive \
+  --source "$PROMETHEUS_DATA_DIR" \
+  --run-dir "$RUN_DIR"
 ```
 
-先停止 Prometheus 再复制，确保 WAL 已落盘。复制的每一步失败都会在 rename 前退出，保留 `metrics.tmp/` 供人工处理；只有复制成功且 `wal/` 存在时才原子重命名为 `metrics/`。失败时在 `metrics-evidence.json` 记录 `archive_error`，不要删除临时目录。
+先停止 Prometheus 再归档，确保 WAL 已落盘。脚本校验源目录包含 `wal/`、复制到 `$RUN_DIR/metrics.tmp`，校验文件数与树哈希后原子重命名为 `$RUN_DIR/metrics`；退出码 `0` 成功、`2` 参数/前置条件/IO 错误、`3` 校验失败。失败时保留 `metrics.tmp/` 供人工处理，并在 `metrics-evidence.json` 记录 `archive_error`；不要删除临时目录。
 
 如果运行被中断，仍按同样步骤停止并归档；证据只判定实际完成的测量阶段，未运行的阶段记为缺失。
 
@@ -133,8 +123,10 @@ mv "$RUN_DIR/metrics.tmp" "$RUN_DIR/metrics"
 
 ```bash
 export VIEW_DIR="/tmp/opencode/payment-hub-view/$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$VIEW_DIR"
-cp -a "$RUN_DIR/metrics"/. "$VIEW_DIR"/
+
+python3 tests/benchmark/metrics_store.py view \
+  --run-dir "$RUN_DIR" \
+  --view-dir "$VIEW_DIR"
 
 export PROMETHEUS_DATA_DIR="$VIEW_DIR"
 export PROMETHEUS_CONFIG_FILE="$PWD/deploy/observability/prometheus.view.yml"
@@ -142,7 +134,7 @@ export PROMETHEUS_CONFIG_FILE="$PWD/deploy/observability/prometheus.view.yml"
 docker compose -f deploy/compose.observability.yaml up -d prometheus grafana
 ```
 
-打开 `http://127.0.0.1:3000`，选择预置看板“Payment Hub 压测总览”，时间范围选该次运行的时间窗。Grafana 为回环匿名只读，已关闭 basic auth 和登录表单，不需要登录。
+`metrics_store.py view` 复制前后校验归档哈希不变，副本已存在且非空时拒绝。打开 `http://127.0.0.1:3000`，选择预置看板“Payment Hub 压测总览”，时间范围选该次运行的时间窗。Grafana 为回环匿名只读，已关闭 basic auth 和登录表单，不需要登录。
 
 回看配置使用空抓取目标，并设置较长的保留时间，避免 Prometheus 打开归档副本时删除过期块。同一个副本只能被一个 Prometheus 实例使用。
 
