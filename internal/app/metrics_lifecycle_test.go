@@ -575,3 +575,70 @@ func TestMetricsServeFailureIsLogged(t *testing.T) {
 		t.Fatalf("shutdown events = %d, want 1\n%s", shutdownEvents, logs.String())
 	}
 }
+
+type failingShutdownServeServer struct {
+	serveErr    error
+	shutdownErr error
+}
+
+func (server *failingShutdownServeServer) Serve(net.Listener) error       { return server.serveErr }
+func (server *failingShutdownServeServer) Shutdown(context.Context) error { return server.shutdownErr }
+func (server *failingShutdownServeServer) Close() error                   { return nil }
+
+func TestServeFailureIsLoggedWhenShutdownFails(t *testing.T) {
+	lifecycleTestClearPGEnv(t)
+	db := newLifecycleTestDB()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	serveErr := errors.New("serve canary failure")
+	shutdownErr := errors.New("shutdown canary failure")
+	server := &failingShutdownServeServer{serveErr: serveErr, shutdownErr: shutdownErr}
+	deps := runtimeDeps{
+		openDatabase: func(context.Context, string) (runtimeDatabase, error) {
+			return db, nil
+		},
+		listen: func(context.Context, string) (net.Listener, error) {
+			return listener, nil
+		},
+		newServer: func(*http.Server) runtimeServer {
+			return server
+		},
+	}
+
+	var logs bytes.Buffer
+	err = runWith(context.Background(), lifecycleTestLookup(lifecycleTestBaseValues()), &logs, deps, lifecycleTestLimits())
+	if !errors.Is(err, ErrShutdown) {
+		t.Fatalf("err = %v, want ErrShutdown", err)
+	}
+	if _, _, closeCalls, _ := db.snapshot(); closeCalls != 1 {
+		t.Fatalf("database close calls = %d, want 1", closeCalls)
+	}
+	text := logs.String()
+	if strings.Contains(text, serveErr.Error()) || strings.Contains(text, shutdownErr.Error()) {
+		t.Fatal("serve failure log echoed raw error text")
+	}
+	shutdownEvents := 0
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal("serve failure log line is not JSON")
+		}
+		if entry["event"] != "shutdown" || entry["stage"] != "shutdown" {
+			continue
+		}
+		shutdownEvents++
+		if entry["error_kind"] != "internal" {
+			t.Fatalf("unexpected serve failure log entry: %v", entry)
+		}
+	}
+	if shutdownEvents != 1 {
+		t.Fatalf("shutdown events = %d, want 1\n%s", shutdownEvents, text)
+	}
+}

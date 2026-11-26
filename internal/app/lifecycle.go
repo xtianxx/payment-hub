@@ -345,6 +345,21 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 	}
 
 	shutdownErr := shutdownRuntime(runtimeServer, metricsServer, gate, testMode, db, listener, metricsListener, cancelWork, serveDone, metricsServeDone, limits)
+
+	// Read Serve results only after their completion channels close, then
+	// record an underlying failure even when shutdown itself also failed, so
+	// the operator can see what triggered the exit.
+	businessFailure := stoppedServerFailure(serveDone, func() error { return serveErr })
+	var metricsFailure error
+	if metricsServeDone != nil {
+		metricsFailure = stoppedServerFailure(metricsServeDone, func() error { return metricsServeErr })
+	}
+	if businessFailure != nil {
+		logger.logServeFailure(businessFailure)
+	} else if metricsFailure != nil {
+		logger.logServeFailure(metricsFailure)
+	}
+
 	if shutdownErr != nil {
 		return shutdownErr
 	}
@@ -354,20 +369,28 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 	if metricsServeDone != nil && !serveDoneClosed(metricsServeDone) {
 		return ErrShutdown
 	}
-	// Record the underlying Serve failure before folding it into the fixed
-	// runtime exit code, so the operator sees an actionable cause.
-	if !errors.Is(serveErr, http.ErrServerClosed) {
-		logger.logServeFailure(serveErr)
-		return ErrRuntime
-	}
-	if metricsServeDone != nil && !errors.Is(metricsServeErr, http.ErrServerClosed) {
-		logger.logServeFailure(metricsServeErr)
+	if businessFailure != nil || metricsFailure != nil {
 		return ErrRuntime
 	}
 	if runtimeErr != nil {
 		return runtimeErr
 	}
 	return nil
+}
+
+// stoppedServerFailure returns the unexpected Serve error of a finished
+// server, or nil when it is still running or stopped normally. The error is
+// read only after the completion channel is closed, which orders the read after
+// the serving goroutine's write; read must not be called otherwise.
+func stoppedServerFailure(done <-chan struct{}, read func() error) error {
+	if !serveDoneClosed(done) {
+		return nil
+	}
+	err := read()
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 func serveDoneClosed(done <-chan struct{}) bool {
