@@ -73,8 +73,12 @@ def main(argv=None):
         print(f"ERROR: set {args.dsn_env} to a PostgreSQL DSN")
         return 2
 
-    holder = psql(dsn, "")
-    waiter = psql(dsn, "")
+    try:
+        holder = psql(dsn, "")
+        waiter = psql(dsn, "")
+    except FileNotFoundError:
+        print("ERROR: psql executable not found in PATH")
+        return 2
     try:
         holder.stdin.write(
             f"BEGIN;\nLOCK TABLE {args.table} IN ACCESS EXCLUSIVE MODE;\n"
