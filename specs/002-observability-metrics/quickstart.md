@@ -43,16 +43,15 @@ stat -c '%u %g %a %n' "$PAYMENT_HUB_MONITOR_PASSWORD_FILE"
 
 ```bash
 docker network inspect host >/dev/null
-export PROMETHEUS_DATA_DIR="/tmp/opencode/payment-hub-metrics/$(date -u +%Y%m%dT%H%M%SZ)"
+install -d -m 700 /tmp/opencode/payment-hub-metrics
+export PROMETHEUS_DATA_DIR="$(mktemp -d /tmp/opencode/payment-hub-metrics/run-XXXXXX)"
 export PROMETHEUS_CONFIG_FILE="$PWD/deploy/observability/prometheus.yml"
-mkdir -p "$PROMETHEUS_DATA_DIR"
-chmod 700 "$PROMETHEUS_DATA_DIR"
 stat -c '%u %g %a %n' "$PROMETHEUS_DATA_DIR"
 
 docker compose -f deploy/compose.observability.yaml up -d prometheus postgres-exporter
 ```
 
-`docker network inspect host` 只验证 host 网络存在；Docker Desktop 的独立虚拟机不满足本方案前提。数据目录必须属于 `HOST_UID`，否则 Prometheus 无法写 WAL；`stat` 输出的 UID/GID 必须等于 `HOST_UID`/`HOST_GID`，权限为 `700`。
+`docker network inspect host` 只验证 host 网络存在；Docker Desktop 的独立虚拟机不满足本方案前提。数据目录用 `mktemp -d` 生成唯一路径（权限 `700`），不要复用旧目录，否则 Prometheus 会沿用已有 TSDB，下一次归档会混入历史序列。目录必须属于 `HOST_UID`，否则 Prometheus 无法写 WAL；`stat` 输出的 UID/GID 必须等于 `HOST_UID`/`HOST_GID`。
 
 必须显式设置 `PROMETHEUS_CONFIG_FILE`：测量阶段使用抓取配置 `deploy/observability/prometheus.yml`，回看阶段再切换为 `prometheus.view.yml`，避免 shell 中残留的上一次配置。
 
@@ -158,27 +157,7 @@ export PROMETHEUS_CONFIG_FILE="$PWD/deploy/observability/prometheus.view.yml"
 docker compose -f deploy/compose.observability.yaml up -d prometheus grafana
 ```
 
-`metrics_store.py view` 复制前后校验归档哈希不变，副本已存在且非空时拒绝；归档目录本身是唯一长期保留的数据，回看只读副本。复制完成后可用下面的脚本复核归档树哈希（与 `archive` 输出一致）：
-
-```bash
-python3 - "$RUN_DIR/metrics" <<'PY'
-import hashlib, os, sys
-
-def tree_hash(root):
-    digest = hashlib.sha256()
-    for base, dirs, files in os.walk(root):
-        dirs.sort()
-        for name in sorted(files):
-            path = os.path.join(base, name)
-            digest.update(os.path.relpath(path, root).encode())
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1 << 20), b""):
-                    digest.update(chunk)
-    return digest.hexdigest()
-
-print("归档树哈希:", tree_hash(sys.argv[1]))
-PY
-```
+`metrics_store.py view` 复制前后校验归档哈希不变，副本已存在且非空时拒绝；归档目录本身是唯一长期保留的数据，回看只读副本。`archive` 与 `view` 都会打印“源目录树哈希/目标目录树哈希”和文件数：回看时输出的归档哈希必须与归档时一致，两次输出可直接对照。不要用自写脚本比较哈希，算法包含路径边界和逐文件摘要，手写版本会与脚本不一致。
 
 打开 `http://127.0.0.1:3000`，选择预置看板“Payment Hub 压测总览”，时间范围选该次运行的时间窗。Grafana 为回环匿名只读，已关闭 basic auth 和登录表单，不需要登录。
 
@@ -204,7 +183,7 @@ python3 tests/benchmark/export_metrics.py \
 ```bash
 docker compose -f deploy/compose.observability.yaml down -v
 
-python3 - "$RUN_DIR" <<'PY'
+if python3 - "$RUN_DIR" <<'PY'
 import json, re, subprocess, sys
 
 run_dir = sys.argv[1]
@@ -214,29 +193,68 @@ run_id = str(summary.get("run_id", ""))
 if re.fullmatch(r"[0-9a-f]{12}", run_id) is None:
     raise SystemExit(f"summary.json 的 run_id 不是 12 位十六进制：{run_id!r}")
 
+failed = []
 for item in summary.get("overall", {}).get("volumes", []):
+    round_number = item.get("round")
+    expected = f"payment-hub-load-{run_id}r{round_number}_postgres_data"
     volume = str(item.get("volume", ""))
-    # 只删除本次运行的基准卷：名称必须同时带基准前缀和 run_id。
-    if not volume.startswith("payment-hub-load-") or run_id not in volume:
-        print("skipping unverified volume", volume)
+    # 卷名必须与本次运行和轮次精确对应，不接受前缀/子串匹配。
+    if volume != expected:
+        print("skipping unverified volume", volume, "expected", expected)
+        failed.append(volume)
         continue
     inspect = subprocess.run(
         ["docker", "volume", "inspect", volume],
         capture_output=True, text=True,
     )
     if inspect.returncode != 0:
-        print("not found", volume)
+        if "no such volume" in (inspect.stderr or "").lower():
+            print("absent", volume)
+            continue
+        print("inspect failed", volume, (inspect.stderr or "").strip())
+        failed.append(volume)
         continue
-    print("removing", volume)
-    subprocess.run(["docker", "volume", "rm", volume], check=False)
-PY
+    removed = subprocess.run(
+        ["docker", "volume", "rm", volume],
+        capture_output=True, text=True,
+    )
+    if removed.returncode != 0:
+        print("remove failed", volume, (removed.stderr or "").strip())
+        failed.append(volume)
+    else:
+        print("removed", volume)
 
-docker volume ls | grep 'payment-hub-load' || true
-docker ps -a --filter 'label=payment-hub.scope' --format '{{.Names}}'
-rm -rf "$RUN_DIR" "$VIEW_DIR"
+for index, item in enumerate(summary.get("rounds", []), start=1):
+    project = f"payment-hub-load-{run_id}r{item.get('round', index)}"
+    containers = subprocess.run(
+        [
+            "docker", "ps", "-a",
+            "--filter", f"label=com.docker.compose.project={project}",
+            "--format", "{{.Names}}",
+        ],
+        capture_output=True, text=True,
+    )
+    if containers.returncode != 0:
+        print("container check failed", project, (containers.stderr or "").strip())
+        failed.append(project)
+        continue
+    names = containers.stdout.split()
+    if names:
+        print("containers remain", project, names)
+        failed.append(project)
+
+if failed:
+    raise SystemExit("清理未全部确认：%s" % failed)
+PY
+then
+  docker volume ls | grep 'payment-hub-load' || true
+  rm -rf "$RUN_DIR" "$VIEW_DIR"
+else
+  echo "卷或容器清理未全部确认，保留 $RUN_DIR 以便重试" >&2
+fi
 ```
 
-`down -v` 只清理观测栈自己的卷；基准的数据库卷必须按 `summary.json` 的 `overall.volumes` 逐个删除。脚本只接受同时带 `payment-hub-load-` 前缀和本次 `run_id` 的卷名，并先用 `docker volume inspect` 确认存在，避免被篡改的 `summary.json` 删除无关卷；其他卷名只打印跳过。删除后 `docker volume ls` 不应再有本次运行的基准卷，`docker ps -a` 不应再有 `payment-hub.scope` 标签的容器。
+`down -v` 只清理观测栈自己的卷；基准的数据库卷必须按 `summary.json` 的 `overall.volumes` 逐个删除。脚本要求卷名精确等于 `payment-hub-load-{run_id}r{轮次}_postgres_data`，区分“确认不存在”和 inspect 失败，检查 `docker volume rm` 的退出码，并按 `com.docker.compose.project` 标签检查各轮是否还有残留容器。任何一步未确认成功都会以非零状态结束并保留 `$RUN_DIR`；只有全部确认后才删除证据目录和回看副本。
 
 第 6 步把 `PROMETHEUS_DATA_DIR` 覆盖成了回看副本路径；测量阶段的数据目录在归档成功、回看副本也已删除后即可按记录的原路径删除，`$RUN_DIR/metrics` 是唯一长期保留的数据。
 
@@ -267,13 +285,15 @@ rm -rf "$RUN_DIR" "$VIEW_DIR"
 |---|---|---|
 | 观测栈 | `docker compose ... up -d prometheus postgres-exporter` | 9090 就绪；exporter `pg_up=0`（数据库未启动，属预期） |
 | 契约验收 | `verify_observability.py --timeout 30` | 第一轮数据库就绪后退出 0；`pg_up=1`、`pg_benchmark_waiting_locks` 与 `pg_stat_database_xact_commit` 可用，无 `usename`/`application_name` 标签 |
+| 全量测试 | `go test ./...`；`python3 -B -m unittest discover -s tests/benchmark -p 'test_*.py'` | 退出 0：Go 2079 通过 / 10 个包；benchmark 143 项 OK；本阶段无测试失败需要修复 |
+| 基数测试 | `go test ./internal/metrics/ -run StaysWithin -v` | 1 项通过；按导出序列统计（直方图桶 + `_sum`/`_count`）为 102 条，低于 300 预算 |
 | 基准 | `run_payment_create.py --profile 200 --rounds 5` | `RESULT: PASS`，5 轮全部 `complete`，每轮 24000–24001 次迭代，`dropped_iterations=0`；测量轮 P95 18.1/30.9/23.7/18.0/27.0 ms，P99 23.6/56.3/28.0/20.8/53.8 ms |
 | 证据 | `check_metrics_evidence.py` | 退出 0，`status=complete`；5 个阶段目标均为 `up`，全部关键序列 present，`expected` 23 与 `observed` 24–25 的抓取计数正常 |
 | 归档 | `metrics_store.py archive`（先 `down` 观测栈） | 退出 0；源/目标树哈希一致，3 个文件，`metrics-evidence.json` 字节不变 |
 | 回看 | `metrics_store.py view` + `up prometheus grafana` | 退出 0，归档与副本树哈希一致；Grafana 13.2.7 `/api/health` 正常、数据源与看板“Payment Hub 压测总览”自动加载，3000/9090 仅监听回环 |
 | 归档数据 | Prometheus API 查询归档副本 | 第一轮窗口末：`sum(payment_hub_http_requests_total)=25013`，整轮 P95（121s）约 17.4 ms，`pg_up=1` |
 | 导出 | `export_metrics.py --out "$RUN_DIR/metrics-export"` | 退出 0，17 个查询 + `queries.json`，CSV 为 CRLF，`metric` 列按查询名回退 |
-| 清理 | `down -v` + 按 `overall.volumes` 删除 | 仅删除本次 `run_id` 的 5 个基准卷；`docker volume ls`、`docker ps -a` 无残留，其他历史卷未受影响 |
+| 清理 | `down -v` + 按 `overall.volumes` 删除 | 实跑时按前缀 + `run_id` 删除本次 5 个基准卷，`docker volume ls`、`docker ps -a` 无残留，其他历史卷未受影响；提交前收紧为卷名精确匹配并对 inspect/rm 失败、容器标签检查做了合成用例验证（精确卷缺失→`absent` 且退出 0，不匹配卷名→退出非 0，无关卷保留） |
 
 未验证与限制：
 
