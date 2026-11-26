@@ -181,9 +181,10 @@ python3 tests/benchmark/export_metrics.py \
 确认不再需要该次运行的数据后：
 
 ```bash
-docker compose -f deploy/compose.observability.yaml down -v
-
-if python3 - "$RUN_DIR" <<'PY'
+if ! docker compose -f deploy/compose.observability.yaml down -v; then
+  echo "观测栈未停止，跳过数据删除" >&2
+  false
+elif python3 - "$RUN_DIR" <<'PY'
 import json, re, subprocess, sys
 
 run_dir = sys.argv[1]
@@ -251,12 +252,15 @@ then
   rm -rf "$RUN_DIR" "$VIEW_DIR"
 else
   echo "卷或容器清理未全部确认，保留 $RUN_DIR 以便重试" >&2
+  false
 fi
 ```
 
-`down -v` 只清理观测栈自己的卷；基准的数据库卷必须按 `summary.json` 的 `overall.volumes` 逐个删除。脚本要求卷名精确等于 `payment-hub-load-{run_id}r{轮次}_postgres_data`，区分“确认不存在”和 inspect 失败，检查 `docker volume rm` 的退出码，并按 `com.docker.compose.project` 标签检查各轮是否还有残留容器。任何一步未确认成功都会以非零状态结束并保留 `$RUN_DIR`；只有全部确认后才删除证据目录和回看副本。
+`down -v` 只清理观测栈自己的卷；基准的数据库卷必须按 `summary.json` 的 `overall.volumes` 逐个删除。`down -v` 失败时直接中止，不再执行卷删除和数据删除。脚本要求卷名精确等于 `payment-hub-load-{run_id}r{轮次}_postgres_data`，区分“确认不存在”和 inspect 失败，检查 `docker volume rm` 的退出码，并按 `com.docker.compose.project` 标签检查各轮是否还有残留容器。任何一步未确认成功都会以非零状态结束并保留 `$RUN_DIR`；只有全部确认后才删除证据目录和回看副本。
 
-第 6 步把 `PROMETHEUS_DATA_DIR` 覆盖成了回看副本路径；测量阶段的数据目录在归档成功、回看副本也已删除后即可按记录的原路径删除，`$RUN_DIR/metrics` 是唯一长期保留的数据。
+`rm -rf "$RUN_DIR"` 会连同 `$RUN_DIR/metrics` 归档一起删除；需要长期保留归档时，先把该目录移到 `$RUN_DIR` 和 `$VIEW_DIR` 之外，再执行清理。
+
+第 6 步把 `PROMETHEUS_DATA_DIR` 覆盖成了回看副本路径；测量阶段的数据目录在归档成功、回看副本也已删除后即可按记录的原路径删除，`$RUN_DIR/metrics` 是归档后唯一长期保留的数据。
 
 ## 常见问题
 
@@ -293,7 +297,7 @@ fi
 | 回看 | `metrics_store.py view` + `up prometheus grafana` | 退出 0，归档与副本树哈希一致；Grafana 13.2.7 `/api/health` 正常、数据源与看板“Payment Hub 压测总览”自动加载，3000/9090 仅监听回环 |
 | 归档数据 | Prometheus API 查询归档副本 | 第一轮窗口末：`sum(payment_hub_http_requests_total)=25013`，整轮 P95（121s）约 17.4 ms，`pg_up=1` |
 | 导出 | `export_metrics.py --out "$RUN_DIR/metrics-export"` | 退出 0，17 个查询 + `queries.json`，CSV 为 CRLF，`metric` 列按查询名回退 |
-| 清理 | `down -v` + 按 `overall.volumes` 删除 | 实跑时按前缀 + `run_id` 删除本次 5 个基准卷，`docker volume ls`、`docker ps -a` 无残留，其他历史卷未受影响；提交前收紧为卷名精确匹配并对 inspect/rm 失败、容器标签检查做了合成用例验证（精确卷缺失→`absent` 且退出 0，不匹配卷名→退出非 0，无关卷保留） |
+| 清理 | `down -v` + 按 `overall.volumes` 删除 | 实跑时按前缀 + `run_id` 删除本次 5 个基准卷，`docker volume ls`、`docker ps -a` 无残留，其他历史卷未受影响；提交前收紧为卷名精确匹配并对 inspect/rm 失败、容器标签检查做了合成用例验证（精确卷缺失→`absent` 且退出 0，不匹配卷名→退出非 0，无关卷保留）；`down -v` 失败会中止后续删除，`rm -rf` 会删除 `$RUN_DIR/metrics` 归档，需要保留时先移出 |
 
 未验证与限制：
 
