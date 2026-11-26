@@ -255,6 +255,7 @@ if failed:
 PY
 then
   docker volume ls | grep 'payment-hub-load' || true
+  measurement_failed=0
   MEASUREMENT_DIR="$(cat "$RUN_DIR/prometheus-data-dir.txt" 2>/dev/null || true)"
   case "$MEASUREMENT_DIR" in
     "")
@@ -262,14 +263,21 @@ then
     /tmp/opencode/payment-hub-metrics/run-*)
       if [ "$(dirname -- "$MEASUREMENT_DIR")" = "/tmp/opencode/payment-hub-metrics" ] \
          && [ ! -L "$MEASUREMENT_DIR" ]; then
-        rm -rf -- "$MEASUREMENT_DIR"
+        if ! rm -rf -- "$MEASUREMENT_DIR"; then
+          echo "测量数据目录删除失败，保留 $RUN_DIR 以便重试：$MEASUREMENT_DIR" >&2
+          measurement_failed=1
+        fi
       else
         echo "测量数据目录路径异常，跳过：$MEASUREMENT_DIR" >&2
       fi ;;
     *)
       echo "测量数据目录不在预期位置，跳过：$MEASUREMENT_DIR" >&2 ;;
   esac
-  rm -rf "$RUN_DIR" "$VIEW_DIR"
+  if [ "$measurement_failed" -eq 0 ]; then
+    rm -rf "$RUN_DIR" "$VIEW_DIR"
+  else
+    false
+  fi
 else
   echo "卷或容器清理未全部确认，保留 $RUN_DIR 以便重试" >&2
   false
@@ -280,7 +288,7 @@ fi
 
 `rm -rf "$RUN_DIR"` 会连同 `$RUN_DIR/metrics` 归档一起删除；需要长期保留归档时，先把该目录移到 `$RUN_DIR` 和 `$VIEW_DIR` 之外，再执行清理。
 
-第 6 步把 `PROMETHEUS_DATA_DIR` 覆盖成了回看副本路径，所以第 5 步先把测量目录记录到 `$RUN_DIR/prometheus-data-dir.txt`。成功分支会按该记录删除测量目录：只接受 `/tmp/opencode/payment-hub-metrics/run-*` 且父目录完全匹配的路径，符号链接跳过；记录缺失或路径异常时只提示并保留目录。`$RUN_DIR/metrics` 是归档后唯一长期保留的数据。
+第 6 步把 `PROMETHEUS_DATA_DIR` 覆盖成了回看副本路径，所以第 5 步先把测量目录记录到 `$RUN_DIR/prometheus-data-dir.txt`。成功分支会按该记录删除测量目录：只接受 `/tmp/opencode/payment-hub-metrics/run-*` 且父目录完全匹配的路径，符号链接跳过；记录缺失或路径异常时只提示并保留目录。测量目录删除失败时返回非零并保留 `$RUN_DIR`（含路径记录）以便重试，不会用后续删除掩盖失败。`$RUN_DIR/metrics` 是归档后唯一长期保留的数据。
 
 ## 常见问题
 
