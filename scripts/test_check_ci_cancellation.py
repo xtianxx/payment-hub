@@ -850,17 +850,23 @@ class CancellationReportSchemaTests(unittest.TestCase):
                     "errors": [
                         "cleanup:container-identity",
                         "migration-up:container-remains",
+                        "reject-env:container-cleanup",
                         "cleanup:unknown-code",
                         "cleanup:secret-marker",
+                        "private-token:reap",
                     ],
                     "tool_containers": [],
                 }
             }
         )
-        self.assertEqual(summary["error_count"], 4)
+        self.assertEqual(summary["error_count"], 6)
         self.assertEqual(
             summary["errors"],
-            ["cleanup:container-identity", "migration-up:container-remains"],
+            [
+                "cleanup:container-identity",
+                "migration-up:container-remains",
+                "reject-env:container-cleanup",
+            ],
         )
 
 

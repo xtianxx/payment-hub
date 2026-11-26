@@ -41,6 +41,22 @@ SCHEMA = "payment-hub.ci-cancellation.v1"
 LAUNCHER_SCHEMA = "payment-hub.db-foundation.v1"
 REPORT_FILENAME = "cancellation-report.json"
 STAGE = "pg-healthy"
+CLEANUP_STAGES = frozenset(
+    (
+        "cleanup",
+        "version",
+        "sql-hash",
+        "negative-dsn",
+        "migration-up",
+        "migration-up-again",
+        "reject-env",
+        "reject-down",
+        "reject-reset",
+        "reject-up-extra",
+        "reject-option",
+    )
+)
+
 CLEANUP_ERROR_PREFIX_RE = re.compile(r"[a-z0-9-]{1,40}")
 CLEANUP_STAGE_ERROR_SUFFIXES = frozenset(
     ("reap", "container-identity", "container-remains", "container-cleanup")
@@ -74,15 +90,21 @@ REPORT_PREFIX = "cancellation-report:"
 
 
 def sanitize_cleanup_error(value: Any) -> str | None:
-    """只接受启动器的固定错误码，拒绝任意文本进入上传报告。"""
+    """只接受启动器的固定错误码，拒绝任意文本进入上传报告。
+
+    启动器新增工具阶段时需同步 ``CLEANUP_STAGES``，否则带阶段的错误码会被
+    丢弃；``error_count`` 仍以原始列表为准，不受过滤影响。
+    """
     if not isinstance(value, str) or ":" not in value:
         return None
     prefix, _, suffix = value.partition(":")
-    if not CLEANUP_ERROR_PREFIX_RE.fullmatch(prefix):
-        return None
     if value in CLEANUP_ERROR_CODES:
         return value
-    if suffix in CLEANUP_STAGE_ERROR_SUFFIXES:
+    if (
+        prefix in CLEANUP_STAGES
+        and CLEANUP_ERROR_PREFIX_RE.fullmatch(prefix)
+        and suffix in CLEANUP_STAGE_ERROR_SUFFIXES
+    ):
         return value
     return None
 

@@ -8617,6 +8617,62 @@ class ExportReportsTests(unittest.TestCase):
         self.assertNotIn("secret-marker", text)
         self.assertNotIn("raw text", text)
 
+    def test_export_cancellation_caps_filtered_errors(self):
+        value = self.cancellation_report("fail")
+        stages = (
+            "cleanup",
+            "version",
+            "sql-hash",
+            "negative-dsn",
+            "migration-up",
+            "migration-up-again",
+            "reject-env",
+            "reject-down",
+            "reject-reset",
+            "reject-up-extra",
+            "reject-option",
+        )
+        suffixes = (
+            "reap",
+            "container-identity",
+            "container-remains",
+            "container-cleanup",
+        )
+        codes = [f"{stage}:{suffix}" for stage in stages for suffix in suffixes]
+        value["cleanup"]["errors"] = codes + ["private-token:reap"]
+        value["cleanup"]["error_count"] = len(codes) + 1
+        self.write(self.report_dir / "cancellation-report.json", value)
+        code, _ = self.export(["cancellation"])
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "cancellation.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(safe["status"], "exported")
+        self.assertEqual(len(safe["cleanup"]["errors"]), 32)
+        self.assertEqual(safe["cleanup"]["error_count"], len(codes) + 1)
+        self.assertNotIn("private-token:reap", safe["cleanup"]["errors"])
+
+    def test_export_cancellation_drops_unknown_stage_codes(self):
+        value = self.cancellation_report("fail")
+        value["cleanup"]["errors"] = [
+            "private-token:reap",
+            "migration-up:container-remains",
+        ]
+        value["cleanup"]["error_count"] = 2
+        self.write(self.report_dir / "cancellation-report.json", value)
+        code, _ = self.export(["cancellation"])
+        self.assertEqual(code, 1)
+        safe = json.loads(
+            (
+                self.report_dir / "upload" / "cancellation.safe.json"
+            ).read_text()
+        )
+        self.assertEqual(
+            safe["cleanup"]["errors"], ["migration-up:container-remains"]
+        )
+
     def test_export_cancellation_pass_requires_launcher_exit_1(self):
         value = self.cancellation_report("pass")
         value["launcher_exit"] = 0
