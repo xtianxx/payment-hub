@@ -77,11 +77,13 @@ func (pool *saturatingPool) acquire(ctx context.Context) error {
 }
 
 func (pool *saturatingPool) release() {
-	<-pool.slots
+	// Update the counters before freeing the slot so a woken acquire always
+	// observes idle > 0 and reuses the connection instead of counting a third.
 	pool.mu.Lock()
 	pool.acquired--
 	pool.idle++
 	pool.mu.Unlock()
+	<-pool.slots
 }
 
 func (pool *saturatingPool) MaxConns() int32 { return pool.max }
@@ -175,6 +177,10 @@ func TestPoolMetricsExposeSaturation(t *testing.T) {
 
 	waitForCondition(t, "third acquire to wait", func() bool { return pool.WaitingCount() == 1 })
 
+	// pgxpool documents empty_acquires_total as successful acquires that
+	// waited for a resource to be released or constructed. The counter is
+	// recorded when the acquire completes, so a still-waiting acquire must
+	// not appear yet; it appears after release.
 	waiting := gatherPoolValues(t, registry)
 	if got := waiting["payment_hub_db_pool_connections_in_use"]; got != 2 {
 		t.Fatalf("in-use while waiting = %v, want 2", got)
