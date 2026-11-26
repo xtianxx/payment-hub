@@ -16,6 +16,29 @@ import (
 	"payment-hub/internal/payment"
 )
 
+func counterLineValue(body, name string, labels ...string) string {
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, name+"{") {
+			continue
+		}
+		matched := true
+		for _, label := range labels {
+			if !strings.Contains(line, label) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 2 {
+			return fields[1]
+		}
+	}
+	return ""
+}
+
 func waitForMetricsBody(t *testing.T, address string) string {
 	t.Helper()
 	client := &http.Client{Timeout: 500 * time.Millisecond}
@@ -413,6 +436,9 @@ func TestMetricsListenerRecordsBusinessHTTP(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics missing %s: %s", want, body)
 		}
+	}
+	if got := counterLineValue(body, "payment_hub_http_requests_total", `method="POST"`, `route="/api/v1/payments"`, `status="201"`); got != "1" {
+		t.Fatalf("POST payment counter = %q, want 1", got)
 	}
 
 	cancel()

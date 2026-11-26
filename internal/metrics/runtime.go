@@ -1,7 +1,9 @@
 package metrics
 
 import (
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,9 +20,10 @@ type Runtime struct {
 }
 
 // NewRuntime builds a fresh runtime with Go, process and HTTP metrics. The
-// handler serves only GET /metrics; other paths return 404 and other methods
-// return 405, so a misconfigured scrape path fails loudly instead of silently
-// scraping the same data.
+// handler serves only GET /metrics. Other paths return 404, other methods
+// return 405 with an Allow header, and requests whose Host is not a loopback
+// literal are rejected with 403 so a DNS-rebinding page cannot read the
+// unauthenticated scrape through a victim browser.
 func NewRuntime() *Runtime {
 	registry := NewRegistry()
 	httpMetrics := NewHTTPMetrics(registry)
@@ -28,13 +31,50 @@ func NewRuntime() *Runtime {
 		MaxRequestsInFlight: 2,
 		Timeout:             4 * time.Second,
 	})
-	mux := http.NewServeMux()
-	mux.Handle("GET /metrics", scrape)
 	return &Runtime{
 		Registry: registry,
-		Handler:  mux,
+		Handler:  newScrapeHandler(scrape),
 		HTTP:     httpMetrics,
 	}
+}
+
+func newScrapeHandler(scrape http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/metrics" {
+			http.NotFound(writer, request)
+			return
+		}
+		if request.Method != http.MethodGet {
+			writer.Header().Set("Allow", http.MethodGet)
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !isLoopbackHost(request.Host) {
+			http.Error(writer, "forbidden", http.StatusForbidden)
+			return
+		}
+		scrape.ServeHTTP(writer, request)
+	})
+}
+
+// isLoopbackHost reports whether the Host header names the local machine by a
+// loopback literal or the conventional localhost name. Anything else, including
+// an attacker-controlled rebinding domain, is rejected.
+func isLoopbackHost(hostport string) bool {
+	if hostport == "" {
+		return false
+	}
+	host := hostport
+	if splitHost, _, err := net.SplitHostPort(hostport); err == nil {
+		host = splitHost
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Middleware returns the HTTP middleware for this runtime. A nil runtime

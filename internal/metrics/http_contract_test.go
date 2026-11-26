@@ -68,6 +68,16 @@ func requestSeries(family *dto.MetricFamily) map[string]bool {
 	return series
 }
 
+func requestCounts(family *dto.MetricFamily) map[string]float64 {
+	counts := make(map[string]float64, len(family.GetMetric()))
+	for _, metric := range family.GetMetric() {
+		labels := metricLabels(metric)
+		key := labels["method"] + "|" + labels["route"] + "|" + labels["status"]
+		counts[key] = metric.GetCounter().GetValue()
+	}
+	return counts
+}
+
 func TestHTTPMetricsUsesRouteTemplatesAndSkipsReadyz(t *testing.T) {
 	router, registry := newContractRouter(t)
 
@@ -109,6 +119,21 @@ func TestHTTPMetricsUsesRouteTemplatesAndSkipsReadyz(t *testing.T) {
 			t.Fatalf("missing request series %q; got %v", want, series)
 		}
 	}
+	counts := requestCounts(family)
+	for key, want := range map[string]float64{
+		"POST|/api/v1/payments|201":            1,
+		"GET|/api/v1/payments/:payment_id|200": 1,
+		"GET|unmatched|404":                    1,
+		"GET|/unauthorized|401":                1,
+		"OTHER|unmatched|404":                  1,
+	} {
+		if got := counts[key]; got != want {
+			t.Fatalf("request count %q = %v, want %v", key, got, want)
+		}
+	}
+	if len(counts) != 5 {
+		t.Fatalf("unexpected request series count = %d, want 5: %v", len(counts), counts)
+	}
 	for key := range series {
 		if strings.Contains(key, "/readyz") || strings.Contains(key, "/metrics") {
 			t.Fatalf("probe or metrics path must not be recorded: %v", series)
@@ -141,8 +166,8 @@ func TestHTTPMetricsHistogramUsesConfiguredBuckets(t *testing.T) {
 	if histogram == nil {
 		t.Fatal("duration metric is not a histogram")
 	}
-	if got := len(histogram.GetBucket()); got != len(HTTPDurationBuckets) {
-		t.Fatalf("bucket count = %d, want %d", got, len(HTTPDurationBuckets))
+	if got := len(histogram.GetBucket()); got != len(HTTPDurationBuckets()) {
+		t.Fatalf("bucket count = %d, want %d", got, len(HTTPDurationBuckets()))
 	}
 	if got := family.GetMetric()[0].GetHistogram().GetSampleCount(); got != 1 {
 		t.Fatalf("sample count = %d, want 1", got)

@@ -9,12 +9,21 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// HTTPDurationBuckets covers the current 10-25 ms P95 with extra resolution
-// between 5 and 30 ms. Each route template adds one bucket series per boundary.
-var HTTPDurationBuckets = []float64{
+// httpDurationBuckets covers the current 10-25 ms P95 with extra resolution
+// between 5 and 30 ms. Each route template adds one exported bucket series per
+// boundary plus the implicit +Inf series. The slice is private so a caller
+// cannot change the boundaries of already-created or future registries.
+var httpDurationBuckets = []float64{
 	0.001, 0.0025, 0.005, 0.0075, 0.01, 0.0125,
 	0.015, 0.0175, 0.02, 0.025, 0.03, 0.04,
 	0.05, 0.075, 0.1, 0.25, 0.5, 1, 2.5, 5,
+}
+
+// HTTPDurationBuckets returns a copy of the canonical finite bucket
+// boundaries. Callers may inspect or format the copy without affecting
+// registries built by NewHTTPMetrics.
+func HTTPDurationBuckets() []float64 {
+	return append([]float64(nil), httpDurationBuckets...)
 }
 
 // HTTPMetrics owns the request counter and duration histogram.
@@ -35,7 +44,7 @@ func NewHTTPMetrics(registerer prometheus.Registerer) *HTTPMetrics {
 			Namespace: "payment_hub",
 			Name:      "http_request_duration_seconds",
 			Help:      "HTTP request duration from entering the API route group to handler return.",
-			Buckets:   HTTPDurationBuckets,
+			Buckets:   httpDurationBuckets,
 		}, []string{"method", "route"}),
 	}
 	registerer.MustRegister(metrics.requests, metrics.duration)
