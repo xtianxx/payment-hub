@@ -1,0 +1,11 @@
+# 自定义 PostgreSQL 查询，通过 --extend.query-path 加载。
+# exporter 对外暴露的指标名为 pg_benchmark_waiting_locks 和 pg_benchmark_granted_locks，不带用户标签。
+pg_benchmark:
+  query: SELECT count(*) FILTER (WHERE NOT granted) AS waiting_locks, count(*) FILTER (WHERE granted) AS granted_locks FROM pg_locks
+  metrics:
+    - waiting_locks:
+        usage: GAUGE
+        description: 当前等待授予的锁数量
+    - granted_locks:
+        usage: GAUGE
+        description: 当前已授予的锁数量

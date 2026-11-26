@@ -28,9 +28,9 @@
 **Purpose**: 建立依赖、目录和脚本骨架，不实现行为。
 
 - [ ] T001 在 `go.mod` / `go.sum` 引入 `github.com/prometheus/client_golang v1.25.0`，执行 `go mod tidy` 和 `go build ./...`，确认现有构建不受影响
-- [ ] T002 [P] 创建 `deploy/compose.observability.yaml` 与 `deploy/observability/` 目录骨架，包括 `prometheus.yml`、`prometheus.view.yml`、`postgres-exporter-user`、`postgres-exporter-queries.yaml`、`grafana/provisioning/datasources/prometheus.yml`、`grafana/provisioning/dashboards/provider.yml`、`grafana/dashboards/overview.json`
-- [ ] T003 [P] 创建 `tests/benchmark/check_metrics_evidence.py` 和 `tests/benchmark/export_metrics.py` 的 argparse 骨架，写入 0/2/3/4 退出码注释；创建 `tests/benchmark/test_metrics_evidence.py`、`tests/benchmark/test_export_metrics.py`，先断言 `--help` 可用、错误参数返回 2
-- [ ] T004 [P] 创建 `docs/observability.md` 中文骨架，包含启动、密码文件、验证、归档、回看、导出、清理、限制八节，暂不填入命令
+- [x] T002 [P] 创建 `deploy/compose.observability.yaml` 与 `deploy/observability/` 目录骨架，包括 `prometheus.yml`、`prometheus.view.yml`、`postgres-exporter-user`、`postgres-exporter-queries.yaml`、`grafana/provisioning/datasources/prometheus.yml`、`grafana/provisioning/dashboards/provider.yml`、`grafana/dashboards/overview.json`
+- [x] T003 [P] 创建 `tests/benchmark/check_metrics_evidence.py` 和 `tests/benchmark/export_metrics.py` 的 argparse 骨架，写入 0/2/3/4 退出码注释；创建 `tests/benchmark/test_metrics_evidence.py`、`tests/benchmark/test_export_metrics.py`，先断言 `--help` 可用、错误参数返回 2
+- [x] T004 [P] 创建 `docs/observability.md` 中文骨架，包含启动、密码文件、验证、归档、回看、导出、清理、限制八节，暂不填入命令
 
 ---
 

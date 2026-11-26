@@ -1,0 +1,5 @@
+# 基准运行期间的 Prometheus 抓取配置（骨架）。
+# 后续任务在此填入应用指标目标 127.0.0.1:9091 和 PostgreSQL exporter 目标 127.0.0.1:9187。
+global: { scrape_interval: 5s, scrape_timeout: 4s }
+
+scrape_configs: []

@@ -1,0 +1,11 @@
+{
+  "uid": "payment-hub-overview",
+  "title": "Payment Hub 压测总览",
+  "schemaVersion": 39,
+  "panels": [],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s"
+}

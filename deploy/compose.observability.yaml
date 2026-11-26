@@ -1,0 +1,4 @@
+# 观测栈 Compose 骨架。
+# 后续任务在此填充 Prometheus、Grafana 和 postgres-exporter 服务；
+# 本文件当前仅为骨架，不包含任何实际服务，避免半成品被误用。
+services: {}
