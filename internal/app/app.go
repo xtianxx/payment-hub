@@ -123,11 +123,14 @@ func realRuntimeDeps() runtimeDeps {
 			return &httpRuntimeServer{server: server}
 		},
 		newMetricsRuntime: func(_ context.Context, db runtimeDatabase) (*metrics.Runtime, error) {
-			pool, err := businessPool(db)
-			if err != nil {
-				return nil, err
+			provider, ok := db.(poolStatsProvider)
+			if !ok || provider == nil {
+				return nil, ErrStartup
 			}
-			return metrics.NewRuntimeWithPool(func() metrics.PoolStats { return pool.Stat() }), nil
+			if provider.BusinessPoolStats() == nil {
+				return nil, ErrStartup
+			}
+			return metrics.NewRuntimeWithPool(provider.BusinessPoolStats), nil
 		},
 		newBusiness:      productionNewBusiness,
 		businessRequired: true,
@@ -239,6 +242,17 @@ func (db *pgxpoolRuntimeDatabase) BusinessPool() *pgxpool.Pool {
 		return nil
 	}
 	return db.pool
+}
+
+// BusinessPoolStats returns a fresh snapshot of the same production pool for
+// the metrics collector. It never creates a pool, and a nil receiver or nil
+// pool yields nil so the metrics runtime fails closed instead of fabricating
+// zeros.
+func (db *pgxpoolRuntimeDatabase) BusinessPoolStats() metrics.PoolStats {
+	if db == nil || db.pool == nil {
+		return nil
+	}
+	return db.pool.Stat()
 }
 
 func parseRuntimeDatabaseConfig(databaseURL string) (*pgxpool.Config, error) {
