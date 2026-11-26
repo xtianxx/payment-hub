@@ -1,4 +1,114 @@
-# 观测栈 Compose 骨架。
-# 后续任务在此填充 Prometheus、Grafana 和 postgres-exporter 服务；
-# 本文件当前仅为骨架，不包含任何实际服务，避免半成品被误用。
-services: {}
+# 本地压测观测栈：Prometheus、postgres-exporter、Grafana。
+# 仅支持 Linux/WSL2 同一来宾的 host 网络；不支持 Docker Desktop 的独立虚拟机。
+# 所有服务只监听回环地址，不发布 ports，不提供公网或生产用途。
+# 启动前由操作者提供 PROMETHEUS_DATA_DIR、HOST_UID、HOST_GID 和监控密码文件。
+name: payment-hub-observability
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    platform: linux/amd64
+    network_mode: host
+    restart: "no"
+    user: "${HOST_UID:?请设置 HOST_UID}:${HOST_GID:?请设置 HOST_GID}"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-100y}
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - type: bind
+        source: ${PROMETHEUS_DATA_DIR:?请设置本次运行的 Prometheus 数据目录}
+        target: /prometheus
+      - type: bind
+        source: ${PROMETHEUS_CONFIG_FILE:-./observability/prometheus.yml}
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.21.1
+    platform: linux/amd64
+    network_mode: host
+    restart: "no"
+    user: "${HOST_UID:?请设置 HOST_UID}:${HOST_GID:?请设置 HOST_GID}"
+    command:
+      - --datasource.uri=127.0.0.1:55432/postgres?sslmode=disable
+      - --datasource.user-file=/run/payment-hub-monitor-user
+      - --datasource.pass-file=/run/payment-hub-monitor-password
+      - --web.listen-address=127.0.0.1:9187
+      - --collection-timeout=3s
+      - --extend.query-path=/etc/postgres-exporter/queries.yaml
+      - --no-collector.settings
+      - --no-collector.stat_activity
+      - --no-collector.stat_activity_autovacuum
+      - --no-collector.stat_user_tables
+      - --no-collector.statio_user_tables
+      - --no-collector.statio_user_indexes
+      - --no-collector.stat_progress_vacuum
+      - --no-collector.locks
+      - --no-collector.database
+      - --no-collector.replication
+      - --no-collector.replication_slots
+      - --no-collector.database_wraparound
+      - --no-collector.long_running_transactions
+      - --no-collector.process_idle
+    volumes:
+      - type: bind
+        source: ./observability/postgres-exporter-queries.yaml
+        target: /etc/postgres-exporter/queries.yaml
+        read_only: true
+      - type: bind
+        source: ./observability/postgres-exporter-user
+        target: /run/payment-hub-monitor-user
+        read_only: true
+      - type: bind
+        source: ${PAYMENT_HUB_MONITOR_PASSWORD_FILE:?请设置监控密码文件路径}
+        target: /run/payment-hub-monitor-password
+        read_only: true
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  grafana:
+    image: grafana/grafana:13.2.7
+    platform: linux/amd64
+    network_mode: host
+    restart: "no"
+    environment:
+      GF_SERVER_HTTP_ADDR: "127.0.0.1"
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+    volumes:
+      - type: bind
+        source: ./observability/grafana/provisioning
+        target: /etc/grafana/provisioning
+        read_only: true
+      - type: bind
+        source: ./observability/grafana/dashboards
+        target: /var/lib/grafana/dashboards
+        read_only: true
+      - type: volume
+        source: grafana_data
+        target: /var/lib/grafana
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  grafana_data: {}
