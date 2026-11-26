@@ -100,7 +100,7 @@ MIGRATE_ENV_KEYS = {"GOOSE_DRIVER", "GOOSE_DBSTRING", "TZ", "HOME"}
 FROZEN_SHA256 = {
     ".dockerignore": "a52495f2a13adc2da7c07ec2950082b6f3177e629b5551583f2b6b4dd986e4b7",
     "go.mod": "237e726d401fd3280a9de3b269df8a30aee2096c235b8089a4466c1e2fdb4af7",
-    "go.sum": "d1b61d234955907c54eb85b8e713de1d0da9aa9670dd41b1ad9e9fac50291cc3",
+    "go.sum": "663e60a79c2715386ae36d61fb1da71a1478a8d62e0108df56e260578213ebd8",
     "deploy/compose.yaml": "aa992418cd960cc9c8f55089119519dd61e2a559090659fcb5e1f2d7757bc68a",
     "deploy/compose.test.yaml": "0b6e3127d6c540506b2b4af1590b17972e8d61e7e006819c94c891f66f05eb04",
     "deploy/Dockerfile.app": "8cdeb7bf77880ccaad47889dd252680aeb56b4c57703184ee5c758fdcb7a1390",
