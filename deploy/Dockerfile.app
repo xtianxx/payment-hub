@@ -35,7 +35,7 @@ COPY internal/mock/hooks.go internal/mock/query.go internal/mock/transaction.go 
 COPY internal/payment/errors.go internal/payment/identity.go internal/payment/ports.go internal/payment/query.go internal/payment/query_types.go internal/payment/result.go internal/payment/submit.go internal/payment/submit_validation.go internal/payment/types.go internal/payment/validation.go /src/internal/payment/
 COPY internal/postgres/hooks.go internal/postgres/lookup.go internal/postgres/orders.go internal/postgres/results.go /src/internal/postgres/
 COPY internal/testcontrol/client.go internal/testcontrol/protocol.go /src/internal/testcontrol/
-COPY internal/metrics/http.go internal/metrics/registry.go internal/metrics/runtime.go /src/internal/metrics/
+COPY internal/metrics/http.go internal/metrics/pool.go internal/metrics/registry.go internal/metrics/runtime.go /src/internal/metrics/
 
 RUN mkdir -p /out
 RUN go build -mod=readonly -trimpath -o /out/payment-hub ./cmd/payment-hub
