@@ -2559,7 +2559,7 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
                 for forbidden in ("3×120", "3 * 120", "3个120", "三个 120"):
                     self.assertNotIn(forbidden, text)
 
-    def test_all_32_bash_blocks_parse_with_bash_n(self):
+    def test_all_bash_blocks_parse_with_bash_n(self):
         bash = shutil.which("bash")
         self.assertIsNotNone(bash)
         scripts = [
@@ -2569,7 +2569,7 @@ class SetupWorkflowBatchBudgetTests(unittest.TestCase):
             for step in job.get("steps", [])
             if step.get("shell") == "bash"
         ]
-        self.assertEqual(len(scripts), 32)
+        self.assertEqual(len(scripts), 34)
         for index, script in enumerate(scripts):
             result = subprocess.run(
                 [bash, "-n"],

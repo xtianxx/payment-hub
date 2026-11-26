@@ -207,6 +207,8 @@ CI_STEP_NAMES = {
         "Check CI contract metadata",
         "Run foundation unit checks",
         "Check launcher syntax and safety regressions",
+        "Install benchmark test dependency",
+        "Run benchmark script tests",
         "Export safe setup reports",
         "Upload safe setup reports",
     ),
