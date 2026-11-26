@@ -38,14 +38,22 @@ export HOST_GID="$(id -g)"
 
 ```bash
 export PROMETHEUS_DATA_DIR="/tmp/opencode/payment-hub-metrics/$(date -u +%Y%m%dT%H%M%SZ)"
+export PROMETHEUS_CONFIG_FILE="$PWD/deploy/observability/prometheus.yml"
 mkdir -p "$PROMETHEUS_DATA_DIR"
 chmod 700 "$PROMETHEUS_DATA_DIR"
 
 docker compose -f deploy/compose.observability.yaml up -d prometheus postgres-exporter
+```
+
+显式设置 `PROMETHEUS_CONFIG_FILE` 指向测量配置，避免沿用 shell 中残留的回看配置。
+
+`verify_observability.py` 需要基准数据库已经启动、`postgres_exporter` 角色已由基准入口创建，因此应在基准第一轮开始后另开终端执行：
+
+```bash
 python3 tests/benchmark/verify_observability.py --timeout 30
 ```
 
-`verify_observability.py` 退出码：`0` 通过，`2` 传输错误，`3` 契约不满足。检查内容包括 `pg_up=1`、`pg_benchmark_waiting_locks`、`pg_stat_database_xact_commit`，以及 exporter 不暴露 `usename`/`application_name`。
+退出码：`0` 通过，`2` 传输错误，`3` 契约不满足。检查内容包括 `pg_up=1`、`pg_benchmark_waiting_locks`、`pg_stat_database_xact_commit`，以及 exporter 不暴露 `usename`/`application_name`。
 
 ## 3. 运行基准
 
@@ -142,18 +150,34 @@ docker compose -f deploy/compose.observability.yaml down -v
 rm -rf "$VIEW_DIR"
 
 python3 - "$RUN_DIR" <<'PY'
-import json, subprocess, sys
+import json, re, subprocess, sys
 
 run_dir = sys.argv[1]
 with open(f"{run_dir}/summary.json", encoding="utf-8") as f:
     summary = json.load(f)
+run_id = str(summary.get("run_id", ""))
+if re.fullmatch(r"[0-9a-f]{12}", run_id) is None:
+    raise SystemExit(f"summary.json 的 run_id 不是 12 位十六进制：{run_id!r}")
+
 for item in summary.get("overall", {}).get("volumes", []):
-    volume = item.get("volume")
-    if volume:
-        print("removing", volume)
-        subprocess.run(["docker", "volume", "rm", volume], check=False)
+    volume = str(item.get("volume", ""))
+    # 只删除本次运行的基准卷：名称必须同时带基准前缀和 run_id。
+    if not volume.startswith("payment-hub-load-") or run_id not in volume:
+        print("skipping unverified volume", volume)
+        continue
+    inspect = subprocess.run(
+        ["docker", "volume", "inspect", volume],
+        capture_output=True, text=True,
+    )
+    if inspect.returncode != 0:
+        print("not found", volume)
+        continue
+    print("removing", volume)
+    subprocess.run(["docker", "volume", "rm", volume], check=False)
 PY
 ```
+
+清理脚本只接受同时带 `payment-hub-load-` 前缀和本次 `run_id` 的卷名，并先用 `docker volume inspect` 确认存在；其他卷名只打印跳过，避免被篡改的 `summary.json` 删除无关数据。
 
 - 观测栈数据目录 `$PROMETHEUS_DATA_DIR` 与回看副本 `$VIEW_DIR` 按需手动删除；归档目录 `$RUN_DIR/metrics` 不随 `down -v` 删除。
 - 基准数据库卷必须按 `summary.json.overall.volumes` 逐个删除，不能把 `down -v` 当作基准卷清理。
