@@ -4,6 +4,10 @@
 
 本流程在本地跑一次完整压测（5 个测量轮），采集应用与 PostgreSQL 指标，归档后用 Grafana 回看。所有端口只绑定回环，观测栈使用 host 网络。
 
+## 当前实现范围（MVP）
+
+本文件描述目标形态的完整流程。当前只完成 T001–T014：`deploy/compose.observability.yaml` 仍是 `services: {}` 骨架，`check_metrics_evidence.py` 与 `export_metrics.py` 仍是占位脚本，基准入口仍是 3 轮且不会设置 `PAYMENT_HUB_METRICS_ADDR`。因此第 2、3、4、7 步的 Compose 启动、5 轮参数、证据检查和导出在执行时还不可用，将在 US2–US4 实现；第 1、5、6 步的边界与目录约定已确定，但需要真实数据目录才能执行。
+
 ## 前置条件
 
 - Linux 或 WSL2 同一来宾的 Docker Engine；host 网络只在该形态下可靠，不支持 Docker Desktop 的独立虚拟机模式。
@@ -102,16 +106,24 @@ python3 -m json.tool "$RUN_DIR/metrics-evidence.json"
 ## 5. 停止并归档指标数据
 
 ```bash
+set -euo pipefail
 docker compose -f deploy/compose.observability.yaml down
 
+test -d "$PROMETHEUS_DATA_DIR"
+test ! -e "$RUN_DIR/metrics"
+test ! -e "$RUN_DIR/metrics.tmp"
+
 mkdir -p "$RUN_DIR/metrics.tmp"
-cp -a "$PROMETHEUS_DATA_DIR"/. "$RUN_DIR/metrics.tmp/"
+if ! cp -a "$PROMETHEUS_DATA_DIR"/. "$RUN_DIR/metrics.tmp/"; then
+  echo "archive copy failed; keeping $RUN_DIR/metrics.tmp" >&2
+  exit 1
+fi
 test -d "$RUN_DIR/metrics.tmp/wal"
 du -sh "$RUN_DIR/metrics.tmp"
 mv "$RUN_DIR/metrics.tmp" "$RUN_DIR/metrics"
 ```
 
-先停止 Prometheus 再复制，确保 WAL 已落盘。复制完成后 rename，避免出现半个 `metrics/`。如果复制失败，保留 `metrics.tmp/`，并在 `metrics-evidence.json` 记录 `archive_error`，不要删除临时目录。
+先停止 Prometheus 再复制，确保 WAL 已落盘。复制的每一步失败都会在 rename 前退出，保留 `metrics.tmp/` 供人工处理；只有复制成功且 `wal/` 存在时才原子重命名为 `metrics/`。失败时在 `metrics-evidence.json` 记录 `archive_error`，不要删除临时目录。
 
 如果运行被中断，仍按同样步骤停止并归档；证据只判定实际完成的测量阶段，未运行的阶段记为缺失。
 

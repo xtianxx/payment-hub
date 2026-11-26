@@ -61,6 +61,7 @@
         "payment_hub_http_requests_total": "present",
         "payment_hub_http_request_duration_seconds_bucket": "present",
         "go_goroutines": "present",
+        "payment_hub_db_pool_connections_max": "present",
         "payment_hub_db_pool_connections_in_use": "present",
         "payment_hub_db_pool_acquires_total": "present",
         "payment_hub_db_pool_acquire_duration_seconds_total": "present",
@@ -68,8 +69,10 @@
         "pg_up": "present",
         "pg_stat_database_xact_commit": "present",
         "pg_stat_database_blks_hit": "present",
+        "pg_stat_database_blks_read": "present",
         "pg_benchmark_waiting_locks": "present",
-        "pg_stat_bgwriter_checkpoints_timed_total": "present"
+        "pg_stat_bgwriter_checkpoints_timed_total": "present",
+        "pg_stat_bgwriter_checkpoint_write_time_total": "present"
       },
       "status": "complete",
       "missing": []
@@ -82,8 +85,8 @@
 ```
 
 - `stages` 只包含实际运行的测量阶段；中断时未运行的阶段不写入，整体 `status` 为 `incomplete`。
-- 关键序列覆盖 SC-001、SC-003、SC-004 的验收查询：HTTP 计数与直方图、Go 运行时、连接池使用/获取/等待/无空闲、`pg_up`、事务、缓存、等待锁和检查点各至少一条。
-- `scrapes.expected` 按 `max(0, floor(窗口秒数 / 5) - 1)` 计算，允许 1 个边界样本的容差；`observed` 用 `count_over_time(up[window])` 取得，用于发现 Prometheus 自身中断。
+- 关键序列覆盖 SC-001、SC-003、SC-004 的验收查询：HTTP 计数与直方图、Go 运行时、连接池上限/使用/获取/等待/无空闲、`pg_up`、事务、缓存命中率（`blks_hit` 与 `blks_read`）、等待锁和检查点定时/写入耗时各至少一条。
+- `scrapes.expected` 按 `max(0, floor(窗口秒数 / 5) - 1)` 计算；减 1 只用于窗口起止样本对齐，不得解释为允许窗口内部缺失。窗口内部缺口必须独立检测：相邻 `up` 样本间隔超过 5 秒抓取间隔的 1.5 倍即判 `incomplete`，`observed < expected` 同样判 `incomplete`。`observed` 用 `count_over_time(up[window])` 统计，专门用于发现 Prometheus 自身中断（FR-029）。
 - `status` 只有 `complete` 和 `incomplete`；整体 `complete` 要求所有阶段 `complete`。
 - `missing` 列出缺失的目标、`pg_up` 或序列；`incomplete` 时不得用于指标验收。
 - 归档失败时额外记录 `archive_error`，整体仍为 `incomplete`，并保留临时目录供人工处理。

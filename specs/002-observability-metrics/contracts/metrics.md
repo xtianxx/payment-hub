@@ -31,7 +31,7 @@
 0.001, 0.0025, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.25, 0.5, 1, 2.5, 5
 ```
 
-覆盖当前约 10–25 ms 的 P95，并在 5–30 ms 区间保留足够分辨率；这 20 个是有限桶边界，文本暴露时每个路由另有 1 个 `+Inf` 桶，共 21 条桶序列，2 个模板共 42 条桶序列。
+覆盖当前约 10–25 ms 的 P95，并在 5–30 ms 区间保留足够分辨率；这 20 个是有限桶边界，文本暴露时每个 method-route 组合另有 1 个 `+Inf` 桶和 `_sum`/`_count`，共 23 条序列；当前最多 3 个已匹配组合和 3 个 `unmatched` 组合（GET/POST/OTHER），合计不超过 138 条。
 
 **端点访问**：
 
@@ -77,7 +77,7 @@
 - 关闭：`settings`、`stat_activity`、`stat_activity_autovacuum`、`stat_user_tables`、`statio_user_tables`、`statio_user_indexes`、`stat_progress_vacuum`、`locks`、`database`、`replication`、`replication_slots`、`database_wraparound`、`long_running_transactions`、`process_idle`。
 - 保留：`stat_database`、`stat_bgwriter`；`pg_up` 由 exporter 自身提供。
 - 自定义查询：`deploy/observability/postgres-exporter-queries.yaml` 提供 `pg_benchmark_waiting_locks` 和 `pg_benchmark_granted_locks`，不带 `usename`、`application_name` 等标签。
-- 该文件使用 v0.21.1 的 `--extend.query-path`（已标记 deprecated）；实现时必须验证输出名称，失败时回退为接受 `stat_activity` 并重新评估基数预算。
+- 该文件使用 v0.21.1 的 `--extend.query-path`（已标记 deprecated）；实现时必须验证输出名称，失败时不得退回 `stat_activity`（FR-028 禁止该 collector 及其用户标签），锁等待指标标记为 No data 并在证据与文档中记录限制。
 
 | 指标 | 类型 | 关键标签 | 说明 |
 |---|---|---|---|
@@ -143,10 +143,13 @@ sum by (route, status) (rate(payment_hub_http_requests_total[1m]))
   or vector(0)
 )
 /
-sum(rate(payment_hub_http_requests_total[1m]))
+(
+  sum(rate(payment_hub_http_requests_total[1m]))
+  > 0
+)
 ```
 
-无请求时结果为空（看板显示 No data）；有请求但无 5xx 时为 0。
+无请求或窗口内计数器增量为 0 时结果为空（看板显示 No data），不返回 `NaN`；有请求但无 5xx 时为 0。
 
 **4xx/5xx 速率**
 
@@ -203,10 +206,13 @@ rate(payment_hub_db_pool_empty_acquires_total[1m])
 ```promql
 rate(payment_hub_db_pool_acquire_duration_seconds_total[1m])
 /
-rate(payment_hub_db_pool_acquires_total[1m])
+(
+  rate(payment_hub_db_pool_acquires_total[1m])
+  > 0
+)
 ```
 
-无获取时结果为空，不伪装成 0。
+无获取或窗口内增量为 0 时结果为空，不返回 `NaN`，也不伪装成 0。
 
 **PostgreSQL 事务速率**
 
@@ -228,13 +234,16 @@ pg_benchmark_waiting_locks
 sum(rate(pg_stat_database_blks_hit[1m]))
 /
 (
-  sum(rate(pg_stat_database_blks_hit[1m]))
-  +
-  sum(rate(pg_stat_database_blks_read[1m]))
+  (
+    sum(rate(pg_stat_database_blks_hit[1m]))
+    +
+    sum(rate(pg_stat_database_blks_read[1m]))
+  )
+  > 0
 )
 ```
 
-分母为 0（窗口内没有块访问）时结果为空，不显示 0。
+分母为 0（窗口内没有块访问）时结果为空，不返回 `NaN`，也不显示 0。
 
 **临时文件速率**
 
@@ -263,11 +272,11 @@ sum(rate(pg_stat_bgwriter_checkpoint_write_time_total[1m]))
 
 ## 基数预算
 
-- HTTP：2 个路由模板、3 个方法-路由组合；请求序列不超过 24 条，直方图 2 个模板 × (20 个有限桶 + 1 个 `+Inf` 桶) + 4 条 sum/count，共 46 条。
+- HTTP：请求序列不超过 24 条；直方图最多 6 个 method-route 组合（3 个已匹配 + GET/POST/OTHER 的 `unmatched`）× (20 个有限桶 + 1 个 `+Inf` 桶 + 2 条 sum/count) = 138 条。
 - 连接池：12 条固定序列。
 - Go/进程：约 30 条标准序列。
 - PostgreSQL：`stat_database` 约 19 个指标 × 4 个 `datname`，`stat_bgwriter` 约 10 条，自定义锁查询 2 条，共约 90 条。
-- 总量目标：一次运行少于 300 条时间序列；不得随订单数量增长。
+- 总量目标：一次运行少于 300 条时间序列（上述上限合计约 294 条）；不得随订单数量增长。
 
 ## 变更规则
 
