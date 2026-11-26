@@ -82,6 +82,7 @@
 ```
 
 - `stages` 只包含实际运行的测量阶段；中断时未运行的阶段不写入，整体 `status` 为 `incomplete`。
+- 关键序列覆盖 SC-001、SC-003、SC-004 的验收查询：HTTP 计数与直方图、Go 运行时、连接池使用/获取/等待/无空闲、`pg_up`、事务、缓存、等待锁和检查点各至少一条。
 - `scrapes.expected` 按 `max(0, floor(窗口秒数 / 5) - 1)` 计算，允许 1 个边界样本的容差；`observed` 用 `count_over_time(up[window])` 取得，用于发现 Prometheus 自身中断。
 - `status` 只有 `complete` 和 `incomplete`；整体 `complete` 要求所有阶段 `complete`。
 - `missing` 列出缺失的目标、`pg_up` 或序列；`incomplete` 时不得用于指标验收。

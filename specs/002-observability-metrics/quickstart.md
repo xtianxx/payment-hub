@@ -35,11 +35,14 @@ export HOST_GID=$(id -g)
 测量期间只启动 Prometheus 和 exporter，不启动 Grafana，避免额外 CPU 竞争。
 
 ```bash
+docker network inspect host >/dev/null
 export PROMETHEUS_DATA_DIR="/tmp/opencode/payment-hub-metrics/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$PROMETHEUS_DATA_DIR"
 
 docker compose -f deploy/compose.observability.yaml up -d prometheus postgres-exporter
 ```
+
+`docker network inspect host` 只验证 host 网络存在；Docker Desktop 的独立虚拟机不满足本方案前提。数据目录必须属于 `HOST_UID`，否则 Prometheus 无法写 WAL。
 
 确认两个端点可访问：
 
@@ -178,7 +181,10 @@ rm -rf "$RUN_DIR" "$VIEW_DIR"
 | `up{job="postgres"}=0` | exporter 是否启动；`curl http://127.0.0.1:9187/metrics` 是否可访问 |
 | `up{job="postgres"}=1` 但 `pg_up=0` | exporter 在运行，但连不上数据库；检查 55432 和数据库容器是否就绪 |
 | 看板显示 No data | 时间窗是否选对；该时间段是否真的没有请求；不要把它当成 0 |
+| Grafana 数据源不可达 | 检查 `http://127.0.0.1:9090` 是否可访问；看板显示错误或 No data，不当作 0 |
 | 5xx 比例为 0 | 有请求但没有 5xx，属于正常的 0；无请求时应为 No data |
+| 归档失败或磁盘不足 | 保留 `metrics.tmp/`，证据记录 `archive_error`；不要删除已有证据或临时目录 |
+| 运行数据保留多久 | 保留到观察者确认清理；不设自动保留上限，磁盘不足时先停止归档 |
 | 端口冲突 | 基准入口只管 55432/9091；9090/9187 冲突看 Compose 报错；3000 只在回看阶段占用 |
 | 密码文件被拒绝 | 权限必须是 `0600`，内容为单行非空密码；入口只检查一次 |
 | exporter 读不到密码 | 确认已导出 `HOST_UID`/`HOST_GID`，且 Compose 以该身份挂载只读文件 |

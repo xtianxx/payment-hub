@@ -20,7 +20,7 @@
 
 **标签取值**：
 
-- `method`：实际 HTTP 方法，当前为 `POST` 或 `GET`。
+- `method`：当前为 `GET`、`POST`；其他方法归入固定值 `OTHER`，避免无界序列。
 - `route`：Gin 的路由模板，当前为 `/api/v1/payments`、`/api/v1/payments/:payment_id`；未匹配路由为 `unmatched`。
 - `status`：`200`、`201`、`400`、`401`、`404`、`409`、`500`、`503` 等有限集合。
 - `/readyz` 不计入；指标端点在不同监听上，不进入本组指标。
@@ -247,6 +247,8 @@ sum(rate(pg_stat_bgwriter_checkpoint_write_time_total[1m]))
 | 查询 | 抓取失败 | 抓取成功、无请求 | 抓取成功、有请求 |
 |---|---|---|---|
 | 请求速率 | 0（用 `up=0` 区分） | 0 | >0 |
+| 4xx 速率 | 0（用 `up=0` 区分） | 0 | ≥0 |
+| 5xx 速率 | 0（用 `up=0` 区分） | 0 | ≥0 |
 | 5xx 比例 | No data | No data | 0 或 >0 |
 | 平均获取等待 | No data | No data（无获取） | 0 或 >0 |
 | 数据库事务速率 | No data（`pg_up=0`） | 0 或 No data | >0 |

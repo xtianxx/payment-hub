@@ -45,7 +45,7 @@
 ## Key Technical Decisions
 
 - **指标端点按需开启**：仅当设置非空 `PAYMENT_HUB_METRICS_ADDR` 时启动第二个监听；地址必须是字面回环 IP:port，拒绝 `0.0.0.0`、`::`、空 host 和非回环主机名；未设置或空值不启动监听；开启后监听失败视为启动失败。
-- **第二监听与现有生命周期集成**：在现有启动预算内同时建立业务监听和指标监听，任一失败按配置语义关闭已建立资源；两个 server 共享同一个 shutdown deadline，先停止指标监听再停业务 server；连接池通过窄接口传给采集器。
+- **第二监听与现有生命周期集成**：在现有启动预算内同时建立业务监听和指标监听，任一失败按配置语义关闭已建立资源；两个 server 共享同一个 shutdown deadline，指标监听先停止并只使用最多 500ms 或四分之一预算的受限子窗口，随后业务 server 使用剩余预算；metrics 清理失败不跳过 gate drain、testMode.Seal 和数据库关闭；连接池通过窄接口传给采集器。
 - **独立注册表**：使用 `prometheus.NewRegistry()`，注册 Go collector、process collector、连接池采集器和 HTTP 指标，不使用全局默认注册表，避免测试污染。
 - **Gin 指标中间件**：全局注册在路由之前，按方法、`c.FullPath()` 路由模板、精确状态码和耗时记录；`/readyz` 跳过；未匹配路由归入固定值 `unmatched`；计时到 handler 链返回为止，包含响应写入但不含 socket 刷新。
 - **连接池采集器**：实现 `prometheus.Collector`，从 `pgxpool.Stat()` 读取上限、总数、空闲、使用中、建立中、获取次数、累计等待、无空闲等待、取消和连接销毁计数；单个业务池，不加池标签。
