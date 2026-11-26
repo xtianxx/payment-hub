@@ -17,6 +17,7 @@
 import argparse
 import http.client
 import json
+import math
 import re
 import sys
 import time
@@ -214,7 +215,10 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout 必须是大于 0 的有限数值")
 
     try:
         for expression in REQUIRED_QUERIES:

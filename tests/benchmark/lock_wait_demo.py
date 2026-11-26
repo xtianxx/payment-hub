@@ -29,6 +29,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 TABLE = "payment_orders"
@@ -60,7 +61,7 @@ class Connection:
     port: str
     dbname: str
     user: str
-    password: str | None
+    password: Optional[str]
 
 
 def parse_dsn(dsn):
