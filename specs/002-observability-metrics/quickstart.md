@@ -17,7 +17,7 @@
   - `55432`（基准 PostgreSQL）和 `9091`（应用指标）：基准入口检查；
   - `9090`（Prometheus）和 `9187`（exporter）：观测栈 Compose 检查；
   - `3000`（Grafana）：只在回看阶段检查。
-- 同一时间只能有一个运行；基准入口用 `<artifacts root>/.payment-hub-load.lock` 排他锁保证。
+- 同一时间只能有一个运行；基准入口用 `<临时目录>/payment-hub-load.lock`（通常 `/tmp/payment-hub-load.lock`，由 `tempfile.gettempdir()` 决定）排他锁保证。锁是主机级、与 `--artifacts-dir` 无关，因为 `55432`/`9091` 是主机级固定资源，不同证据目录的运行同样不能并发。
 - 磁盘足够保留一次运行的 5 个数据库卷和指标数据。
 
 ## 1. 准备监控密码文件和容器身份
@@ -69,7 +69,7 @@ python3 -B tests/benchmark/run_payment_create.py \
 
 入口会：
 
-- 获取运行锁，检查 `55432` 和 `9091`，冲突时立即失败；
+- 获取主机级运行锁（与 `--artifacts-dir` 无关），检查 `55432` 和 `9091`，冲突时立即失败；
 - 使用固定 `55432` 端口和 5 个测量轮；
 - 每轮通过 stdin 创建只读角色 `postgres_exporter`，密码不进入 argv 或日志；
 - 启动应用时设置 `PAYMENT_HUB_METRICS_ADDR=127.0.0.1:9091`；
@@ -202,7 +202,7 @@ rm -rf "$RUN_DIR" "$VIEW_DIR"
 | exporter 读不到密码 | 确认已导出 `HOST_UID`/`HOST_GID`，且 Compose 以该身份挂载只读文件 |
 | Prometheus 无法写数据目录 | 数据目录必须属于 `HOST_UID`；回看副本同理 |
 | 运行被中断 | 证据只判定已完成的阶段，整体标记 `incomplete`；未运行阶段记为缺失 |
-| 第二个运行无法启动 | 查看 `<artifacts root>/.payment-hub-load.lock` 的持有者；一次只允许一个运行 |
+| 第二个运行无法启动 | 查看 `<临时目录>/payment-hub-load.lock`（通常 `/tmp/payment-hub-load.lock`）的持有者；锁是主机级、与 `--artifacts-dir` 无关，因为 `55432`/`9091` 是主机级固定资源，不同证据目录的运行也不能并发 |
 
 ## 限制
 

@@ -35,7 +35,7 @@ python3 -B tests/benchmark/run_payment_create.py \
   --profile 200 --rounds 5
 ```
 
-如 `PATH` 上的 Go 或 k6 不是预期版本，用 `--go`、`--k6` 传入已验证的绝对路径。CPU 预检不启动 Docker；实际运行仍会检查容器及进程掩码、迁移文件和运行时池配置。使用独立 Compose 项目及固定的 `127.0.0.1:55432` 数据库端口，不连接现有 PostgreSQL。入口在启动前检查 `55432` 和 `9091`，并在 `<artifacts root>/.payment-hub-load.lock` 上持有排他锁；锁或端口冲突时立即失败。监控密码文件由 `PAYMENT_HUB_MONITOR_PASSWORD_FILE` 指定（默认 `~/.config/payment-hub/monitor-password`），必须是 `0600` 的单行文件。原始日志和未脱敏产物不要入库。
+如 `PATH` 上的 Go 或 k6 不是预期版本，用 `--go`、`--k6` 传入已验证的绝对路径。CPU 预检不启动 Docker；实际运行仍会检查容器及进程掩码、迁移文件和运行时池配置。使用独立 Compose 项目及固定的 `127.0.0.1:55432` 数据库端口，不连接现有 PostgreSQL。入口在启动前检查 `55432` 和 `9091`，并在 `<临时目录>/payment-hub-load.lock`（通常 `/tmp/payment-hub-load.lock`，由 `tempfile.gettempdir()` 决定）上持有排他锁；锁或端口冲突时立即失败。锁是主机级、与 `--artifacts-dir` 无关，因为 `55432`/`9091` 是主机级固定资源，不同证据目录的运行同样不能并发。监控密码文件由 `PAYMENT_HUB_MONITOR_PASSWORD_FILE` 指定（默认 `~/.config/payment-hub/monitor-password`），必须是 `0600` 的单行文件。原始日志和未脱敏产物不要入库。
 
 运行结束时，`ARTIFACTS` 行会给出证据目录，默认位于 `/tmp/opencode/payment-hub-benchmark/load-runs/`。如需长期保留，用 `--artifacts-dir` 指定仓库外的持久目录。对比前核对 `summary.json` 中的源码 SHA 和工作树状态；有未提交改动时，不把 SHA 单独当作实际源码身份。
 

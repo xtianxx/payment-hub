@@ -50,7 +50,7 @@
 - **Gin 指标中间件**：全局注册在路由之前，按方法、`c.FullPath()` 路由模板、精确状态码和耗时记录；`/readyz` 跳过；未匹配路由归入固定值 `unmatched`；计时到 handler 链返回为止，包含响应写入但不含 socket 刷新。
 - **连接池采集器**：实现 `prometheus.Collector`，从 `pgxpool.Stat()` 读取上限、总数、空闲、使用中、建立中、获取次数、累计等待、无空闲等待、取消和连接销毁计数；单个业务池，不加池标签。
 - **观测栈 host 网络**：`deploy/compose.observability.yaml` 使用 `network_mode: host`，Prometheus 绑 `127.0.0.1:9090`、exporter 绑 `127.0.0.1:9187`、Grafana 绑 `127.0.0.1:3000`；抓取 `127.0.0.1:9091` 和 `127.0.0.1:9187`。要求 Linux/WSL2 同一来宾，不支持 Docker Desktop。
-- **固定端口与运行锁**：应用指标 9091、Prometheus 9090、Grafana 3000、exporter 9187、基准 PostgreSQL 55432，全部绑定回环。基准入口检查 55432 和 9091 并持有 `<artifacts root>/.payment-hub-load.lock` 排他锁；观测栈 Compose 负责 9090/9187；3000 只在回看阶段检查。
+- **固定端口与运行锁**：应用指标 9091、Prometheus 9090、Grafana 3000、exporter 9187、基准 PostgreSQL 55432，全部绑定回环。基准入口检查 55432 和 9091 并持有 `<临时目录>/payment-hub-load.lock`（通常 `/tmp/payment-hub-load.lock`，由 `tempfile.gettempdir()` 决定）排他锁；锁是主机级、与 `--artifacts-dir` 无关，因为 `55432`/`9091` 是主机级固定资源，不同证据目录的运行同样不能并发；观测栈 Compose 负责 9090/9187；3000 只在回看阶段检查。
 - **镜像与依赖固定**：`prom/prometheus:v3.16.0`、`grafana/grafana:13.2.7`、`prometheuscommunity/postgres-exporter:v0.21.1`、`client_golang v1.25.0`；首次实现记录 linux/amd64 digest。
 - **exporter 凭据与身份**：`--datasource.uri=127.0.0.1:55432/postgres?sslmode=disable`、`--datasource.user-file`、`--datasource.pass-file`，连接 `postgres` 库读取整个实例统计；Prometheus 和 exporter 以宿主 UID/GID 运行，密码文件只读挂载到 `/run/payment-hub-monitor-password`；权限由入口脚本检查。
 - **监控角色**：基准入口每轮用本地密码文件中的密码创建只读角色 `postgres_exporter`，授予 `pg_monitor` 和连接权限；SQL 通过 stdin 传递，密码不进入 argv、日志或摘要。

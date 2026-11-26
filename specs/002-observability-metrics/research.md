@@ -109,7 +109,7 @@ Prometheus 打开 TSDB 需要写锁，启动和运行时会写 WAL、可能压�
 ## 基准入口改动
 
 - 轮数从 3 改为 5，同步命令行、测试和文档；`docs/payment-create-baseline.md` 标注旧 3 轮为历史协议。
-- PostgreSQL 从动态端口改为固定 `55432`；入口检查 55432 和 9091，并持有 `<artifacts root>/.payment-hub-load.lock` 排他锁直到运行结束。
+- PostgreSQL 从动态端口改为固定 `55432`；入口检查 55432 和 9091，并持有 `<临时目录>/payment-hub-load.lock`（通常 `/tmp/payment-hub-load.lock`，由 `tempfile.gettempdir()` 决定）排他锁直到运行结束。锁是主机级、与 `--artifacts-dir` 无关，因为 `55432`/`9091` 是主机级固定资源，不同证据目录的运行同样不能并发。
 - 每轮用本地密码文件创建只读角色；密码缺失或权限不对时拒绝运行；SQL 通过 stdin 传递，密码不进入 argv、`commands.log` 或摘要。
 - 启动应用时设置 `PAYMENT_HUB_METRICS_ADDR=127.0.0.1:9091`；指标监听失败按配置语义使启动失败。
 - 证据脚本按 `summary.json` 的 5 个 `load200` 阶段窗口判定，不按整次运行窗口。
@@ -136,7 +136,7 @@ Prometheus 打开 TSDB 需要写锁，启动和运行时会写 WAL、可能压�
 1. Grafana 13 对经典 JSON 看板的 provisioning 行为需要在实现时实测；失败则固定到 12.4 或改 V2 格式。
 2. 观测栈自身 CPU 开销没有单独测量；通过“对比运行使用相同观测栈配置”抵消，绝对数值不与未启用观测栈的历史数据直接比较。
 3. host 网络只支持 Linux/WSL2 同一来宾；Docker Desktop 不作为支持目标，文档必须在启动说明中写明。
-4. 固定端口 55432、9091、9090、9187、3000 可能与本机其他进程冲突；按组件划分检查责任，并保留运行锁。
+4. 固定端口 55432、9091、9090、9187、3000 可能与本机其他进程冲突；按组件划分检查责任，并保留主机级运行锁（与 `--artifacts-dir` 无关，`55432`/`9091` 是主机级固定资源）。
 5. `postgres_exporter` 的自定义查询使用已标记 deprecated 的 `--extend.query-path`；实现时先验证输出名称，失败则回退到 `stat_activity` 并重估基数。
 6. `postgres_exporter` 的指标名称在版本间可能变化（例如 `_total` 后缀）；实现时以 v0.21.1 实际 `/metrics` 输出为准，并同步更新契约。
 7. 回看副本需要与归档等量的磁盘；磁盘不足时回看失败，但不影响归档本身。
