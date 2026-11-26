@@ -27,7 +27,7 @@
 
 **Purpose**: 建立依赖、目录和脚本骨架，不实现行为。
 
-- [ ] T001 在 `go.mod` / `go.sum` 引入 `github.com/prometheus/client_golang v1.25.0`，执行 `go mod tidy` 和 `go build ./...`，确认现有构建不受影响
+- [x] T001 在 `go.mod` / `go.sum` 引入 `github.com/prometheus/client_golang v1.25.0`，执行 `go mod tidy` 和 `go build ./...`，确认现有构建不受影响
 - [x] T002 [P] 创建 `deploy/compose.observability.yaml` 与 `deploy/observability/` 目录骨架，包括 `prometheus.yml`、`prometheus.view.yml`、`postgres-exporter-user`、`postgres-exporter-queries.yaml`、`grafana/provisioning/datasources/prometheus.yml`、`grafana/provisioning/dashboards/provider.yml`、`grafana/dashboards/overview.json`
 - [x] T003 [P] 创建 `tests/benchmark/check_metrics_evidence.py` 和 `tests/benchmark/export_metrics.py` 的 argparse 骨架，写入 0/2/3/4 退出码注释；创建 `tests/benchmark/test_metrics_evidence.py`、`tests/benchmark/test_export_metrics.py`，先断言 `--help` 可用、错误参数返回 2
 - [x] T004 [P] 创建 `docs/observability.md` 中文骨架，包含启动、密码文件、验证、归档、回看、导出、清理、限制八节，暂不填入命令
@@ -40,9 +40,9 @@
 
 **⚠️ CRITICAL**: 本阶段完成后 US1 和 US2 才能开始。
 
-- [ ] T005 实现 `internal/metrics/registry.go` 的 `NewRegistry()`：使用 `prometheus.NewRegistry()` 注册 Go collector 和 process collector；在 `internal/metrics/registry_test.go` 断言 `go_goroutines`、`go_memstats_heap_inuse_bytes`、`process_cpu_seconds_total`、`process_resident_memory_bytes` 存在
-- [ ] T006 在 `internal/app/app.go` 增加 `PAYMENT_HUB_METRICS_ADDR` 解析：未设置或空字符串关闭；非空必须是字面回环 IP:port，拒绝 `0.0.0.0`、`::`、空 host 和非回环主机名；在 `internal/app/metrics_config_test.go` 覆盖合法、空值、非法和监听失败前置条件
-- [ ] T007 在 `internal/app/lifecycle.go` 集成第二个监听：业务监听成功后再建立指标监听，使用 `promhttp.HandlerFor(registry, ...)` 提供 `/metrics`；任一监听失败关闭已建立资源；两个 server 共享同一个 shutdown deadline，先停指标监听再停业务 server；在 `internal/app/metrics_lifecycle_test.go` 覆盖关闭、开启、监听失败和优雅关闭
+- [x] T005 实现 `internal/metrics/registry.go` 的 `NewRegistry()`：使用 `prometheus.NewRegistry()` 注册 Go collector 和 process collector；在 `internal/metrics/registry_test.go` 断言 `go_goroutines`、`go_memstats_heap_inuse_bytes`、`process_cpu_seconds_total`、`process_resident_memory_bytes` 存在
+- [x] T006 在 `internal/app/app.go` 增加 `PAYMENT_HUB_METRICS_ADDR` 解析：未设置或空字符串关闭；非空必须是字面回环 IP:port，拒绝 `0.0.0.0`、`::`、空 host 和非回环主机名；在 `internal/app/metrics_config_test.go` 覆盖合法、空值、非法和监听失败前置条件
+- [x] T007 在 `internal/app/lifecycle.go` 集成第二个监听：业务监听成功后再建立指标监听，使用 `promhttp.HandlerFor(registry, ...)` 提供 `/metrics`；任一监听失败关闭已建立资源；两个 server 共享同一个 shutdown deadline，先停指标监听再停业务 server；在 `internal/app/metrics_lifecycle_test.go` 覆盖关闭、开启、监听失败和优雅关闭
 
 **Checkpoint**: 应用可以在显式配置后于 `127.0.0.1:9091` 暴露 Go/process 指标，默认行为不变。
 
@@ -56,16 +56,16 @@
 
 ### Tests for User Story 1
 
-- [ ] T008 [P] [US1] 在 `internal/metrics/http_contract_test.go` 写失败测试：`method`/`route`/`status` 标签、`unmatched` 固定值、`/readyz` 跳过、401 计入、无订单号/支付 ID/请求 ID、20 个直方图桶
-- [ ] T009 [P] [US1] 在 `internal/metrics/http_test.go` 写失败测试：无 5xx 时 `status=~"5.."` 序列不存在；出现 5xx 后计数增加；`go_gc_duration_seconds_count` 等运行时序列不被 HTTP 指标覆盖
+- [x] T008 [P] [US1] 在 `internal/metrics/http_contract_test.go` 写失败测试：`method`/`route`/`status` 标签、`unmatched` 固定值、`/readyz` 跳过、401 计入、无订单号/支付 ID/请求 ID、20 个直方图桶
+- [x] T009 [P] [US1] 在 `internal/metrics/http_test.go` 写失败测试：无 5xx 时 `status=~"5.."` 序列不存在；出现 5xx 后计数增加；`go_gc_duration_seconds_count` 等运行时序列不被 HTTP 指标覆盖
 
 ### Implementation for User Story 1
 
-- [ ] T010 [US1] 实现 `internal/metrics/http.go`：全局中间件按 `c.FullPath()` 或 `unmatched`、`c.Writer.Status()` 精确状态码、方法记录计数器；耗时从进入路由组到 `c.Next()` 返回；`/readyz` 跳过；注册 20 个桶（0.001 到 5 秒）
-- [ ] T011 [US1] 实现 `RegisterHTTP`/`Handler` 并在 `internal/metrics/registry.go` 或 `http.go` 暴露注册入口；单元测试断言指标名、标签和类型与 `contracts/metrics.md` 一致
-- [ ] T012 [US1] 在 `internal/httpapi/router.go` 为 `NewRouter` 和 `NewRouterWithPayments` 增加全局中间件选项，保持 `/readyz` 与三个业务路由注册顺序不变；更新 `internal/httpapi/router_payments_test.go`
-- [ ] T013 [US1] 在 `internal/app/lifecycle.go` 把 HTTP 指标注册到 T007 的注册表，确保指标监听与业务监听共享同一个 registry；新增 `internal/app/metrics_http_integration_test.go`，实际抓取 `127.0.0.1:9091/metrics`
-- [ ] T014 [US1] 新增 `internal/httpapi/router_metrics_test.go`：断言引入中间件后支付响应体、状态码和鉴权行为不变；未配置 `PAYMENT_HUB_METRICS_ADDR` 时不存在指标监听
+- [x] T010 [US1] 实现 `internal/metrics/http.go`：全局中间件按 `c.FullPath()` 或 `unmatched`、`c.Writer.Status()` 精确状态码、方法记录计数器；耗时从进入路由组到 `c.Next()` 返回；`/readyz` 跳过；注册 20 个桶（0.001 到 5 秒）
+- [x] T011 [US1] 实现 `RegisterHTTP`/`Handler` 并在 `internal/metrics/registry.go` 或 `http.go` 暴露注册入口；单元测试断言指标名、标签和类型与 `contracts/metrics.md` 一致
+- [x] T012 [US1] 在 `internal/httpapi/router.go` 为 `NewRouter` 和 `NewRouterWithPayments` 增加全局中间件选项，保持 `/readyz` 与三个业务路由注册顺序不变；更新 `internal/httpapi/router_payments_test.go`
+- [x] T013 [US1] 在 `internal/app/lifecycle.go` 把 HTTP 指标注册到 T007 的注册表，确保指标监听与业务监听共享同一个 registry；新增 `internal/app/metrics_http_integration_test.go`，实际抓取 `127.0.0.1:9091/metrics`
+- [x] T014 [US1] 新增 `internal/httpapi/router_metrics_test.go`：断言引入中间件后支付响应体、状态码和鉴权行为不变；未配置 `PAYMENT_HUB_METRICS_ADDR` 时不存在指标监听
 
 **Checkpoint**: US1 可独立演示；HTTP 指标可由 Prometheus 抓取，业务契约不变。
 
