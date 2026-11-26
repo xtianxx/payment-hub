@@ -1629,22 +1629,101 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.assertIsNone(self.launcher.tool_containers[0]["container_exit_code"])
 
     def test_stop_remove_refuses_label_mismatch(self):
-        self.launcher._inspect_container = mock.Mock(
-            return_value={
-                "Name": "/different",
-                "Config": {
-                    "Labels": {
-                        "payment-hub.run-id": self.launcher.run_id,
-                        "payment-hub.scope": "db-foundation",
-                    }
+        self.launcher._inspect_container_state = mock.Mock(
+            return_value=(
+                {
+                    "Name": "/different",
+                    "Config": {
+                        "Labels": {
+                            "payment-hub.run-id": self.launcher.run_id,
+                            "payment-hub.scope": "db-foundation",
+                        }
+                    },
                 },
-            }
+                False,
+            )
         )
         self.launcher._run = mock.Mock()
         record = {"stage": "x", "name": "expected", "id": "a" * 64}
         self.launcher._stop_remove_container("a" * 64, "cleanup", record)
         self.launcher._run.assert_not_called()
         self.assertIn("cleanup:container-identity", self.launcher.cleanup_failures)
+
+    def test_stop_remove_treats_confirmed_missing_container_as_absent(self):
+        self.launcher._inspect_container_state = mock.Mock(return_value=(None, True))
+        self.launcher._run = mock.Mock()
+        record = {"stage": "x", "name": "expected", "id": "a" * 64}
+        self.launcher._stop_remove_container("a" * 64, "cleanup", record)
+        self.launcher._run.assert_not_called()
+        self.assertTrue(record["absent"])
+        self.assertEqual(self.launcher.cleanup_failures, [])
+
+    def test_stop_remove_reports_unconfirmed_inspect_failure(self):
+        self.launcher._inspect_container_state = mock.Mock(return_value=(None, False))
+        self.launcher._run = mock.Mock()
+        record = {"stage": "x", "name": "expected", "id": "a" * 64}
+        self.launcher._stop_remove_container("a" * 64, "cleanup", record)
+        self.assertEqual(
+            self.launcher.cleanup_failures, ["cleanup:container-identity"]
+        )
+
+    def test_find_intended_container_confirmed_missing_is_absent(self):
+        self.launcher._run = mock.Mock(
+            return_value=completed(["docker", "ps"], 0, "a" * 64 + "\n")
+        )
+        self.launcher._inspect_container_state = mock.Mock(return_value=(None, True))
+        record = {"stage": "x", "name": "expected", "id": None}
+        self.assertIsNone(self.launcher._find_intended_container(record))
+        self.assertTrue(record["absent"])
+        self.assertEqual(self.launcher.cleanup_failures, [])
+
+    def test_inspect_container_state_recognizes_missing_and_daemon_errors(self):
+        record_missing = completed(
+            ["docker", "inspect"], 1, "", "Error: No such object: abc"
+        )
+        self.launcher._run = mock.Mock(return_value=record_missing)
+        self.assertEqual(
+            self.launcher._inspect_container_state("abc", "cleanup"), (None, True)
+        )
+
+        record_missing_container = completed(
+            ["docker", "inspect"], 1, "", "Error response from daemon: No such container: abc"
+        )
+        self.launcher._run = mock.Mock(return_value=record_missing_container)
+        self.assertEqual(
+            self.launcher._inspect_container_state("abc", "cleanup"), (None, True)
+        )
+
+        daemon_error = completed(
+            ["docker", "inspect"],
+            1,
+            "",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        )
+        self.launcher._run = mock.Mock(return_value=daemon_error)
+        self.assertEqual(
+            self.launcher._inspect_container_state("abc", "cleanup"), (None, False)
+        )
+
+    def test_cleanup_accepts_already_removed_tool_container(self):
+        record = {
+            "stage": "migration-up",
+            "name": "ph-db-test",
+            "id": "a" * 64,
+            "created": True,
+            "removed": False,
+        }
+        self.launcher.tool_containers = [record]
+        self.launcher._run = mock.Mock(
+            return_value=completed(
+                ["docker", "inspect"], 1, "", "Error: No such object: " + "a" * 64
+            )
+        )
+        self.launcher.cleanup_safely()
+        self.assertEqual(self.launcher.cleanup["result"], "pass")
+        self.assertEqual(self.launcher.cleanup["errors"], [])
+        self.assertTrue(self.launcher.cleanup["tool_containers"][0]["absent"])
+        self.assertFalse(self.launcher.cleanup["tool_containers"][0]["removed"])
 
     def test_cleanup_collection_failure_is_not_green(self):
         self.launcher.compose_attempted = True
