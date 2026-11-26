@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cpu_plan import DEFAULT_GROUPS, parse_cpu_set  # noqa: E402
 from run_payment_create import (  # noqa: E402
     DEFAULT_ARTIFACTS_ROOT,
+    METRICS_HOST_PORT,
+    PG_HOST_PORT,
     PROFILE,
     REQUIRED_ROUNDS,
     REPO,
@@ -69,7 +72,7 @@ class CliConfigTest(unittest.TestCase):
     def test_fixed_profile_and_rounds_remain_compatible(self):
         args = parse_args([
             "--migrate-image", "local/migrate:test",
-            "--profile", "200", "--rounds", "3",
+            "--profile", "200", "--rounds", "5",
         ])
         self.assertEqual(args.profile, PROFILE)
         self.assertEqual(args.rounds, REQUIRED_ROUNDS)
@@ -78,6 +81,7 @@ class CliConfigTest(unittest.TestCase):
         for argv in (
             ["--profile", "smoke"],
             ["--rounds", "1"],
+            ["--rounds", "3"],
         ):
             with self.assertRaises(SystemExit, msg=argv):
                 parse_args(argv)
@@ -100,6 +104,80 @@ class CliConfigTest(unittest.TestCase):
     def test_artifacts_root_outside_repository_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
             validate_artifacts_root(Path(tmp) / "run")
+
+
+class FixedPortTest(unittest.TestCase):
+    def test_benchmark_ports_are_pinned(self):
+        self.assertEqual(PG_HOST_PORT, 55432)
+        self.assertEqual(METRICS_HOST_PORT, 9091)
+
+    def test_benchmark_overlay_pins_the_fixed_port(self):
+        text = (REPO / "tests" / "benchmark" / "compose.benchmark.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('published: "55432"', text)
+        self.assertIn("!override", text)
+
+    def test_environment_uses_fixed_port_and_metrics_address(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = Runner(parse_args([
+                "--migrate-image", "local/migrate:test",
+                "--artifacts-dir", tmp,
+            ]))
+            runner.prepare_dirs()
+            runner.env_dir.mkdir(parents=True, exist_ok=True)
+            runner.create_environment()
+            self.assertEqual(runner.pg_port, 55432)
+            self.assertEqual(
+                runner.app_env["PAYMENT_HUB_METRICS_ADDR"], "127.0.0.1:9091"
+            )
+            compose_env = runner.compose_env_path.read_text(encoding="utf-8")
+            self.assertIn("PAYMENT_HUB_TEST_PG_PORT=55432", compose_env)
+
+    def test_busy_port_is_rejected_with_the_port_number(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as busy:
+            busy.bind(("127.0.0.1", 0))
+            busy.listen(1)
+            busy_port = busy.getsockname()[1]
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as spare:
+                spare.bind(("127.0.0.1", 0))
+                free_port = spare.getsockname()[1]
+            runner = Runner.__new__(Runner)
+            with self.assertRaises(PreconditionError) as caught:
+                runner.check_fixed_ports(pg_port=busy_port, metrics_port=free_port)
+            self.assertIn(str(busy_port), str(caught.exception))
+
+
+class RunLockTest(unittest.TestCase):
+    @staticmethod
+    def make_runner(artifacts_dir):
+        return Runner(parse_args([
+            "--migrate-image", "local/migrate:test",
+            "--artifacts-dir", str(artifacts_dir),
+        ]))
+
+    def test_lock_is_exclusive_and_records_holder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self.make_runner(tmp)
+            first.prepare_dirs()
+            first.acquire_run_lock()
+            lock_path = Path(tmp) / ".payment-hub-load.lock"
+            holder = lock_path.read_text(encoding="utf-8")
+            self.assertIn(f"pid={os.getpid()}", holder)
+            self.assertIn(first.base_run_id, holder)
+            self.assertNotIn("password", holder.lower())
+
+            second = self.make_runner(tmp)
+            second.prepare_dirs()
+            with self.assertRaises(PreconditionError) as caught:
+                second.acquire_run_lock()
+            self.assertIn(str(lock_path), str(caught.exception))
+            self.assertIn(f"pid={os.getpid()}", str(caught.exception))
+
+            first.release_run_lock()
+            first.release_run_lock()
+            second.acquire_run_lock()
+            second.release_run_lock()
 
 
 class CpuWindowTest(unittest.TestCase):
