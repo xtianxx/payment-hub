@@ -3,6 +3,7 @@
 import contextlib
 import errno
 import io
+import json
 import os
 import re
 import shutil
@@ -86,6 +87,27 @@ class MetricsStoreTest(unittest.TestCase):
             str(run_dir or self.run_dir),
             "--view-dir",
             str(view_dir),
+        )
+
+    def write_evidence(self, payload=None):
+        path = self.run_dir / "metrics-evidence.json"
+        if payload is None:
+            payload = {
+                "schema": "payment-hub.metrics-evidence.v2",
+                "run_id": "a1b2c3d4e5f6",
+                "status": "complete",
+                "missing": ["已有缺失"],
+                "stages": [{"round": 1, "status": "complete"}],
+            }
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def read_evidence(self):
+        return json.loads(
+            (self.run_dir / "metrics-evidence.json").read_text(encoding="utf-8")
         )
 
     def test_archive_success_renames_tmp_and_preserves_metadata(self):
@@ -201,6 +223,112 @@ class MetricsStoreTest(unittest.TestCase):
         self.assertIn("保留", stderr)
         self.assertIn("metrics.tmp", stderr)
 
+    def test_archive_copy_failure_records_archive_error(self):
+        source = make_tsdb(self.root / "prometheus")
+        evidence_path = self.write_evidence()
+        original = json.loads(evidence_path.read_text(encoding="utf-8"))
+
+        def failing_copy(source_path, destination_path):
+            os.makedirs(destination_path)
+            write_file(Path(destination_path) / "partial", b"partial")
+            raise OSError("模拟复制失败")
+
+        with mock.patch.object(metrics_store, "copy_tree", side_effect=failing_copy):
+            code, _, stderr = self.archive(source)
+
+        self.assertEqual(code, 2, stderr)
+        temporary = self.run_dir / "metrics.tmp"
+        self.assertTrue((temporary / "partial").is_file())
+        self.assertFalse((self.run_dir / "metrics").exists())
+
+        evidence = self.read_evidence()
+        self.assertEqual(evidence["archive_error"], "归档复制失败")
+        self.assertEqual(evidence["status"], "incomplete")
+        self.assertEqual(evidence["missing"][0], original["missing"][0])
+        self.assertEqual(len(evidence["missing"]), len(original["missing"]) + 1)
+        self.assertIn("归档复制失败", evidence["missing"][-1])
+        self.assertIn("metrics.tmp", evidence["missing"][-1])
+        self.assertEqual(evidence["schema"], original["schema"])
+        self.assertEqual(evidence["run_id"], original["run_id"])
+
+        lock = self.run_dir / ".metrics-evidence.lock"
+        self.assertTrue(lock.is_file())
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+
+    def test_archive_verification_failure_records_archive_error(self):
+        source = make_tsdb(self.root / "prometheus")
+        evidence_path = self.write_evidence()
+        original = json.loads(evidence_path.read_text(encoding="utf-8"))
+        real_copy = metrics_store.copy_tree
+
+        def corrupt_copy(source_path, destination_path):
+            real_copy(source_path, destination_path)
+            write_file(Path(destination_path) / "wal" / "99999999", b"unexpected")
+
+        with mock.patch.object(metrics_store, "copy_tree", side_effect=corrupt_copy):
+            code, _, stderr = self.archive(source)
+
+        self.assertEqual(code, 3, stderr)
+        self.assertTrue((self.run_dir / "metrics.tmp" / "wal" / "99999999").is_file())
+        self.assertFalse((self.run_dir / "metrics").exists())
+
+        evidence = self.read_evidence()
+        self.assertEqual(evidence["archive_error"], "归档校验失败")
+        self.assertEqual(evidence["status"], "incomplete")
+        self.assertEqual(evidence["missing"][0], original["missing"][0])
+        self.assertEqual(len(evidence["missing"]), len(original["missing"]) + 1)
+        self.assertIn("归档校验失败", evidence["missing"][-1])
+        self.assertIn("metrics.tmp", evidence["missing"][-1])
+
+    def test_archive_rename_failure_records_archive_error(self):
+        source = make_tsdb(self.root / "prometheus")
+        evidence_path = self.write_evidence()
+        original = json.loads(evidence_path.read_text(encoding="utf-8"))
+        target = self.run_dir / "metrics"
+
+        with mock.patch.object(
+            metrics_store.os,
+            "replace",
+            side_effect=OSError(errno.EXDEV, "Invalid cross-device link"),
+        ):
+            code, _, stderr = self.archive(source)
+
+        self.assertEqual(code, 2, stderr)
+        self.assertTrue((self.run_dir / "metrics.tmp").is_dir())
+        self.assertFalse(target.exists())
+
+        evidence = self.read_evidence()
+        self.assertEqual(evidence["archive_error"], "归档重命名失败")
+        self.assertEqual(evidence["status"], "incomplete")
+        self.assertEqual(evidence["missing"][0], original["missing"][0])
+        self.assertEqual(len(evidence["missing"]), len(original["missing"]) + 1)
+        self.assertIn("归档重命名失败", evidence["missing"][-1])
+        self.assertIn("metrics.tmp", evidence["missing"][-1])
+
+    def test_archive_failure_without_evidence_does_not_create_it(self):
+        source = make_tsdb(self.root / "prometheus")
+
+        with mock.patch.object(
+            metrics_store,
+            "copy_tree",
+            side_effect=OSError("模拟复制失败"),
+        ):
+            code, _, stderr = self.archive(source)
+
+        self.assertEqual(code, 2, stderr)
+        self.assertFalse((self.run_dir / "metrics-evidence.json").exists())
+        self.assertFalse((self.run_dir / "metrics").exists())
+
+    def test_archive_success_does_not_modify_evidence(self):
+        source = make_tsdb(self.root / "prometheus")
+        evidence_path = self.write_evidence()
+        before = evidence_path.read_bytes()
+
+        code, _, stderr = self.archive(source)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(evidence_path.read_bytes(), before)
+
     def test_archive_rejects_symlink_in_source(self):
         source = make_tsdb(self.root / "prometheus")
         try:
@@ -215,12 +343,85 @@ class MetricsStoreTest(unittest.TestCase):
         self.assertFalse((self.run_dir / "metrics").exists())
         self.assertFalse((self.run_dir / "metrics.tmp").exists())
 
+    def test_archive_rejects_symlinked_source_root(self):
+        real_source = make_tsdb(self.root / "real-prometheus")
+        source_link = self.root / "prometheus-link"
+        try:
+            os.symlink(str(real_source), str(source_link))
+        except (OSError, NotImplementedError) as error:
+            self.skipTest("当前文件系统不支持符号链接: %s" % error)
+        source_files = file_snapshot(real_source)
+
+        code, _, stderr = self.archive(source_link)
+
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("符号链接", stderr)
+        self.assertFalse((self.run_dir / "metrics").exists())
+        self.assertFalse((self.run_dir / "metrics.tmp").exists())
+        self.assertEqual(file_snapshot(real_source), source_files)
+
+    def test_archive_rejects_symlinked_target(self):
+        for target_name in ("metrics", "metrics.tmp"):
+            with self.subTest(target=target_name):
+                case = self.root / target_name.replace(".", "-")
+                case.mkdir()
+                run_dir = case / "run"
+                run_dir.mkdir()
+                source = make_tsdb(case / "prometheus")
+                outside = case / "outside"
+                outside.mkdir()
+                write_file(outside / "sentinel", b"keep-me")
+                target = run_dir / target_name
+                try:
+                    os.symlink(str(outside), str(target))
+                except (OSError, NotImplementedError) as error:
+                    self.skipTest("当前文件系统不支持符号链接: %s" % error)
+
+                code, _, stderr = self.archive(source, run_dir=run_dir)
+
+                self.assertEqual(code, 2, stderr)
+                self.assertIn("符号链接", stderr)
+                self.assertTrue(target.is_symlink())
+                self.assertEqual(file_snapshot(outside), {"sentinel": b"keep-me"})
+                other = "metrics.tmp" if target_name == "metrics" else "metrics"
+                self.assertFalse((run_dir / other).exists())
+
+    def test_archive_rejects_target_inside_source(self):
+        for mode in ("nested", "same"):
+            with self.subTest(mode=mode):
+                source = make_tsdb(self.root / ("prometheus-" + mode))
+                run_dir = source / "evidence" if mode == "nested" else source
+                run_dir.mkdir(exist_ok=True)
+                source_files = file_snapshot(source)
+
+                code, _, stderr = self.archive(source, run_dir=run_dir)
+
+                self.assertEqual(code, 2, stderr)
+                self.assertIn("重叠", stderr)
+                self.assertFalse((run_dir / "metrics").exists())
+                self.assertFalse((run_dir / "metrics.tmp").exists())
+                self.assertEqual(file_snapshot(source), source_files)
+
+    def test_overlap_helper_rejects_both_directions(self):
+        source = self.root / "prometheus"
+        nested = source / "nested"
+        independent = self.root / "independent"
+
+        self.assertTrue(metrics_store._paths_overlap(str(nested), str(source)))
+        self.assertTrue(metrics_store._paths_overlap(str(source), str(nested)))
+        self.assertTrue(metrics_store._paths_overlap(str(source), str(source)))
+        self.assertFalse(
+            metrics_store._paths_overlap(str(source), str(independent))
+        )
+
     def test_view_success_copies_contents_and_keeps_archive_unchanged(self):
         source = make_tsdb(self.root / "prometheus")
         archive_dir = self.run_dir / "metrics"
         shutil.copytree(str(source), str(archive_dir))
         archive_files = file_snapshot(archive_dir)
         archive_hash, archive_count = metrics_store.tree_stat(str(archive_dir))
+        evidence_path = self.write_evidence()
+        evidence_bytes = evidence_path.read_bytes()
         view_dir = self.root / "view"
 
         code, stdout, stderr = self.view(view_dir=view_dir)
@@ -238,10 +439,29 @@ class MetricsStoreTest(unittest.TestCase):
             metrics_store.tree_stat(str(archive_dir)),
             (archive_hash, archive_count),
         )
+        self.assertEqual(evidence_path.read_bytes(), evidence_bytes)
         hashes = HASH_PATTERN.findall(stdout)
         self.assertGreaterEqual(len(hashes), 2, stdout)
         self.assertTrue(all(value == archive_hash for value in hashes), stdout)
         self.assertIn(str(view_dir), stdout)
+
+    def test_view_rejects_symlinked_archive(self):
+        source = make_tsdb(self.root / "prometheus")
+        real_archive = self.root / "real-metrics"
+        shutil.copytree(str(source), str(real_archive))
+        archive_files = file_snapshot(real_archive)
+        try:
+            os.symlink(str(real_archive), str(self.run_dir / "metrics"))
+        except (OSError, NotImplementedError) as error:
+            self.skipTest("当前文件系统不支持符号链接: %s" % error)
+        view_dir = self.root / "view"
+
+        code, _, stderr = self.view(view_dir=view_dir)
+
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("符号链接", stderr)
+        self.assertFalse(view_dir.exists())
+        self.assertEqual(file_snapshot(real_archive), archive_files)
 
     def test_view_accepts_existing_empty_directory(self):
         source = make_tsdb(self.root / "prometheus")

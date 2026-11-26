@@ -7,8 +7,12 @@
 
 archive 把 Prometheus 本地 TSDB 目录复制到 ``RUN_DIR/metrics.tmp``，校验后原子重命名为
 ``RUN_DIR/metrics``。失败时保留 ``metrics.tmp``，不覆盖已有 ``metrics`` 或
-``metrics.tmp``。view 把 ``RUN_DIR/metrics`` 的内容复制到 ``VIEW_DIR``，复制前后校验
-归档目录不变，且不修改归档内容。
+``metrics.tmp``。复制、校验或重命名失败且证据文件已存在时，会在
+``.metrics-evidence.lock`` 锁下合并顶层 ``archive_error``、``status`` 和 ``missing``；
+证据文件不存在时不会创建它。view 把 ``RUN_DIR/metrics`` 的内容复制到 ``VIEW_DIR``，
+复制前后校验归档目录不变，且不修改归档内容或证据文件。
+
+源目录、归档 ``metrics/`` 和回看所用的 ``RUN_DIR/metrics/`` 本身是符号链接时一律拒绝。
 
 退出码：
   0  成功；
@@ -20,10 +24,14 @@ archive 把 Prometheus 本地 TSDB 目录复制到 ``RUN_DIR/metrics.tmp``，校
 """
 
 import argparse
+import fcntl
 import hashlib
+import json
 import os
 import shutil
+import stat
 import sys
+import tempfile
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -31,6 +39,13 @@ EXIT_VERIFY = 3
 
 HASH_NAME = "sha256"
 CHUNK_SIZE = 1024 * 1024
+
+EVIDENCE_NAME = "metrics-evidence.json"
+EVIDENCE_LOCK_NAME = ".metrics-evidence.lock"
+
+ARCHIVE_ERROR_COPY = "归档复制失败"
+ARCHIVE_ERROR_VERIFY = "归档校验失败"
+ARCHIVE_ERROR_RENAME = "归档重命名失败"
 
 
 class UnsupportedEntryError(Exception):
@@ -146,11 +161,149 @@ def _format_hash(value):
     return "%s:%s" % (HASH_NAME, value)
 
 
+def _paths_overlap(first, second):
+    """两个路径相同，或其中一个位于另一个之内时返回 True。"""
+    first_real = os.path.realpath(first)
+    second_real = os.path.realpath(second)
+    try:
+        common = os.path.commonpath([first_real, second_real])
+    except ValueError:
+        return False
+    return common == first_real or common == second_real
+
+
+def _short_text(value, limit=160):
+    text = " ".join(str(value).split())
+    if not text:
+        return "未知错误"
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def _write_json_atomic(path, document):
+    """写同目录临时文件并 fsync，再用 os.replace 原子替换。"""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".metrics-evidence-", suffix=".tmp", dir=directory
+    )
+    try:
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mode = None
+        if mode is not None:
+            try:
+                os.fchmod(descriptor, mode)
+            except OSError:
+                pass
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(document, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.replace(temporary, path)
+        except OSError:
+            # 同一目录内的 rename 仍是原子替换；保留 os.replace 作为首选路径。
+            os.rename(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _merge_archive_error(evidence_path, reason, detail):
+    """在证据对象上合并失败字段；调用方必须已持有证据锁。"""
+    try:
+        with open(evidence_path, "r", encoding="utf-8") as handle:
+            evidence = json.load(handle)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as error:
+        _error("无法更新指标证据（读取失败）: %s" % error)
+        return
+
+    if not isinstance(evidence, dict):
+        _error("无法更新指标证据（顶层不是 JSON 对象）: %s" % evidence_path)
+        return
+
+    evidence["archive_error"] = reason
+    evidence["status"] = "incomplete"
+    missing = evidence.get("missing")
+    if isinstance(missing, list):
+        missing = list(missing)
+    elif missing is None:
+        missing = []
+    else:
+        missing = [str(missing)]
+    missing.append(
+        "指标归档失败（%s）：%s；请人工处理保留的 metrics.tmp。"
+        % (reason, _short_text(detail))
+    )
+    evidence["missing"] = missing
+
+    try:
+        _write_json_atomic(evidence_path, evidence)
+    except (OSError, TypeError, ValueError) as error:
+        _error("无法更新指标证据（写入失败）: %s" % error)
+
+
+def _record_archive_error(run_dir, reason, detail):
+    """在 0600、不可跟随符号链接的锁下合并 metrics-evidence.json。
+
+    证据文件不存在时不创建它；任何记录失败都只打印警告，不改变归档命令的退出码。
+    """
+    evidence_path = os.path.join(run_dir, EVIDENCE_NAME)
+    if not os.path.lexists(evidence_path):
+        return
+
+    lock_path = os.path.join(run_dir, EVIDENCE_LOCK_NAME)
+    flags = os.O_CREAT | os.O_RDWR
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        _error("无法记录 archive_error（打开锁失败）: %s" % error)
+        return
+
+    try:
+        try:
+            info = os.fstat(lock_descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                _error("无法记录 archive_error（锁不是常规文件）: %s" % lock_path)
+                return
+            os.fchmod(lock_descriptor, 0o600)
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        except OSError as error:
+            _error("无法记录 archive_error（获取锁失败）: %s" % error)
+            return
+
+        try:
+            _merge_archive_error(evidence_path, reason, detail)
+        except Exception as error:
+            _error("无法更新指标证据: %s" % error)
+        finally:
+            try:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(lock_descriptor)
+
+
 def archive(source, run_dir):
     """把 Prometheus 数据目录归档到 ``run_dir/metrics``。"""
     source = os.path.abspath(source)
     run_dir = os.path.abspath(run_dir)
 
+    if os.path.islink(source):
+        _error("源目录是符号链接，拒绝归档: %s" % source)
+        return EXIT_USAGE
     if not os.path.isdir(source):
         _error("源目录不存在或不是目录: %s" % source)
         return EXIT_USAGE
@@ -163,12 +316,20 @@ def archive(source, run_dir):
 
     target = os.path.join(run_dir, "metrics")
     temporary = os.path.join(run_dir, "metrics.tmp")
+    for path, label in ((target, "目标 metrics"), (temporary, "临时目录 metrics.tmp")):
+        if os.path.islink(path):
+            _error("%s是符号链接，拒绝覆盖: %s" % (label, path))
+            return EXIT_USAGE
     if os.path.lexists(target):
         _error("目标已存在，拒绝覆盖: %s" % target)
         return EXIT_USAGE
     if os.path.lexists(temporary):
         _error("临时目录已存在，拒绝覆盖: %s" % temporary)
         return EXIT_USAGE
+    for path in (target, temporary):
+        if _paths_overlap(source, path):
+            _error("归档目标与源目录重叠，拒绝复制: %s" % path)
+            return EXIT_USAGE
 
     try:
         source_hash, source_count = tree_stat(source)
@@ -183,9 +344,11 @@ def archive(source, run_dir):
         copy_tree(source, temporary)
     except UnsupportedEntryError as error:
         _error("复制时遇到符号链接或特殊文件，保留临时目录: %s" % error)
+        _record_archive_error(run_dir, ARCHIVE_ERROR_COPY, error)
         return EXIT_USAGE
     except (OSError, shutil.Error) as error:
         _error("复制到 %s 失败，保留临时目录供人工处理: %s" % (temporary, error))
+        _record_archive_error(run_dir, ARCHIVE_ERROR_COPY, error)
         return EXIT_USAGE
 
     try:
@@ -194,21 +357,31 @@ def archive(source, run_dir):
         target_hash, target_count = tree_stat(temporary)
     except UnsupportedEntryError as error:
         _error("复制后校验失败，保留 %s: %s" % (temporary, error))
+        _record_archive_error(run_dir, ARCHIVE_ERROR_VERIFY, error)
         return EXIT_VERIFY
     except OSError as error:
         _error("复制后校验失败，保留 %s: %s" % (temporary, error))
+        _record_archive_error(run_dir, ARCHIVE_ERROR_VERIFY, error)
         return EXIT_VERIFY
 
     if not has_wal:
         _error("复制后校验失败: %s 缺少 wal/，保留临时目录" % temporary)
+        _record_archive_error(run_dir, ARCHIVE_ERROR_VERIFY, "副本缺少 wal/ 子目录")
         return EXIT_VERIFY
     if current_hash != source_hash or current_count != source_count:
         _error("复制期间源目录发生变化，校验失败，保留 %s" % temporary)
+        _record_archive_error(run_dir, ARCHIVE_ERROR_VERIFY, "源目录在复制期间发生变化")
         return EXIT_VERIFY
     if target_count != source_count or target_hash != source_hash:
         _error(
             "复制后校验失败: 文件数或树哈希不一致（源 %d 个文件，副本 %d 个文件），保留 %s"
             % (source_count, target_count, temporary)
+        )
+        _record_archive_error(
+            run_dir,
+            ARCHIVE_ERROR_VERIFY,
+            "文件数或树哈希不一致（源 %d 个文件，副本 %d 个文件）"
+            % (source_count, target_count),
         )
         return EXIT_VERIFY
 
@@ -216,6 +389,7 @@ def archive(source, run_dir):
         os.replace(temporary, target)
     except OSError as error:
         _error("重命名为 %s 失败，保留 %s: %s" % (target, temporary, error))
+        _record_archive_error(run_dir, ARCHIVE_ERROR_RENAME, error)
         return EXIT_USAGE
 
     print("归档完成: %s" % target)
@@ -235,6 +409,9 @@ def view(run_dir, view_dir):
     view_dir = os.path.abspath(view_dir)
     metrics = os.path.join(run_dir, "metrics")
 
+    if os.path.islink(metrics):
+        _error("归档指标目录是符号链接，拒绝读取: %s" % metrics)
+        return EXIT_USAGE
     if not os.path.isdir(metrics):
         _error("归档指标目录不存在或不是目录: %s" % metrics)
         return EXIT_USAGE
