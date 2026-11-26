@@ -151,11 +151,11 @@
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T045 [P] 新增 `internal/metrics/cardinality_test.go`：gather 应用注册表，断言一次运行少于 300 条序列，且不存在 `usename`、`application_name`、订单号、支付 ID、请求 ID 标签
-- [ ] T046 [P] 更新 `specs/002-observability-metrics/quickstart.md`：把命令替换为 T039–T042 的实际参数，补充 host 网络、UID/GID、归档副本和清理卷的验证步骤
-- [ ] T047 运行 `go test ./...` 和 `python3 -m unittest discover -s tests/benchmark -p 'test_*.py'`，记录实际命令、退出码和失败修复；不得用旧结果代替
-- [ ] T048 在 Linux/WSL2 执行完整 quickstart：启动观测栈、跑 5 轮、生成证据、归档、回看、导出、清理；记录实际结果、未验证项和限制
-- [ ] T049 运行 `git diff --check`，核对暂存文件只包含本期范围；提交与推送需单独授权
+- [x] T045 [P] 新增 `internal/metrics/cardinality_test.go`：gather 应用注册表，断言一次运行少于 300 条序列，且不存在 `usename`、`application_name`、订单号、支付 ID、请求 ID 标签
+- [x] T046 [P] 更新 `specs/002-observability-metrics/quickstart.md`：把命令替换为 T039–T042 的实际参数，补充 host 网络、UID/GID、归档副本和清理卷的验证步骤
+- [x] T047 运行 `go test ./...` 和 `python3 -m unittest discover -s tests/benchmark -p 'test_*.py'`，记录实际命令、退出码和失败修复；不得用旧结果代替（2026-11-26：`go test ./...` 退出 0，2079 通过 / 10 个包；benchmark 143 项 OK；无失败需要修复。见 quickstart“实跑记录”）
+- [x] T048 在 Linux/WSL2 执行完整 quickstart：启动观测栈、跑 5 轮、生成证据、归档、回看、导出、清理；记录实际结果、未验证项和限制
+- [x] T049 运行 `git diff --check`，核对暂存文件只包含本期范围；提交与推送需单独授权
 
 ---
 
