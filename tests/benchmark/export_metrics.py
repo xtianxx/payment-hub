@@ -10,11 +10,15 @@
   ``labels`` 为按标签名排序后的 ``k=v;...`` 字符串（无标签为空），
   ``timestamp`` 与 ``value`` 保留 Prometheus 返回值原文；空结果只写表头。
 - ``queries.json``：schema 固定为 ``payment-hub.metrics-export.v1``，记录
-  ``run_id``、窗口（ISO Z 与 epoch）、Prometheus 地址以及每个查询的
+  ``run_id``、窗口（ISO Z 与 epoch）、脱敏后的 Prometheus 地址（不含
+  userinfo、query 和 fragment）以及每个查询的
   ``name``、``csv``、``promql``、``status``、``samples``。
 
 整轮 P95 查询中的 ``$__range`` 占位符会替换为整体窗口的整数秒数（例如
 ``[330s]``）。其余查询按 ``contracts/metrics.md`` 的查询契约原样使用 ``[1m]``。
+整体窗口按契约取最早 ``load200`` 开始到最晚 ``load200`` 结束，因此包含轮间
+阶段（smoke/warmup、轮次间隔）；单轮对比不应直接使用该整轮 P95，应另行按
+该轮 ``load200`` 阶段窗口查询。
 
 退出码：
 
@@ -161,18 +165,25 @@ def _coerce_epoch(value):
     """把 epoch 字段转为有限的 float；无效值返回 None。"""
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
         number = float(value)
-    elif isinstance(value, str):
-        try:
-            number = float(value)
-        except ValueError:
-            return None
-    else:
+    except (ValueError, OverflowError):
         return None
     if not math.isfinite(number):
         return None
     return number
+
+
+def _utc_datetime(epoch):
+    """把 epoch 转为 UTC datetime；超出可表示范围时返回 None。"""
+    try:
+        return datetime.datetime.fromtimestamp(
+            epoch, tz=datetime.timezone.utc
+        )
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _iter_stage_records(summary):
@@ -203,6 +214,8 @@ def compute_window(summary):
         start = _coerce_epoch(record.get("k6_started_epoch"))
         end = _coerce_epoch(record.get("k6_finished_epoch"))
         if start is None or end is None or end <= start:
+            continue
+        if _utc_datetime(start) is None or _utc_datetime(end) is None:
             continue
         windows.add((start, end))
     if not windows:
@@ -252,8 +265,30 @@ def _prepare_out(out):
     return out_abs
 
 
+def _sanitize_prometheus_url(url):
+    """去掉 URL 中的 userinfo、query 和 fragment，只保留地址与路径。"""
+    parts = urllib.parse.urlsplit(str(url).strip())
+    hostname = parts.hostname
+    if hostname is None:
+        netloc = parts.netloc.rsplit("@", 1)[-1]
+    else:
+        host = hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        netloc = f"{host}:{port}" if port is not None else host
+    return urllib.parse.urlunsplit(
+        (parts.scheme, netloc, parts.path, "", "")
+    )
+
+
 def _utc_iso(epoch):
-    moment = datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+    moment = _utc_datetime(epoch)
+    if moment is None:
+        raise ExportInputError(f"epoch 超出 UTC 可表示范围：{epoch!r}")
     return moment.isoformat().replace("+00:00", "Z")
 
 
@@ -274,6 +309,12 @@ def _format_labels(metric):
 
 def _scalar_text(value):
     if isinstance(value, str):
+        try:
+            float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ExportPrometheusError(
+                f"指标值不是数字，拒绝写入 CSV：{value!r}"
+            )
         return value
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -298,6 +339,13 @@ def _parse_sample_value(name, raw):
         timestamp, (int, float, str)
     ):
         raise ExportPrometheusError(f"查询 {name} 的样本时间戳无效：{timestamp!r}")
+    if isinstance(timestamp, str):
+        try:
+            float(timestamp)
+        except (TypeError, ValueError, OverflowError):
+            raise ExportPrometheusError(
+                f"查询 {name} 的样本时间戳不是数字：{timestamp!r}"
+            )
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ExportPrometheusError(f"查询 {name} 的样本值无效：{value!r}")
     return {
@@ -320,9 +368,13 @@ def _parse_samples(name, payload):
     if not isinstance(data, dict):
         raise ExportPrometheusError(f"查询 {name} 的响应缺少 data 对象")
     result_type = data.get("resultType")
+    if result_type not in ("vector", "scalar"):
+        raise ExportPrometheusError(
+            f"查询 {name} 的 resultType 无效（实际 {result_type!r}）"
+        )
+    if "result" not in data:
+        raise ExportPrometheusError(f"查询 {name} 的响应缺少 data.result")
     result = data.get("result")
-    if result is None:
-        result = []
     if result_type == "scalar":
         sample = _parse_sample_value(name, result)
         sample["metric"] = {}
@@ -331,10 +383,6 @@ def _parse_samples(name, payload):
         raise ExportPrometheusError(f"查询 {name} 的 data.result 不是数组")
     if not result:
         return []
-    if result_type != "vector":
-        raise ExportPrometheusError(
-            f"查询 {name} 的 resultType 不是 vector（实际 {result_type!r}）"
-        )
     samples = []
     for item in result:
         if not isinstance(item, dict):
@@ -391,23 +439,28 @@ def fetch_query(base_url, name, promql, timestamp):
     return _parse_samples(name, payload)
 
 
-def _write_csv(path, samples):
+def _csv_metric_name(sample, query_name):
+    name = sample["metric"].get("__name__")
+    return name if name else query_name
+
+
+def _write_csv(path, samples, query_name):
     ordered = sorted(
         samples,
         key=lambda sample: (
-            sample["metric"].get("__name__", ""),
+            _csv_metric_name(sample, query_name),
             _format_labels(sample["metric"]),
             sample["timestamp"],
         ),
     )
     try:
         with open(path, "w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle, lineterminator="\n")
+            writer = csv.writer(handle, lineterminator="\r\n")
             writer.writerow(CSV_HEADER)
             for sample in ordered:
                 writer.writerow(
                     (
-                        sample["metric"].get("__name__", ""),
+                        _csv_metric_name(sample, query_name),
                         _format_labels(sample["metric"]),
                         sample["timestamp"],
                         sample["value"],
@@ -435,7 +488,10 @@ def export_metrics(run_dir, prometheus, out):
         raise ExportInputError("load200 整体窗口不足 1 秒，无法导出整轮查询")
 
     out_abs = _prepare_out(out)
-    prometheus_base = str(prometheus).rstrip("/")
+    try:
+        prometheus_base = _sanitize_prometheus_url(prometheus).rstrip("/")
+    except ValueError as exc:
+        raise ExportInputError(f"--prometheus 地址无效：{exc}") from exc
     if not prometheus_base:
         raise ExportInputError("--prometheus 不能为空")
 
@@ -459,7 +515,7 @@ def export_metrics(run_dir, prometheus, out):
                 prometheus_base, name, promql, end_epoch
             )
             csv_name = f"{name}.csv"
-            _write_csv(os.path.join(tmp_dir, csv_name), samples)
+            _write_csv(os.path.join(tmp_dir, csv_name), samples, name)
             query_entries.append(
                 {
                     "name": name,

@@ -205,10 +205,10 @@ class FakePrometheus:
 
 
 def _closed_port():
-    """返回一个刚释放的本机端口，用于模拟 Prometheus 不可达。"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    """绑定但不监听的本机端口；返回 (socket, port)，调用方负责关闭。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    return sock, sock.getsockname()[1]
 
 
 class ExportMetricsTest(unittest.TestCase):
@@ -308,16 +308,23 @@ class ExportMetricsTest(unittest.TestCase):
         with FakePrometheus(
             lambda query: (200, _vector(samples))
         ) as prometheus:
-            code, stdout, stderr = self.run_main(prometheus.url, out)
+            prometheus_url = (
+                prometheus.url.replace(
+                    "http://", "http://loaduser:secretpass@", 1
+                )
+                + "?token=supersecret"
+            )
+            code, stdout, stderr = self.run_main(
+                prometheus_url, out
+            )
             requests = list(prometheus.requests)
 
         self.assertEqual(code, 0, stderr)
         self.assertIn("已导出", stdout)
         self.assertTrue((out / "queries.json").is_file())
 
-        manifest = json.loads(
-            (out / "queries.json").read_text(encoding="utf-8")
-        )
+        manifest_text = (out / "queries.json").read_text(encoding="utf-8")
+        manifest = json.loads(manifest_text)
         self.assertEqual(manifest["schema"], "payment-hub.metrics-export.v1")
         self.assertEqual(manifest["run_id"], "a1b2c3d4e5f6")
         self.assertEqual(
@@ -330,6 +337,9 @@ class ExportMetricsTest(unittest.TestCase):
             },
         )
         self.assertEqual(manifest["prometheus"], prometheus.url)
+        self.assertNotIn("loaduser", manifest_text)
+        self.assertNotIn("secretpass", manifest_text)
+        self.assertNotIn("supersecret", manifest_text)
         self.assertEqual(
             [entry["name"] for entry in manifest["queries"]],
             EXPECTED_QUERY_NAMES,
@@ -387,7 +397,10 @@ class ExportMetricsTest(unittest.TestCase):
         self.assertEqual(len(rows), 3)
 
         self.assertEqual(len(requests), len(EXPECTED_QUERY_NAMES))
-        for _, requested_at in requests:
+        for (sent_promql, requested_at), entry in zip(
+            requests, manifest["queries"]
+        ):
+            self.assertEqual(sent_promql, entry["promql"])
             self.assertAlmostEqual(
                 float(requested_at), float(WINDOW_END), places=3
             )
@@ -412,16 +425,203 @@ class ExportMetricsTest(unittest.TestCase):
         for entry in manifest["queries"]:
             self.assertEqual(entry["status"], "success")
             self.assertEqual(entry["samples"], 0)
-            csv_text = (out / entry["csv"]).read_text(encoding="utf-8")
+            csv_bytes = (out / entry["csv"]).read_bytes()
             self.assertEqual(
-                csv_text, "metric,labels,timestamp,value\n"
+                csv_bytes, b"metric,labels,timestamp,value\r\n"
             )
+        self.assert_no_temp_leftovers()
+
+    def test_non_numeric_sample_exits_four_without_out(self):
+        self.write_default_summary()
+        cases = [
+            (
+                "value",
+                _vector([({"__name__": "demo_metric"}, "=1+1")]),
+            ),
+            (
+                "timestamp",
+                _vector(
+                    [({"__name__": "demo_metric"}, "1")],
+                    timestamp="=1+1",
+                ),
+            ),
+        ]
+        for label, payload in cases:
+            with self.subTest(field=label):
+                out = self.tmp / f"non-numeric-{label}"
+                with FakePrometheus(
+                    lambda query, payload=payload: (200, payload)
+                ) as prometheus:
+                    code, stdout, stderr = self.run_main(
+                        prometheus.url, out
+                    )
+                self.assertEqual(code, 4, stderr)
+                self.assertIn("不是数字", stderr)
+                self.assertFalse(out.exists())
+        self.assert_no_temp_leftovers()
+
+    def test_malformed_empty_result_exits_four(self):
+        self.write_default_summary()
+        payloads = [
+            {"status": "success", "data": {"resultType": "vector"}},
+            {
+                "status": "success",
+                "data": {"resultType": "matrix", "result": []},
+            },
+            {"status": "success", "data": {"result": []}},
+        ]
+        for index, payload in enumerate(payloads):
+            with self.subTest(index=index):
+                out = self.tmp / f"malformed-{index}"
+                with FakePrometheus(
+                    lambda query, payload=payload: (200, payload)
+                ) as prometheus:
+                    code, stdout, stderr = self.run_main(
+                        prometheus.url, out
+                    )
+                self.assertEqual(code, 4, stderr)
+                self.assertFalse(out.exists())
+        self.assert_no_temp_leftovers()
+
+    def test_metric_column_falls_back_to_query_name(self):
+        self.write_default_summary()
+        out = self.tmp / "metrics-export"
+        with FakePrometheus(
+            lambda query: (
+                200,
+                _vector(
+                    [({"route": "/api/v1/payments"}, "0.02")]
+                ),
+            )
+        ) as prometheus:
+            code, stdout, stderr = self.run_main(prometheus.url, out)
+
+        self.assertEqual(code, 0, stderr)
+        for name in EXPECTED_QUERY_NAMES:
+            with (out / f"{name}.csv").open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                rows = list(csv.reader(handle))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[1][0], name)
+            self.assertEqual(rows[1][1], "route=/api/v1/payments")
+        self.assert_no_temp_leftovers()
+
+    def test_cr_in_label_is_quoted_and_round_trips(self):
+        self.write_default_summary()
+        out = self.tmp / "metrics-export"
+        with FakePrometheus(
+            lambda query: (
+                200,
+                _vector(
+                    [
+                        (
+                            {
+                                "__name__": "demo_metric",
+                                "note": "first\rsecond",
+                            },
+                            "1",
+                        )
+                    ]
+                ),
+            )
+        ) as prometheus:
+            code, stdout, stderr = self.run_main(prometheus.url, out)
+
+        self.assertEqual(code, 0, stderr)
+        csv_path = out / "request_rate.csv"
+        csv_bytes = csv_path.read_bytes()
+        self.assertEqual(csv_bytes.count(b"\r\n"), 2)
+        with csv_path.open(
+            "r", encoding="utf-8", newline=""
+        ) as handle:
+            rows = list(csv.reader(handle))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows[1]), 4)
+        self.assertEqual(rows[1][0], "demo_metric")
+        self.assertEqual(rows[1][1], "note=first\rsecond")
+        self.assertEqual(rows[1][2], "1700000330.5")
+        self.assertEqual(rows[1][3], "1")
+        self.assert_no_temp_leftovers()
+
+    def test_invalid_epoch_stage_is_skipped(self):
+        self.write_summary(
+            {
+                "schema_version": 3,
+                "run_id": "a1b2c3d4e5f6",
+                "stages": [
+                    {
+                        "stage": "load200",
+                        "k6_started_epoch": 10 ** 400,
+                        "k6_finished_epoch": 10 ** 400,
+                    },
+                    {
+                        "stage": "load200",
+                        "k6_started_epoch": 1e30,
+                        "k6_finished_epoch": 1.1e30,
+                    },
+                    {
+                        "stage": "load200",
+                        "k6_started_epoch": WINDOW_START,
+                        "k6_finished_epoch": WINDOW_END,
+                    },
+                ],
+            }
+        )
+        out = self.tmp / "metrics-export"
+        with FakePrometheus(
+            lambda query: (200, _empty_vector())
+        ) as prometheus:
+            code, stdout, stderr = self.run_main(prometheus.url, out)
+
+        self.assertEqual(code, 0, stderr)
+        manifest = json.loads(
+            (out / "queries.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            manifest["window"]["start_epoch"], WINDOW_START
+        )
+        self.assertEqual(manifest["window"]["end_epoch"], WINDOW_END)
+        self.assert_no_temp_leftovers()
+
+    def test_all_invalid_epochs_exit_two(self):
+        self.write_summary(
+            {
+                "schema_version": 3,
+                "run_id": "a1b2c3d4e5f6",
+                "stages": [
+                    {
+                        "stage": "load200",
+                        "k6_started_epoch": 10 ** 400,
+                        "k6_finished_epoch": 10 ** 400,
+                    },
+                    {
+                        "stage": "load200",
+                        "k6_started_epoch": 1e30,
+                        "k6_finished_epoch": 1.1e30,
+                    },
+                ],
+            }
+        )
+        out = self.tmp / "metrics-export"
+        with FakePrometheus(
+            lambda query: (200, _empty_vector())
+        ) as prometheus:
+            code, stdout, stderr = self.run_main(prometheus.url, out)
+            requests = list(prometheus.requests)
+
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("load200", stderr)
+        self.assertEqual(requests, [])
+        self.assertFalse(out.exists())
         self.assert_no_temp_leftovers()
 
     def test_unreachable_prometheus_exits_four_without_out(self):
         self.write_default_summary()
         out = self.tmp / "metrics-export"
-        url = f"http://127.0.0.1:{_closed_port()}"
+        holder, port = _closed_port()
+        self.addCleanup(holder.close)
+        url = f"http://127.0.0.1:{port}"
 
         code, stdout, stderr = self.run_main(url, out)
 
