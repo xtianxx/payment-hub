@@ -57,6 +57,8 @@ EXPECTED_GOOS = "linux"
 EXPECTED_GOARCH = "amd64"
 EXPECTED_GOTOOLCHAIN = "local"
 EXPECTED_GOTELEMETRY = "off"
+CONTAINER_MISSING_MARKERS = ("no such container", "no such object")
+
 EXPECTED_PLATFORM = "linux/amd64"
 EXPECTED_PG_VERSION = "16.15"
 EXPECTED_GOOSE_VERSION = "goose version: v3.29.0"
@@ -1542,6 +1544,17 @@ class Launcher:
     def _inspect_container(
         self, container_id: str, stage: str
     ) -> dict[str, Any] | None:
+        data, _missing = self._inspect_container_state(container_id, stage)
+        return data
+
+    def _inspect_container_state(
+        self, container_id: str, stage: str
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """返回 ``(容器元数据, 是否确认不存在)``。
+
+        ``docker inspect`` 对不存在的对象返回非零，与守护进程错误无法靠退出码
+        区分；只有固定错误文本才视为“确认不存在”，其余失败仍按错误处理。
+        """
         result = self._run(
             stage,
             "container-inspect",
@@ -1558,7 +1571,9 @@ class Launcher:
             allow_failure=True,
         )
         if result.returncode != 0:
-            return None
+            stderr = (result.stderr or "").lower()
+            missing = any(marker in stderr for marker in CONTAINER_MISSING_MARKERS)
+            return None, missing
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
@@ -1569,7 +1584,7 @@ class Launcher:
             raise LauncherError(
                 stage, "container-inspect", "container metadata is not an object"
             )
-        return data
+        return data, False
 
     def _record_matches(self, record: Mapping[str, Any], data: Mapping[str, Any]) -> bool:
         config = data.get("Config")
@@ -1611,7 +1626,11 @@ class Launcher:
             self.cleanup_failures.append("cleanup:container-ambiguous")
             return None
         container_id = ids[0]
-        data = self._inspect_container(container_id, "cleanup")
+        data, missing = self._inspect_container_state(container_id, "cleanup")
+        if missing:
+            # ps 与 inspect 之间容器消失了；按已不存在处理，交由后续确认。
+            record["absent"] = True
+            return None
         if data is None or not self._record_matches(record, data):
             self.cleanup_failures.append("cleanup:container-identity")
             return None
@@ -1633,7 +1652,12 @@ class Launcher:
     def _stop_remove_container(
         self, container_id: str, stage: str, record: dict[str, Any]
     ) -> None:
-        data = self._inspect_container(container_id, "cleanup")
+        data, missing = self._inspect_container_state(container_id, "cleanup")
+        if missing:
+            # 容器在 stop/remove 完成前后被并发清理，或中断发生在移除成功、
+            # 尚未写回 record["removed"] 之间；确认不存在即视为清理成功。
+            record["absent"] = True
+            return
         if data is None or not self._record_matches(record, data):
             self.cleanup_failures.append(f"{stage}:container-identity")
             return
