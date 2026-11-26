@@ -8535,6 +8535,7 @@ class ExportReportsTests(unittest.TestCase):
                 "volume_retained": False,
                 "repeat_signal_ignored": False,
                 "error_count": 0 if pass_result else 1,
+                "errors": [] if pass_result else ["cleanup:container-identity"],
                 "tool_containers_removed": pass_result,
             },
             "resource_absence": {
@@ -8573,6 +8574,7 @@ class ExportReportsTests(unittest.TestCase):
         )
         self.assertEqual(safe["launcher_exit"], 1)
         self.assertEqual(safe["input_sha256"], "d" * 64)
+        self.assertEqual(safe["cleanup"]["errors"], [])
         for forbidden in ("SECRET_CANCEL_RAW", "SECRET_CANCEL_UNKNOWN"):
             self.assertNotIn(forbidden, text)
 
@@ -8593,6 +8595,27 @@ class ExportReportsTests(unittest.TestCase):
         self.assertEqual(
             safe["failure"], {"stage": "cleanup", "kind": "not-pass"}
         )
+        self.assertEqual(
+            safe["cleanup"]["errors"], ["cleanup:container-identity"]
+        )
+
+    def test_export_cancellation_drops_unknown_error_codes(self):
+        value = self.cancellation_report("fail")
+        value["cleanup"]["errors"] = [
+            "cleanup:secret-marker",
+            "raw text with spaces",
+            "cleanup:volume-remains",
+        ]
+        self.write(self.report_dir / "cancellation-report.json", value)
+        code, _ = self.export(["cancellation"])
+        self.assertEqual(code, 1)
+        text = (
+            self.report_dir / "upload" / "cancellation.safe.json"
+        ).read_text()
+        safe = json.loads(text)
+        self.assertEqual(safe["cleanup"]["errors"], ["cleanup:volume-remains"])
+        self.assertNotIn("secret-marker", text)
+        self.assertNotIn("raw text", text)
 
     def test_export_cancellation_pass_requires_launcher_exit_1(self):
         value = self.cancellation_report("pass")

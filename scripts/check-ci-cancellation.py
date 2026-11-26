@@ -41,9 +41,52 @@ SCHEMA = "payment-hub.ci-cancellation.v1"
 LAUNCHER_SCHEMA = "payment-hub.db-foundation.v1"
 REPORT_FILENAME = "cancellation-report.json"
 STAGE = "pg-healthy"
+CLEANUP_ERROR_PREFIX_RE = re.compile(r"[a-z0-9-]{1,40}")
+CLEANUP_STAGE_ERROR_SUFFIXES = frozenset(
+    ("reap", "container-identity", "container-remains", "container-cleanup")
+)
+CLEANUP_ERROR_CODES = frozenset(
+    (
+        "cleanup:container-list",
+        "cleanup:container-ambiguous",
+        "cleanup:container-identity",
+        "cleanup:containers-remain",
+        "cleanup:network-ambiguous",
+        "cleanup:network-identity",
+        "cleanup:network-remains",
+        "cleanup:network-verify",
+        "cleanup:tool-container",
+        "cleanup:compose-collect",
+        "cleanup:compose-down",
+        "cleanup:volume-not-recorded",
+        "cleanup:volume",
+        "cleanup:volume-ambiguous",
+        "cleanup:volume-identity",
+        "cleanup:volume-inspect",
+        "cleanup:volume-remove",
+        "cleanup:volume-remains",
+    )
+)
+
 SIGNAL_NAME = "SIGTERM"
 STDOUT_PREFIX = "cancellation-check:"
 REPORT_PREFIX = "cancellation-report:"
+
+
+def sanitize_cleanup_error(value: Any) -> str | None:
+    """只接受启动器的固定错误码，拒绝任意文本进入上传报告。"""
+    if not isinstance(value, str) or ":" not in value:
+        return None
+    prefix, _, suffix = value.partition(":")
+    if not CLEANUP_ERROR_PREFIX_RE.fullmatch(prefix):
+        return None
+    if value in CLEANUP_ERROR_CODES:
+        return value
+    if suffix in CLEANUP_STAGE_ERROR_SUFFIXES:
+        return value
+    return None
+
+
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PROJECT_PREFIX = "payment-hub-test-db-"
@@ -128,6 +171,7 @@ def default_cleanup() -> dict[str, Any]:
         "volume_retained": False,
         "repeat_signal_ignored": False,
         "error_count": 0,
+        "errors": [],
         "tool_containers_removed": False,
     }
 
@@ -882,8 +926,17 @@ def summarize_cleanup(report: Mapping[str, Any]) -> dict[str, Any]:
     errors = cleanup.get("errors")
     if isinstance(errors, list):
         summary["error_count"] = len(errors)
+        # 只保留固定错误码，避免把任意文本带进上传报告。
+        summary["errors"] = sorted(
+            {
+                code
+                for item in errors
+                if (code := sanitize_cleanup_error(item)) is not None
+            }
+        )
     else:
         summary["error_count"] = 0
+        summary["errors"] = []
         summary["result"] = "unknown"
     tools = cleanup.get("tool_containers")
     if isinstance(tools, list):
@@ -990,6 +1043,15 @@ def _normalize_cleanup(value: Any) -> dict[str, Any]:
         if isinstance(error_count, int) and not isinstance(error_count, bool) and error_count >= 0
         else 0
     )
+    errors = value.get("errors")
+    if isinstance(errors, list):
+        summary["errors"] = sorted(
+            {
+                code
+                for item in errors
+                if (code := sanitize_cleanup_error(item)) is not None
+            }
+        )
     summary["tool_containers_removed"] = value.get("tool_containers_removed") is True
     return summary
 

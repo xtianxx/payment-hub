@@ -778,6 +778,7 @@ class CancellationReportSchemaTests(unittest.TestCase):
             "volume_retained",
             "repeat_signal_ignored",
             "error_count",
+            "errors",
             "tool_containers_removed",
         })
         self.assertEqual(set(data["timings"]), {"pg_healthy_seconds", "exit_after_signal_seconds"})
@@ -835,6 +836,32 @@ class CancellationReportSchemaTests(unittest.TestCase):
         self.assertNotIn("secret-marker", json.dumps(summary))
         self.assertFalse(summary["tool_containers_removed"])
         self.assertTrue(summary["volume_retained"])
+
+    def test_summarize_cleanup_passes_fixed_error_codes(self):
+        summary = MOD.summarize_cleanup(
+            {
+                "cleanup": {
+                    "result": "fail",
+                    "compose_down_exit": 0,
+                    "network_removed": True,
+                    "volume_removed": True,
+                    "volume_retained": False,
+                    "repeat_signal_ignored": False,
+                    "errors": [
+                        "cleanup:container-identity",
+                        "migration-up:container-remains",
+                        "cleanup:unknown-code",
+                        "cleanup:secret-marker",
+                    ],
+                    "tool_containers": [],
+                }
+            }
+        )
+        self.assertEqual(summary["error_count"], 4)
+        self.assertEqual(
+            summary["errors"],
+            ["cleanup:container-identity", "migration-up:container-remains"],
+        )
 
 
 class RunCheckOrchestrationTests(unittest.TestCase):
