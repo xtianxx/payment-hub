@@ -25,6 +25,7 @@ const (
 	metricsWriteTimeout      = 5 * time.Second
 	metricsIdleTimeout       = 30 * time.Second
 	metricsShutdownGrace     = 500 * time.Millisecond
+	serveFailureLogTimeout   = 500 * time.Millisecond
 )
 
 type startupBudget struct {
@@ -347,28 +348,35 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 	if shutdownErr != nil {
 		return shutdownErr
 	}
+	if !serveDoneClosed(serveDone) {
+		return ErrShutdown
+	}
+	if metricsServeDone != nil && !serveDoneClosed(metricsServeDone) {
+		return ErrShutdown
+	}
+	// Record the underlying Serve failure before folding it into the fixed
+	// runtime exit code, so the operator sees an actionable cause.
+	if !errors.Is(serveErr, http.ErrServerClosed) {
+		logger.logServeFailure(serveErr)
+		return ErrRuntime
+	}
+	if metricsServeDone != nil && !errors.Is(metricsServeErr, http.ErrServerClosed) {
+		logger.logServeFailure(metricsServeErr)
+		return ErrRuntime
+	}
 	if runtimeErr != nil {
 		return runtimeErr
 	}
-	select {
-	case <-serveDone:
-		if !errors.Is(serveErr, http.ErrServerClosed) {
-			return ErrRuntime
-		}
-	default:
-		return ErrShutdown
-	}
-	if metricsServeDone != nil {
-		select {
-		case <-metricsServeDone:
-			if !errors.Is(metricsServeErr, http.ErrServerClosed) {
-				return ErrRuntime
-			}
-		default:
-			return ErrShutdown
-		}
-	}
 	return nil
+}
+
+func serveDoneClosed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
 }
 
 func validRuntimeLimits(limits runtimeLimits) bool {
@@ -598,6 +606,26 @@ func (logger *runtimeLogger) logStartupFailure(budget startupBudget, stage LogSt
 		Stage:  stage,
 		Reason: startupFailureReason(ctxErr),
 		Err:    classified,
+	})
+}
+
+// logServeFailure writes one best-effort shutdown-scoped event for an
+// unexpected Serve result so the operator sees a cause instead of only the
+// fixed runtime exit code. The event carries only whitelisted categories;
+// Err is classified by Logger and never serialized. A missing or timed-out
+// writer is ignored because the process is already terminating.
+func (logger *runtimeLogger) logServeFailure(failure error) {
+	if logger == nil || failure == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), serveFailureLogTimeout)
+	defer cancel()
+	_ = logger.log(ctx, LogRecord{
+		Level:  LogLevelError,
+		Event:  LogEventShutdown,
+		Stage:  LogStageShutdown,
+		Reason: LogReasonInternal,
+		Err:    failure,
 	})
 }
 

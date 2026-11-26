@@ -1,7 +1,9 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -491,5 +493,85 @@ func TestRunWithMetricsServerNilFailsClosed(t *testing.T) {
 	}
 	if _, _, closeCalls, _ := db.snapshot(); closeCalls != 1 {
 		t.Fatalf("database close calls = %d, want 1", closeCalls)
+	}
+}
+
+type failingServeServer struct {
+	err error
+}
+
+func (server *failingServeServer) Serve(net.Listener) error       { return server.err }
+func (server *failingServeServer) Shutdown(context.Context) error { return nil }
+func (server *failingServeServer) Close() error                   { return nil }
+
+func TestMetricsServeFailureIsLogged(t *testing.T) {
+	businessListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen business: %v", err)
+	}
+	t.Cleanup(func() { _ = businessListener.Close() })
+	metricsListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen metrics: %v", err)
+	}
+	t.Cleanup(func() { _ = metricsListener.Close() })
+
+	values := lifecycleTestBaseValues()
+	values[metricsAddrEnvName] = "127.0.0.1:19098"
+	db := newLifecycleTestDB()
+	serveErr := errors.New("metrics serve canary failure")
+	serverCalls := 0
+	deps := runtimeDeps{
+		openDatabase: func(context.Context, string) (runtimeDatabase, error) {
+			return db, nil
+		},
+		listen: func(_ context.Context, address string) (net.Listener, error) {
+			if address == values[metricsAddrEnvName] {
+				return metricsListener, nil
+			}
+			return businessListener, nil
+		},
+		newServer: func(server *http.Server) runtimeServer {
+			serverCalls++
+			if serverCalls == 1 {
+				return &lifecycleTestRealServer{server: server, started: make(chan struct{})}
+			}
+			return &failingServeServer{err: serveErr}
+		},
+		newMetricsRuntime: func(context.Context, runtimeDatabase) (*metrics.Runtime, error) {
+			return metrics.NewRuntime(), nil
+		},
+	}
+
+	var logs bytes.Buffer
+	err = runWith(context.Background(), lifecycleTestLookup(values), &logs, deps, lifecycleTestLimits())
+	if !errors.Is(err, ErrRuntime) {
+		t.Fatalf("err = %v, want ErrRuntime", err)
+	}
+	if _, _, closeCalls, _ := db.snapshot(); closeCalls != 1 {
+		t.Fatalf("database close calls = %d, want 1", closeCalls)
+	}
+	if strings.Contains(logs.String(), serveErr.Error()) {
+		t.Fatal("serve failure log echoed the raw error text")
+	}
+	shutdownEvents := 0
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal("serve failure log line is not JSON")
+		}
+		if entry["event"] != "shutdown" || entry["stage"] != "shutdown" {
+			continue
+		}
+		shutdownEvents++
+		if entry["level"] != "error" || entry["reason"] != "internal" || entry["error_kind"] != "internal" {
+			t.Fatalf("unexpected serve failure log entry: %v", entry)
+		}
+	}
+	if shutdownEvents != 1 {
+		t.Fatalf("shutdown events = %d, want 1\n%s", shutdownEvents, logs.String())
 	}
 }
