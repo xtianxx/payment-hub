@@ -326,6 +326,24 @@ jobs:
           echo "launcher safety regressions: stdlib unittest/mock only; no real PostgreSQL, Docker, or network."
           python3 -B -m unittest discover -s scripts -p 'test_*.py'
 
+      - name: Install benchmark test dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' >/dev/null 2>&1; then
+            echo "PyYAML already available"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-yaml
+            python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+          fi
+
+      - name: Run benchmark script tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s tests/benchmark -p 'test_*.py'
+
       - name: Export safe setup reports
         if: always()
         shell: bash
