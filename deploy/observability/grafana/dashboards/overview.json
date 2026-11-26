@@ -233,16 +233,9 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "整轮 P95 使用 $__range 对直方图桶做 increase，用于与 k6 P95 对照；差异容差为 ±3ms 或 ±20%（取较大者）。",
+      "description": "整轮 P95 在所选时间范围结束时刻以 instant 查询显示；使用 $__range 对直方图桶做 increase，用于与 k6 P95 对照；差异容差为 ±3ms 或 ±20%（取较大者）。",
       "fieldConfig": {
         "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "showPoints": "never"
-          },
           "min": 0,
           "unit": "s"
         },
@@ -256,30 +249,32 @@
       },
       "id": 6,
       "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "textMode": "auto"
       },
       "targets": [
         {
           "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, route) (increase(payment_hub_http_request_duration_seconds_bucket[$__range])))",
-          "instant": false,
+          "instant": true,
           "legendFormat": "{{route}}",
-          "range": true,
+          "range": false,
           "refId": "A"
         }
       ],
       "title": "整轮 P95 延迟（按路由）",
-      "type": "timeseries"
+      "type": "stat"
     },
     {
       "collapsed": false,

@@ -180,6 +180,28 @@ class DashboardJsonTest(unittest.TestCase):
         self.assertIn("increase(", round_p95_expr)
         self.assertIn("[$__range]", round_p95_expr)
 
+    def test_round_p95_is_instant_stat_result(self):
+        round_p95 = [
+            panel
+            for panel in self.panels
+            if panel.get("title") == "整轮 P95 延迟（按路由）"
+        ]
+        self.assertEqual(len(round_p95), 1)
+        panel = round_p95[0]
+        self.assertIn(panel.get("type"), ("stat", "table"))
+
+        targets = panel.get("targets")
+        self.assertIsInstance(targets, list)
+        self.assertEqual(len(targets), 1)
+        target = targets[0]
+        self.assertIs(target.get("instant"), True)
+        self.assertIs(target.get("range"), False)
+
+        expression = target.get("expr", "")
+        self.assertIn("histogram_quantile", expression)
+        self.assertIn("increase(", expression)
+        self.assertIn("[$__range]", expression)
+
     def test_no_forbidden_labels_or_template_variables(self):
         expressions = all_expressions(self.dashboard)
         text = "\n".join(expressions)
