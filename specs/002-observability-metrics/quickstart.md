@@ -6,7 +6,7 @@
 
 ## 当前实现范围（MVP）
 
-本文件描述目标形态的完整流程。当前完成 T001–T019：HTTP 指标与连接池指标（US1/US2）已实现，设置 `PAYMENT_HUB_METRICS_ADDR` 后可从 `/metrics` 读取 `payment_hub_http_*` 与 `payment_hub_db_pool_*`。以下仍未实现：`deploy/compose.observability.yaml` 仍是 `services: {}` 骨架，`check_metrics_evidence.py` 与 `export_metrics.py` 仍是占位脚本，基准入口仍是 3 轮且不会设置 `PAYMENT_HUB_METRICS_ADDR`。因此第 2、3、4、7 步的 Compose 启动、5 轮参数、证据检查和导出在执行时还不可用，将在 US3–US4 实现；第 1、5、6 步的边界与目录约定已确定，但需要真实数据目录才能执行。
+本文件描述目标形态的完整流程。当前完成 T001–T034（US1–US3）：HTTP、连接池和 PostgreSQL 指标已实现；观测栈 Compose、固定 `55432`、5 轮基准、运行锁和监控密码文件均已落地，设置 `PAYMENT_HUB_METRICS_ADDR` 后可从 `/metrics` 读取应用指标。仍未实现：`check_metrics_evidence.py` 与 `export_metrics.py` 仍是占位脚本，归档/回看脚本化（T041）和 Grafana 看板内容（T042）待完成。因此第 4、7 步不可用；第 2、3、5、6 步可按本文执行，回看时看板仍为占位。
 
 ## 前置条件
 
