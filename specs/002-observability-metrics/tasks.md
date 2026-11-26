@@ -103,12 +103,12 @@
 - [x] T020 [P] [US3] 新增 `tests/benchmark/test_observability_compose.py`：断言 `deploy/compose.observability.yaml` 使用 `network_mode: host`、无 `ports`、无 `host.docker.internal`，且 Prometheus/exporter/Grafana 分别只绑定 `127.0.0.1:9090`、`127.0.0.1:9187`、`127.0.0.1:3000`
 - [x] T021 [P] [US3] 新增 `tests/benchmark/test_prometheus_config.py`：断言 `prometheus.yml` 抓取 `127.0.0.1:9091` 和 `127.0.0.1:9187`、间隔 5 秒、`scrape_timeout` 4 秒；`prometheus.view.yml` 无抓取目标并启用长保留
 - [x] T022 [P] [US3] 新增 `tests/benchmark/test_exporter_queries.py`：解析 `postgres-exporter-queries.yaml`，断言存在 `waiting_locks` 和 `granted_locks` 列，且不产生 `usename`/`application_name` 标签
-- [x] T023 [US3] 新增 `tests/benchmark/test_runner_logic.py` 用例：5 轮常量、55432/9091 预检、`<临时目录>/payment-hub-load.lock` 主机级排他锁、锁竞争立即失败、中断阶段标记
+- [x] T023 [US3] 新增 `tests/benchmark/test_runner_logic.py` 用例：5 轮常量、55432/9091 预检、`/tmp/payment-hub-load.lock` 主机级排他锁、锁竞争立即失败、中断阶段标记
 - [x] T024 [US3] 新增 `tests/benchmark/test_runner_secret_hygiene.py`：用假密码运行角色创建路径，断言密码不出现在 `commands.log`、`summary.json`、进程参数和异常文本中
 
 ### Implementation for User Story 3
 
-- [x] T025 [US3] 修改 `tests/benchmark/run_payment_create.py`：轮数固定为 5；启动前检查 `55432` 和 `9091`；在 `<临时目录>/payment-hub-load.lock` 上持有排他 `flock` 直到运行结束，该锁与 `--artifacts-dir` 无关，避免不同证据目录绕过锁；冲突时输出锁路径与持有者 PID 并立即失败
+- [x] T025 [US3] 修改 `tests/benchmark/run_payment_create.py`：轮数固定为 5；启动前检查 `55432` 和 `9091`；在 `/tmp/payment-hub-load.lock` 上持有排他 `flock` 直到运行结束，该锁与 `--artifacts-dir` 无关，避免不同证据目录绕过锁；冲突时输出锁路径与持有者 PID 并立即失败
 - [x] T026 [US3] 修改 `tests/benchmark/run_payment_create.py`：preflight 读取一次 `PAYMENT_HUB_MONITOR_PASSWORD_FILE` 并校验 `0600`、单行且无首尾空白；5 轮复用同一密码；通过 stdin 执行创建或更新 `postgres_exporter` 的 SQL，`DO` 分隔符避开正文且密码不进入 argv；启动应用时注入 `PAYMENT_HUB_METRICS_ADDR=127.0.0.1:9091`；确保 `commands.log` 和 `summary.json` 不出现密码
 - [x] T027 [US3] 更新 `tests/benchmark/compose.benchmark.yaml` 和 `deploy/compose.yaml`：PostgreSQL 固定发布到 `127.0.0.1:55432`，应用指标地址按 T026 注入；同步更新 `tests/benchmark/test_runner_logic.py` 中的端口与 env 断言
 - [x] T028 [P] [US3] 更新 `docs/payment-create-baseline.md`：改为 5 个测量轮、固定 `55432`，替换 `--rounds 3` 示例，并在文首标注旧 3 轮记录属于历史协议、不与新协议直接比较

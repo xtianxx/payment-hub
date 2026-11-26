@@ -109,7 +109,7 @@ Prometheus 打开 TSDB 需要写锁，启动和运行时会写 WAL、可能压�
 ## 基准入口改动
 
 - 轮数从 3 改为 5，同步命令行、测试和文档；`docs/payment-create-baseline.md` 标注旧 3 轮为历史协议。
-- PostgreSQL 从动态端口改为固定 `55432`；入口检查 55432 和 9091，并持有 `<临时目录>/payment-hub-load.lock`（通常 `/tmp/payment-hub-load.lock`，由 `tempfile.gettempdir()` 决定）排他锁直到运行结束。锁是主机级、与 `--artifacts-dir` 无关，因为 `55432`/`9091` 是主机级固定资源，不同证据目录的运行同样不能并发。
+- PostgreSQL 从动态端口改为固定 `55432`；入口检查 55432 和 9091，并持有 `/tmp/payment-hub-load.lock`（固定路径，与 `TMPDIR`/`TEMP`/`TMP` 无关）排他锁直到运行结束。锁是主机级、与 `--artifacts-dir` 无关，因为 `55432`/`9091` 是主机级固定资源，不同证据目录的运行同样不能并发。
 - 每轮用本地密码文件创建只读角色；密码缺失或权限不对时拒绝运行；SQL 通过 stdin 传递，密码不进入 argv、`commands.log` 或摘要。
 - 启动应用时设置 `PAYMENT_HUB_METRICS_ADDR=127.0.0.1:9091`；指标监听失败按配置语义使启动失败。
 - 证据脚本按 `summary.json` 的 5 个 `load200` 阶段窗口判定，不按整次运行窗口。

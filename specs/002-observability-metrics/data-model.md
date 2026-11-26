@@ -136,7 +136,7 @@ prepared -> preflight(lock + ports) -> rounds 1..5 -> completed | incomplete
 ```
 
 - `completed` 由现有基准规则判定，与指标是否完整无关。
-- 同一时间只允许一个运行：基准入口持有 `<临时目录>/payment-hub-load.lock`（通常 `/tmp/payment-hub-load.lock`，由 `tempfile.gettempdir()` 决定）的排他 `flock`，直到运行结束；锁是主机级、与 `--artifacts-dir` 无关，因为 `55432`/`9091` 是主机级固定资源，不同证据目录的运行同样不能并发；端口检查作为辅助。
+- 同一时间只允许一个运行：基准入口持有 `/tmp/payment-hub-load.lock`（固定路径，与 `TMPDIR`/`TEMP`/`TMP` 无关）的排他 `flock`，直到运行结束；锁是主机级、与 `--artifacts-dir` 无关，因为 `55432`/`9091` 是主机级固定资源，不同证据目录的运行同样不能并发；端口检查作为辅助。
 - 运行可能被中断；中断后只判定实际完成的测量阶段，不把计划时长当作已运行时长。
 - `metrics archived` 表示指标目录已进入运行证据目录。
 - `cleaned` 由观察者确认后手动执行；不自动删除。

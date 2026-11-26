@@ -141,6 +141,29 @@ class MonitorRoleSecretHygieneTest(unittest.TestCase):
             json.loads(summary_text)
 
 
+class MonitorRoleRedactionTest(unittest.TestCase):
+    def test_quoted_password_literal_is_redacted_from_role_log(self):
+        tricky = "a'b"
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = make_runner(Path(tmp) / "runs")
+            runner.monitor_password = tricky
+            runner.psql_env = {"PGPASSWORD": tricky}
+
+            def fake_failure(cmd, **kwargs):
+                return subprocess.CompletedProcess(
+                    cmd, 1, "", "error near 'a''b' in password"
+                )
+
+            with mock.patch("run_payment_create.subprocess.run", side_effect=fake_failure):
+                with self.assertRaises(RunError):
+                    runner.ensure_monitor_role()
+
+            log = (runner.logs_dir / "monitor-role.log").read_text(encoding="utf-8")
+        self.assertNotIn("a'b", log)
+        self.assertNotIn("a''b", log)
+        self.assertIn("<redacted>", log)
+
+
 class ArgumentHygieneTest(unittest.TestCase):
     def test_runner_cli_has_no_password_option(self):
         with self.assertRaises(SystemExit):

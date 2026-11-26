@@ -39,7 +39,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,15 +78,18 @@ MONITOR_PASSWORD_ENV = "PAYMENT_HUB_MONITOR_PASSWORD_FILE"
 DEFAULT_MONITOR_PASSWORD_FILE = Path("~/.config/payment-hub/monitor-password")
 MONITOR_ROLE = "postgres_exporter"
 RUN_LOCK_NAME = "payment-hub-load.lock"
+# Fixed absolute path: TMPDIR/TEMP/TMP must not be able to point two runs at
+# different lock files, because 55432/9091 are host resources.
+RUN_LOCK_PATH = Path("/tmp") / RUN_LOCK_NAME
 
 
 def run_lock_path():
-    """Host-wide lock shared by every artifacts root.
+    """Host-wide lock shared by every artifacts root and every TMPDIR setting.
 
-    The fixed 55432/9091 ports are host resources, so a per-artifacts-root lock
-    cannot serialize two runs that use different evidence directories.
+    The fixed 55432/9091 ports are host resources, so a per-artifacts-root or
+    per-TMPDIR lock cannot serialize two runs.
     """
-    return Path(tempfile.gettempdir()) / RUN_LOCK_NAME
+    return RUN_LOCK_PATH
 
 
 def dollar_tag(*texts, base="ph"):
@@ -451,7 +453,14 @@ class Runner:
             raise RunError(f"monitor role creation timed out; see {log_path}") from exc
         redacted = (proc.stdout or "") + (proc.stderr or "")
         if self.monitor_password:
-            redacted = redacted.replace(self.monitor_password, "<redacted>")
+            # psql may echo either the raw password or its doubled-quote SQL
+            # literal in an error, so redact both forms.
+            secrets = {
+                self.monitor_password,
+                self.monitor_password.replace("'", "''"),
+            }
+            for secret in sorted(secrets, key=len, reverse=True):
+                redacted = redacted.replace(secret, "<redacted>")
         with open(log_path, "ab") as log:
             log.write(redacted.encode("utf-8"))
         try:

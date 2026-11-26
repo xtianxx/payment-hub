@@ -150,6 +150,21 @@ class FixedPortTest(unittest.TestCase):
             self.assertIn(str(busy_port), str(caught.exception))
 
 
+class RunLockPathTest(unittest.TestCase):
+    def test_lock_path_is_fixed_and_ignores_temp_environment(self):
+        self.assertEqual(
+            run_payment_create.run_lock_path(), Path("/tmp/payment-hub-load.lock")
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"TMPDIR": "/var/tmp", "TEMP": "/var/tmp", "TMP": "/var/tmp"},
+        ):
+            self.assertEqual(
+                run_payment_create.run_lock_path(),
+                Path("/tmp/payment-hub-load.lock"),
+            )
+
+
 class RunLockTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
