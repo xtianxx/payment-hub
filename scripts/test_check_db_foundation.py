@@ -1663,6 +1663,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         self.launcher._run = mock.Mock()
         record = {"stage": "x", "name": "expected", "id": "a" * 64}
         self.launcher._stop_remove_container("a" * 64, "cleanup", record)
+        self.launcher._run.assert_not_called()
         self.assertEqual(
             self.launcher.cleanup_failures, ["cleanup:container-identity"]
         )
@@ -1675,6 +1676,7 @@ class CheckDBFoundationMockTests(unittest.TestCase):
         record = {"stage": "x", "name": "expected", "id": None}
         self.assertIsNone(self.launcher._find_intended_container(record))
         self.assertTrue(record["absent"])
+        self.assertIsNone(record.get("id"))
         self.assertEqual(self.launcher.cleanup_failures, [])
 
     def test_inspect_container_state_recognizes_missing_and_daemon_errors(self):
