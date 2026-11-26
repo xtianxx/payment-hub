@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // maxApplicationSeries 是单次运行应用注册表的序列上限。指标只用于本地压测
@@ -66,7 +67,7 @@ func TestApplicationRegistryStaysWithinCardinalityBudget(t *testing.T) {
 
 	total := 0
 	for _, family := range families {
-		total += len(family.GetMetric())
+		total += exportedSeriesCount(family)
 		for _, metric := range family.GetMetric() {
 			for _, pair := range metric.GetLabel() {
 				if slices.Contains(forbiddenLabelNames, pair.GetName()) {
@@ -87,4 +88,21 @@ func TestApplicationRegistryStaysWithinCardinalityBudget(t *testing.T) {
 			maxApplicationSeries,
 		)
 	}
+}
+
+// exportedSeriesCount 统计族实际导出的时间序列数：直方图的每个桶以及 _sum、
+// _count 都是独立序列，summary 的分位数同理，只按 Metric 对象计数会低估基数。
+func exportedSeriesCount(family *dto.MetricFamily) int {
+	total := 0
+	for _, metric := range family.GetMetric() {
+		switch {
+		case metric.GetHistogram() != nil:
+			total += len(metric.GetHistogram().GetBucket()) + 2
+		case metric.GetSummary() != nil:
+			total += len(metric.GetSummary().GetQuantile()) + 2
+		default:
+			total++
+		}
+	}
+	return total
 }
