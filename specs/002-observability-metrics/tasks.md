@@ -86,7 +86,7 @@
 ### Implementation for User Story 2
 
 - [x] T018 [US2] 实现 `internal/metrics/pool.go`：`prometheus.Collector` 从 `PoolStats` 快照读取上限、总数、空闲、使用中、建立中、获取、累计等待、无空闲等待、取消、新建和销毁；单个业务池，无池标签
-- [ ] T019 [US2] 在 `internal/app/app.go` 通过 `BusinessPool()` 把业务池接入采集器，确保不新建第二个池；新增 `internal/app/metrics_pool_test.go`
+- [x] T019 [US2] 在 `internal/app/app.go` 通过 `BusinessPool()` 把业务池接入采集器，确保不新建第二个池；新增 `internal/app/metrics_pool_test.go`
 
 **Checkpoint**: US2 可独立演示；停压后资源和池指标可观察回落。
 

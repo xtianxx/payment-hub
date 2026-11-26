@@ -122,8 +122,12 @@ func realRuntimeDeps() runtimeDeps {
 		newServer: func(server *http.Server) runtimeServer {
 			return &httpRuntimeServer{server: server}
 		},
-		newMetricsRuntime: func(context.Context, runtimeDatabase) (*metrics.Runtime, error) {
-			return metrics.NewRuntime(), nil
+		newMetricsRuntime: func(_ context.Context, db runtimeDatabase) (*metrics.Runtime, error) {
+			pool, err := businessPool(db)
+			if err != nil {
+				return nil, err
+			}
+			return metrics.NewRuntimeWithPool(func() metrics.PoolStats { return pool.Stat() }), nil
 		},
 		newBusiness:      productionNewBusiness,
 		businessRequired: true,
