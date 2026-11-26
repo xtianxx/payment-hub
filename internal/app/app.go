@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"payment-hub/internal/httpapi"
+	"payment-hub/internal/metrics"
 )
 
 const (
@@ -70,6 +71,11 @@ type runtimeDeps struct {
 	openDatabase func(context.Context, string) (runtimeDatabase, error)
 	listen       func(context.Context, string) (net.Listener, error)
 	newServer    func(*http.Server) runtimeServer
+	// newMetricsRuntime builds the isolated metrics runtime when the metrics
+	// listener is enabled. It receives the already-open database so later
+	// pool instrumentation can reuse the production pool. It is nil in tests
+	// that only exercise the default (metrics-disabled) path.
+	newMetricsRuntime func(context.Context, runtimeDatabase) (*metrics.Runtime, error)
 	// newBusiness builds the narrow business ports from the already-open
 	// runtime database and the optional test-mode adapters. The context is the
 	// application work context shared with the HTTP base context, so business
@@ -115,6 +121,9 @@ func realRuntimeDeps() runtimeDeps {
 		listen:       listenRuntime,
 		newServer: func(server *http.Server) runtimeServer {
 			return &httpRuntimeServer{server: server}
+		},
+		newMetricsRuntime: func(context.Context, runtimeDatabase) (*metrics.Runtime, error) {
+			return metrics.NewRuntime(), nil
 		},
 		newBusiness:      productionNewBusiness,
 		businessRequired: true,

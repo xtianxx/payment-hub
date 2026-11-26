@@ -1,0 +1,12 @@
+# Grafana 看板预置（骨架）：从容器内固定目录加载，禁止界面修改和删除。
+apiVersion: 1
+
+providers:
+  - name: payment-hub
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

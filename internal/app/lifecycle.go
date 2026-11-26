@@ -12,11 +12,21 @@ import (
 	"time"
 
 	"payment-hub/internal/httpapi"
+	"payment-hub/internal/metrics"
 )
 
 var errReadyzAdmissionClosed = errors.New("app: readiness admission closed")
 
 const startupDiagnosticReserveCap = 250 * time.Millisecond
+
+const (
+	metricsReadHeaderTimeout = 2 * time.Second
+	metricsReadTimeout       = 2 * time.Second
+	metricsWriteTimeout      = 5 * time.Second
+	metricsIdleTimeout       = 30 * time.Second
+	metricsShutdownGrace     = 500 * time.Millisecond
+	serveFailureLogTimeout   = 500 * time.Millisecond
+)
 
 type startupBudget struct {
 	deadline time.Time
@@ -70,6 +80,13 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 	if !validRuntimeHTTPAddr(httpAddr) || runtimePGEnvInjected(lookup) {
 		return ErrRuntimeConfig
 	}
+	metricsAddr, metricsEnabled, metricsErr := resolveMetricsAddr(lookup)
+	if metricsErr != nil {
+		return ErrRuntimeConfig
+	}
+	if metricsEnabled && deps.newMetricsRuntime == nil {
+		return ErrRuntimeConfig
+	}
 	testModeConfig, err := LoadTestModeConfig(lookup)
 	if err != nil {
 		return ErrRuntimeConfig
@@ -92,6 +109,7 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 	}
 	var testMode *TestMode
 	var listener net.Listener
+	var metricsListener net.Listener
 	startupComplete := false
 	defer func() {
 		if startupComplete {
@@ -100,11 +118,26 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 		if testMode != nil {
 			_ = testMode.Close()
 		}
+		if metricsListener != nil {
+			_ = metricsListener.Close()
+		}
 		if listener != nil {
 			_ = listener.Close()
 		}
 		_ = closeRuntimeDatabaseStartup(db, cleanupCtx, limits)
 	}()
+	var metricsRuntime *metrics.Runtime
+	if metricsEnabled {
+		metricsRuntime, metricsErr = deps.newMetricsRuntime(startupCtx, db)
+		if metricsErr != nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), metricsErr)
+			return ErrStartup
+		}
+		if metricsRuntime == nil || metricsRuntime.Handler == nil || metricsRuntime.HTTP == nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), ErrStartup)
+			return ErrStartup
+		}
+	}
 
 	if deps.businessRequired && deps.newBusiness == nil {
 		logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), ErrStartup)
@@ -159,9 +192,28 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 		logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), err)
 		return ErrStartup
 	}
+	if listener == nil {
+		logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), ErrStartup)
+		return ErrStartup
+	}
 	if startupCtx.Err() != nil {
 		logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), nil)
 		return ErrStartup
+	}
+	if metricsRuntime != nil {
+		metricsListener, err = deps.listen(startupCtx, metricsAddr)
+		if err != nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), err)
+			return ErrStartup
+		}
+		if metricsListener == nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), ErrStartup)
+			return ErrStartup
+		}
+		if startupCtx.Err() != nil {
+			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), nil)
+			return ErrStartup
+		}
 	}
 
 	gate := newReadyGate()
@@ -199,9 +251,13 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 		defer cancel()
 		return db.Ping(probeCtx)
 	}
-	router := httpapi.NewRouter(check)
+	var routerOptions []httpapi.Option
+	if metricsRuntime != nil {
+		routerOptions = append(routerOptions, httpapi.WithMiddleware(metricsRuntime.Middleware()))
+	}
+	router := httpapi.NewRouter(check, routerOptions...)
 	if submit != nil {
-		router, err = httpapi.NewRouterWithPayments(check, authConfig, submit, query)
+		router, err = httpapi.NewRouterWithPayments(check, authConfig, submit, query, routerOptions...)
 		if err != nil {
 			logger.logStartupFailure(startup, LogStageEntry, startupCtx.Err(), err)
 			return ErrStartup
@@ -218,9 +274,27 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 			return workCtx
 		},
 	}
+	var metricsServer runtimeServer
 	runtimeServer := deps.newServer(server)
 	if runtimeServer == nil {
 		return ErrRuntime
+	}
+	if metricsRuntime != nil {
+		metricsHTTPServer := &http.Server{
+			Handler:           metricsRuntime.Handler,
+			ReadHeaderTimeout: metricsReadHeaderTimeout,
+			ReadTimeout:       metricsReadTimeout,
+			WriteTimeout:      metricsWriteTimeout,
+			IdleTimeout:       metricsIdleTimeout,
+			ErrorLog:          log.New(io.Discard, "", 0),
+			BaseContext: func(net.Listener) context.Context {
+				return workCtx
+			},
+		}
+		metricsServer = deps.newServer(metricsHTTPServer)
+		if metricsServer == nil {
+			return ErrRuntime
+		}
 	}
 	if err := logger.log(startupCtx, LogRecord{
 		Level:  LogLevelInfo,
@@ -243,29 +317,89 @@ func runWith(ctx context.Context, lookup func(string) (string, bool), writer io.
 		close(serveDone)
 	}()
 
-	var runtimeErr error
-	select {
-	case <-ctx.Done():
-	case <-serveDone:
-		runtimeErr = ErrRuntime
+	var metricsServeDone chan struct{}
+	var metricsServeErr error
+	if metricsServer != nil {
+		metricsServeDone = make(chan struct{})
+		go func() {
+			metricsServeErr = metricsServer.Serve(metricsListener)
+			close(metricsServeDone)
+		}()
 	}
 
-	shutdownErr := shutdownRuntime(runtimeServer, gate, testMode, db, listener, cancelWork, serveDone, limits)
+	var runtimeErr error
+	if metricsServeDone != nil {
+		select {
+		case <-ctx.Done():
+		case <-serveDone:
+			runtimeErr = ErrRuntime
+		case <-metricsServeDone:
+			runtimeErr = ErrRuntime
+		}
+	} else {
+		select {
+		case <-ctx.Done():
+		case <-serveDone:
+			runtimeErr = ErrRuntime
+		}
+	}
+
+	shutdownErr := shutdownRuntime(runtimeServer, metricsServer, gate, testMode, db, listener, metricsListener, cancelWork, serveDone, metricsServeDone, limits)
+
+	// Read Serve results only after their completion channels close, then
+	// record an underlying failure even when shutdown itself also failed, so
+	// the operator can see what triggered the exit.
+	businessFailure := stoppedServerFailure(serveDone, func() error { return serveErr })
+	var metricsFailure error
+	if metricsServeDone != nil {
+		metricsFailure = stoppedServerFailure(metricsServeDone, func() error { return metricsServeErr })
+	}
+	if businessFailure != nil {
+		logger.logServeFailure(businessFailure)
+	} else if metricsFailure != nil {
+		logger.logServeFailure(metricsFailure)
+	}
+
 	if shutdownErr != nil {
 		return shutdownErr
+	}
+	if !serveDoneClosed(serveDone) {
+		return ErrShutdown
+	}
+	if metricsServeDone != nil && !serveDoneClosed(metricsServeDone) {
+		return ErrShutdown
+	}
+	if businessFailure != nil || metricsFailure != nil {
+		return ErrRuntime
 	}
 	if runtimeErr != nil {
 		return runtimeErr
 	}
-	select {
-	case <-serveDone:
-		if !errors.Is(serveErr, http.ErrServerClosed) {
-			return ErrRuntime
-		}
-	default:
-		return ErrShutdown
-	}
 	return nil
+}
+
+// stoppedServerFailure returns the unexpected Serve error of a finished
+// server, or nil when it is still running or stopped normally. The error is
+// read only after the completion channel is closed, which orders the read after
+// the serving goroutine's write; read must not be called otherwise.
+func stoppedServerFailure(done <-chan struct{}, read func() error) error {
+	if !serveDoneClosed(done) {
+		return nil
+	}
+	err := read()
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func serveDoneClosed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
 }
 
 func validRuntimeLimits(limits runtimeLimits) bool {
@@ -288,13 +422,31 @@ func validRuntimeHTTPAddr(address string) bool {
 	return err == nil
 }
 
-func shutdownRuntime(server runtimeServer, gate *readyGate, testMode *TestMode, db runtimeDatabase, listener net.Listener, cancelWork context.CancelFunc, serveDone <-chan struct{}, limits runtimeLimits) error {
+func shutdownRuntime(server runtimeServer, metricsServer runtimeServer, gate *readyGate, testMode *TestMode, db runtimeDatabase, listener net.Listener, metricsListener net.Listener, cancelWork context.CancelFunc, serveDone <-chan struct{}, metricsServeDone <-chan struct{}, limits runtimeLimits) error {
 	gate.close()
 	exitDeadline := time.Now().Add(limits.shutdown)
 	exitCtx, cancelExit := context.WithDeadline(context.Background(), exitDeadline)
 	defer cancelExit()
 
 	shutdownCtx, cancelShutdown := context.WithDeadline(context.Background(), exitDeadline.Add(-limits.closeReserve))
+	metricsGrace := limits.shutdown / 4
+	if metricsGrace > metricsShutdownGrace {
+		metricsGrace = metricsShutdownGrace
+	}
+	if metricsGrace <= 0 {
+		metricsGrace = time.Millisecond
+	}
+	metricsCtx, cancelMetrics := context.WithTimeout(context.Background(), metricsGrace)
+	if metricsServer != nil {
+		if err := metricsServer.Shutdown(metricsCtx); err != nil {
+			_ = metricsServer.Close()
+		}
+	}
+	if metricsListener != nil {
+		_ = metricsListener.Close()
+	}
+	cancelMetrics()
+
 	shutdownErr := server.Shutdown(shutdownCtx)
 	cancelShutdown()
 
@@ -314,6 +466,13 @@ func shutdownRuntime(server runtimeServer, gate *readyGate, testMode *TestMode, 
 	if forceCloseFailed || !gate.wait(exitCtx) || !waitServeDone(serveDone, exitCtx) {
 		return ErrShutdown
 	}
+	metricsStopped := true
+	if metricsServeDone != nil && !waitServeDone(metricsServeDone, exitCtx) {
+		metricsStopped = false
+		if metricsServer != nil {
+			_ = metricsServer.Close()
+		}
+	}
 	// All admitted readyz and business users have finished. It is now safe to
 	// cancel the shared work context before sealing the observer and closing the
 	// database; this must not happen before the normal gate drain.
@@ -330,7 +489,7 @@ func shutdownRuntime(server runtimeServer, gate *readyGate, testMode *TestMode, 
 	if !closeRuntimeDatabaseUntil(db, exitCtx) {
 		return ErrShutdown
 	}
-	if shutdownErr != nil || listenerCloseFailed || testModeFailed {
+	if shutdownErr != nil || listenerCloseFailed || testModeFailed || !metricsStopped {
 		return ErrShutdown
 	}
 	return nil
@@ -470,6 +629,26 @@ func (logger *runtimeLogger) logStartupFailure(budget startupBudget, stage LogSt
 		Stage:  stage,
 		Reason: startupFailureReason(ctxErr),
 		Err:    classified,
+	})
+}
+
+// logServeFailure writes one best-effort shutdown-scoped event for an
+// unexpected Serve result so the operator sees a cause instead of only the
+// fixed runtime exit code. The event carries only whitelisted categories;
+// Err is classified by Logger and never serialized. A missing or timed-out
+// writer is ignored because the process is already terminating.
+func (logger *runtimeLogger) logServeFailure(failure error) {
+	if logger == nil || failure == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), serveFailureLogTimeout)
+	defer cancel()
+	_ = logger.log(ctx, LogRecord{
+		Level:  LogLevelError,
+		Event:  LogEventShutdown,
+		Stage:  LogStageShutdown,
+		Reason: LogReasonInternal,
+		Err:    failure,
 	})
 }
 
