@@ -136,6 +136,12 @@ python3 tests/benchmark/metrics_store.py archive \
   --run-dir "$RUN_DIR"
 ```
 
+归档路径就是第 2 步的 `PROMETHEUS_DATA_DIR`。先把它记录到证据目录，避免第 6 步覆盖变量后丢失原路径：
+
+```bash
+printf '%s\n' "$PROMETHEUS_DATA_DIR" > "$RUN_DIR/prometheus-data-dir.txt"
+```
+
 先停止 Prometheus 再归档，确保 WAL 已落盘。脚本校验源目录包含 `wal/`、复制到 `$RUN_DIR/metrics.tmp`，校验文件数与树哈希后原子重命名为 `$RUN_DIR/metrics`；退出码 `0` 成功、`2` 参数/前置条件/IO 错误、`3` 校验失败。失败时保留 `metrics.tmp/` 供人工处理，并在 `metrics-evidence.json` 记录 `archive_error`；不要删除临时目录。
 
 如果运行被中断，仍按同样步骤停止并归档；证据只判定实际完成的测量阶段，未运行的阶段记为缺失。
@@ -249,6 +255,20 @@ if failed:
 PY
 then
   docker volume ls | grep 'payment-hub-load' || true
+  MEASUREMENT_DIR="$(cat "$RUN_DIR/prometheus-data-dir.txt" 2>/dev/null || true)"
+  case "$MEASUREMENT_DIR" in
+    "")
+      echo "未记录测量数据目录，跳过" >&2 ;;
+    /tmp/opencode/payment-hub-metrics/run-*)
+      if [ "$(dirname -- "$MEASUREMENT_DIR")" = "/tmp/opencode/payment-hub-metrics" ] \
+         && [ ! -L "$MEASUREMENT_DIR" ]; then
+        rm -rf -- "$MEASUREMENT_DIR"
+      else
+        echo "测量数据目录路径异常，跳过：$MEASUREMENT_DIR" >&2
+      fi ;;
+    *)
+      echo "测量数据目录不在预期位置，跳过：$MEASUREMENT_DIR" >&2 ;;
+  esac
   rm -rf "$RUN_DIR" "$VIEW_DIR"
 else
   echo "卷或容器清理未全部确认，保留 $RUN_DIR 以便重试" >&2
@@ -260,7 +280,7 @@ fi
 
 `rm -rf "$RUN_DIR"` 会连同 `$RUN_DIR/metrics` 归档一起删除；需要长期保留归档时，先把该目录移到 `$RUN_DIR` 和 `$VIEW_DIR` 之外，再执行清理。
 
-第 6 步把 `PROMETHEUS_DATA_DIR` 覆盖成了回看副本路径；测量阶段的数据目录在归档成功、回看副本也已删除后即可按记录的原路径删除，`$RUN_DIR/metrics` 是归档后唯一长期保留的数据。
+第 6 步把 `PROMETHEUS_DATA_DIR` 覆盖成了回看副本路径，所以第 5 步先把测量目录记录到 `$RUN_DIR/prometheus-data-dir.txt`。成功分支会按该记录删除测量目录：只接受 `/tmp/opencode/payment-hub-metrics/run-*` 且父目录完全匹配的路径，符号链接跳过；记录缺失或路径异常时只提示并保留目录。`$RUN_DIR/metrics` 是归档后唯一长期保留的数据。
 
 ## 常见问题
 
@@ -297,7 +317,7 @@ fi
 | 回看 | `metrics_store.py view` + `up prometheus grafana` | 退出 0，归档与副本树哈希一致；Grafana 13.2.7 `/api/health` 正常、数据源与看板“Payment Hub 压测总览”自动加载，3000/9090 仅监听回环 |
 | 归档数据 | Prometheus API 查询归档副本 | 第一轮窗口末：`sum(payment_hub_http_requests_total)=25013`，整轮 P95（121s）约 17.4 ms，`pg_up=1` |
 | 导出 | `export_metrics.py --out "$RUN_DIR/metrics-export"` | 退出 0，17 个查询 + `queries.json`，CSV 为 CRLF，`metric` 列按查询名回退 |
-| 清理 | `down -v` + 按 `overall.volumes` 删除 | 实跑时按前缀 + `run_id` 删除本次 5 个基准卷，`docker volume ls`、`docker ps -a` 无残留，其他历史卷未受影响；提交前收紧为卷名精确匹配并对 inspect/rm 失败、容器标签检查做了合成用例验证（精确卷缺失→`absent` 且退出 0，不匹配卷名→退出非 0，无关卷保留）；`down -v` 失败会中止后续删除，`rm -rf` 会删除 `$RUN_DIR/metrics` 归档，需要保留时先移出 |
+| 清理 | `down -v` + 按 `overall.volumes` 删除 | 实跑时按前缀 + `run_id` 删除本次 5 个基准卷，`docker volume ls`、`docker ps -a` 无残留，其他历史卷未受影响；提交前收紧为卷名精确匹配并对 inspect/rm 失败、容器标签检查做了合成用例验证（精确卷缺失→`absent` 且退出 0，不匹配卷名→退出非 0，无关卷保留）；`down -v` 失败会中止后续删除，`rm -rf` 会删除 `$RUN_DIR/metrics` 归档，需要保留时先移出；测量目录按 `prometheus-data-dir.txt` 记录删除 |
 
 未验证与限制：
 
