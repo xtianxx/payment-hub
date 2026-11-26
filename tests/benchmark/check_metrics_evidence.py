@@ -15,7 +15,10 @@
 """
 
 import argparse
+import contextlib
 import datetime
+import fcntl
+import http.client
 import json
 import math
 import os
@@ -32,6 +35,8 @@ LOAD_STAGE = "load200"
 DEFAULT_ROUNDS = 5
 SCRAPE_INTERVAL_SECONDS = 5.0
 MAX_SAMPLE_GAP_SECONDS = 7.5
+GAP_QUERY_DURATION = "7500ms"
+GAP_QUERY_STEP_SECONDS = 1
 RUN_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{12}$")
 
 # 严格按 data-model.md 的 required_series 清单；顺序也保持一致。
@@ -90,7 +95,9 @@ def parse_args(argv=None):
 
 def utc_iso(epoch):
     """把 Unix 时间戳格式化为 UTC 的 ISO 8601 秒级时间。"""
-    moment = datetime.datetime.fromtimestamp(float(epoch), datetime.timezone.utc)
+    moment = datetime.datetime.fromtimestamp(
+        float(epoch), tz=datetime.timezone.utc
+    )
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -115,10 +122,13 @@ def parse_round_number(value):
 
 
 def parse_epoch_value(value):
-    """解析有限数值 epoch；非法时返回 None。"""
+    """解析有限数值 epoch；非法或超出 float 范围时返回 None。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
     if not math.isfinite(number):
         return None
     return number
@@ -230,11 +240,26 @@ def collect_stage_windows(summary, run_id):
     return windows, missing
 
 
+def redact_prometheus_url(url):
+    """去掉 Prometheus URL 中的 userinfo，避免凭据写入证据。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    if "@" not in parts.netloc:
+        return url
+    netloc = parts.netloc.rsplit("@", 1)[1]
+    return urllib.parse.urlunsplit(
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+    )
+
+
 class PrometheusClient(object):
     """访问 Prometheus HTTP API 的最小客户端。"""
 
     def __init__(self, base_url, timeout):
         self.base_url = base_url.rstrip("/")
+        self.display_url = redact_prometheus_url(base_url)
         self.timeout = timeout
 
     def _request(self, path, params):
@@ -259,10 +284,11 @@ class PrometheusClient(object):
             if detail:
                 message += "：" + detail[:500]
             raise PrometheusError(message)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError,
+                http.client.HTTPException) as exc:
             reason = getattr(exc, "reason", exc)
             raise PrometheusError(
-                "无法访问 Prometheus %s：%s" % (self.base_url, reason)
+                "无法访问 Prometheus %s：%s" % (self.display_url, reason)
             )
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -293,7 +319,7 @@ class PrometheusClient(object):
             raise PrometheusError("Prometheus 返回的样本格式无效")
         try:
             number = float(pair[1])
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             raise PrometheusError("Prometheus 返回的样本值不是数值")
         if not math.isfinite(number):
             raise PrometheusError("Prometheus 返回的样本值不是有限数值")
@@ -317,28 +343,20 @@ class PrometheusClient(object):
             return [self._parse_sample_value(result)]
         raise PrometheusError("不支持的即时查询结果类型：%r" % (result_type,))
 
-    def has_series(self, expression, at_epoch):
-        """在指定时刻查询序列名，非空结果即视为存在。"""
-        data = self._instant_result(expression, at_epoch)
-        result_type = data.get("resultType")
-        result = data.get("result")
-        if result_type == "vector":
-            if not isinstance(result, list):
-                raise PrometheusError("Prometheus 的 vector 结果不是数组")
-            return bool(result)
-        if result_type == "scalar":
-            return True
-        raise PrometheusError("不支持的即时查询结果类型：%r" % (result_type,))
+    def series_present_in_window(self, name, at_epoch, range_seconds):
+        """只把窗口内出现过的序列视为 present。"""
+        expression = "count_over_time(%s[%ds]) > 0" % (name, range_seconds)
+        return any(value > 0 for value in self.instant_values(expression, at_epoch))
 
-    def range_series(self, expression, start_epoch, end_epoch):
-        """按 5 秒步长查询窗口内的矩阵，返回 [(标签, 时间戳列表)]。"""
+    def range_samples(self, expression, start_epoch, end_epoch, step_seconds):
+        """查询窗口矩阵，返回 [(标签, [(时间戳, 值)])]。"""
         data = self._request(
             "/api/v1/query_range",
             {
                 "query": expression,
                 "start": format_epoch(start_epoch),
                 "end": format_epoch(end_epoch),
-                "step": "5s",
+                "step": "%ds" % step_seconds,
             },
         )
         if data.get("resultType") != "matrix":
@@ -358,18 +376,18 @@ class PrometheusClient(object):
             values = item.get("values")
             if not isinstance(values, list):
                 raise PrometheusError("Prometheus 的 matrix 样本缺少 values")
-            timestamps = []
+            samples = []
             for pair in values:
-                if not isinstance(pair, (list, tuple)) or len(pair) < 1:
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
                     raise PrometheusError("Prometheus 的 matrix 样本格式无效")
                 try:
                     timestamp = float(pair[0])
-                except (TypeError, ValueError):
+                except (OverflowError, TypeError, ValueError):
                     raise PrometheusError("Prometheus 的样本时间戳不是数值")
                 if not math.isfinite(timestamp):
                     raise PrometheusError("Prometheus 的样本时间戳不是有限数值")
-                timestamps.append(timestamp)
-            series.append((metric, timestamps))
+                samples.append((timestamp, self._parse_sample_value(pair)))
+            series.append((metric, samples))
         return series
 
 
@@ -383,24 +401,35 @@ def sum_as_int(values):
     return int(round(total))
 
 
-def detect_gaps(label, series, start_epoch, end_epoch):
-    """找出窗口内相邻样本间隔超过 7.5 秒的位置。"""
+def detect_sample_gaps(label, series, start_epoch, end_epoch):
+    """检查窗口内是否出现 7.5 秒没有任何原始抓取样本。"""
+    check_from = start_epoch + MAX_SAMPLE_GAP_SECONDS
     messages = []
-    for _metric, timestamps in series:
-        ordered = sorted(
-            {
-                timestamp
-                for timestamp in timestamps
-                if start_epoch - 1e-9 <= timestamp <= end_epoch + 1e-9
-            }
-        )
-        for previous, current in zip(ordered, ordered[1:]):
-            gap = current - previous
-            if gap > MAX_SAMPLE_GAP_SECONDS + 1e-9:
-                messages.append(
-                    "%s 窗口内相邻样本间隔 %.1fs（>7.5s）：%.3f -> %.3f"
-                    % (label, gap, previous, current)
+    for _metric, samples in series:
+        zero_points = [
+            timestamp
+            for timestamp, value in samples
+            if check_from - 1e-9 <= timestamp <= end_epoch + 1e-9
+            and value <= 0
+        ]
+        if not zero_points:
+            continue
+        if len(zero_points) == 1:
+            messages.append(
+                "%s 窗口内 7.5 秒无原始抓取：评估时刻 %.3f 的 "
+                "count_over_time 为 0" % (label, zero_points[0])
+            )
+        else:
+            messages.append(
+                "%s 窗口内 7.5 秒无原始抓取：评估时刻 %.3f 至 %.3f "
+                "共 %d 个点为 0"
+                % (
+                    label,
+                    zero_points[0],
+                    zero_points[-1],
+                    len(zero_points),
                 )
+            )
     if len(messages) > 10:
         extra = len(messages) - 10
         messages = messages[:10]
@@ -417,15 +446,21 @@ def target_state(observed, up_1):
     return "down"
 
 
+def expected_scrapes(start_epoch, end_epoch):
+    duration = end_epoch - start_epoch
+    return max(0, int(math.floor(duration / SCRAPE_INTERVAL_SECONDS)) - 1)
+
+
+def window_range_seconds(start_epoch, end_epoch):
+    return max(1, int(math.floor(end_epoch - start_epoch)))
+
+
 def evaluate_stage(window, client):
     """查询一个测量阶段并返回证据记录。"""
     start = window["start_epoch"]
     end = window["end_epoch"]
-    duration = end - start
-    expected = max(
-        0, int(math.floor(duration / SCRAPE_INTERVAL_SECONDS)) - 1
-    )
-    range_seconds = max(1, int(math.floor(duration)))
+    expected = expected_scrapes(start, end)
+    range_seconds = window_range_seconds(start, end)
 
     observed = sum_as_int(
         client.instant_values(
@@ -434,8 +469,7 @@ def evaluate_stage(window, client):
     )
     up_1 = sum_as_int(
         client.instant_values(
-            'sum_over_time((up{job="payment-hub"} == 1)[%ds:5s])'
-            % range_seconds,
+            'sum_over_time(up{job="payment-hub"}[%ds])' % range_seconds,
             end,
         )
     )
@@ -446,8 +480,7 @@ def evaluate_stage(window, client):
     )
     exporter_up_1 = sum_as_int(
         client.instant_values(
-            'sum_over_time((up{job="postgres"} == 1)[%ds:5s])'
-            % range_seconds,
+            'sum_over_time(up{job="postgres"}[%ds])' % range_seconds,
             end,
         )
     )
@@ -458,17 +491,32 @@ def evaluate_stage(window, client):
     )
     pg_up_1 = sum_as_int(
         client.instant_values(
-            "sum_over_time((pg_up == 1)[%ds:5s])" % range_seconds, end
+            "sum_over_time(pg_up[%ds])" % range_seconds, end
         )
     )
+
+    targets = {
+        "payment-hub": target_state(observed, up_1),
+        "postgres": target_state(exporter_observed, exporter_up_1),
+        "pg_up": target_state(pg_observed, pg_up_1),
+    }
 
     required_series = {}
     for name in REQUIRED_SERIES:
         required_series[name] = (
-            "present" if client.has_series(name, end) else "absent"
+            "present"
+            if client.series_present_in_window(name, end, range_seconds)
+            else "absent"
         )
 
     missing = []
+    if targets["payment-hub"] == "absent":
+        missing.append("payment-hub 窗口内没有抓取样本（targets=absent）")
+    if targets["postgres"] == "absent":
+        missing.append("postgres 窗口内没有抓取样本（targets=absent）")
+    if targets["pg_up"] == "absent":
+        missing.append("pg_up 窗口内没有抓取样本（targets=absent）")
+
     if observed < expected:
         missing.append(
             "payment-hub 抓取次数不足：observed=%d < expected=%d"
@@ -531,13 +579,25 @@ def evaluate_stage(window, client):
         if state == "absent":
             missing.append("关键序列缺失：%s" % name)
 
-    for expression, label in (
-        ('up{job="payment-hub"}', "payment-hub"),
-        ('up{job="postgres"}', "postgres exporter"),
-        ("pg_up", "pg_up"),
-    ):
-        series = client.range_series(expression, start, end)
-        missing.extend(detect_gaps(label, series, start, end))
+    if end + 1e-9 >= start + MAX_SAMPLE_GAP_SECONDS:
+        for expression, label in (
+            ('up{job="payment-hub"}', "payment-hub"),
+            ('up{job="postgres"}', "postgres exporter"),
+            ("pg_up", "pg_up"),
+        ):
+            gap_query = "count_over_time(%s[%s])" % (
+                expression,
+                GAP_QUERY_DURATION,
+            )
+            series = client.range_samples(
+                gap_query,
+                start + MAX_SAMPLE_GAP_SECONDS,
+                end,
+                GAP_QUERY_STEP_SECONDS,
+            )
+            missing.extend(
+                detect_sample_gaps(label, series, start, end)
+            )
 
     status = "complete" if not missing else "incomplete"
     return {
@@ -547,11 +607,7 @@ def evaluate_stage(window, client):
             "start_utc": utc_iso(start),
             "end_utc": utc_iso(end),
         },
-        "targets": {
-            "payment-hub": target_state(observed, up_1),
-            "postgres": target_state(exporter_observed, exporter_up_1),
-            "pg_up": target_state(pg_observed, pg_up_1),
-        },
+        "targets": targets,
         "scrapes": {
             "expected": expected,
             "observed": observed,
@@ -566,14 +622,45 @@ def evaluate_stage(window, client):
     }
 
 
+def failed_stage_result(window, message):
+    """为查询失败的阶段生成 incomplete 记录，保留后续阶段。"""
+    start = window["start_epoch"]
+    end = window["end_epoch"]
+    return {
+        "round": window["round"],
+        "round_id": window["round_id"],
+        "window": {
+            "start_utc": utc_iso(start),
+            "end_utc": utc_iso(end),
+        },
+        "targets": {
+            "payment-hub": "absent",
+            "postgres": "absent",
+            "pg_up": "absent",
+        },
+        "scrapes": {
+            "expected": expected_scrapes(start, end),
+            "observed": 0,
+            "up_1": 0,
+            "exporter_observed": 0,
+            "exporter_up_1": 0,
+            "pg_up_1": 0,
+        },
+        "required_series": {
+            name: "absent" for name in REQUIRED_SERIES
+        },
+        "status": "incomplete",
+        "missing": [message],
+        "error": message,
+    }
+
+
 def compose_evidence(
     run_id,
     run_dir_name,
     prometheus_url,
     stage_results,
     global_missing,
-    archive_error,
-    archive_error_present,
     prometheus_error,
 ):
     """组装顶层证据；整体 complete 要求所有阶段 complete 且无缺失。"""
@@ -583,15 +670,11 @@ def compose_evidence(
             missing.append("第 %d 轮：%s" % (stage["round"], reason))
     if prometheus_error:
         missing.insert(0, prometheus_error)
-    if archive_error_present:
-        message = "已有 metrics-evidence.json 含 archive_error，指标证据强制为 incomplete"
-        if message not in missing:
-            missing.append(message)
 
     complete = bool(stage_results) and not missing
     if any(stage["status"] != "complete" for stage in stage_results):
         complete = False
-    if prometheus_error or archive_error_present:
+    if prometheus_error:
         complete = False
 
     evidence = {
@@ -606,9 +689,54 @@ def compose_evidence(
     }
     if prometheus_error:
         evidence["error"] = prometheus_error
-    if archive_error_present:
-        evidence["archive_error"] = archive_error
     return evidence
+
+
+def merge_archive_error(document, existing):
+    """把已有证据中的 archive_error 合并到新文档并强制 incomplete。"""
+    if existing is None or "archive_error" not in existing:
+        return document
+    merged = dict(document)
+    merged["archive_error"] = existing.get("archive_error")
+    merged["status"] = "incomplete"
+    missing = list(merged.get("missing") or [])
+    message = "已有 metrics-evidence.json 含 archive_error，指标证据强制为 incomplete"
+    if message not in missing:
+        missing.append(message)
+    merged["missing"] = missing
+    return merged
+
+
+@contextlib.contextmanager
+def evidence_lock(run_dir):
+    """对运行目录内的证据写锁加排他 flock。"""
+    lock_path = os.path.join(run_dir, ".metrics-evidence.lock")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield lock_path
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def write_evidence_locked(run_dir, build_document):
+    """持锁重读现有证据、合并 archive_error 后原子写入。"""
+    evidence_path = os.path.join(run_dir, "metrics-evidence.json")
+    with evidence_lock(run_dir):
+        existing = load_existing_evidence(run_dir)
+        document = merge_archive_error(build_document(), existing)
+        write_json_atomic(evidence_path, document)
+        return document
 
 
 def write_json_atomic(path, document):
@@ -641,13 +769,6 @@ def main(argv=None):
             raise InputError("运行目录不存在或不是目录：%s" % run_dir)
         summary = load_summary(run_dir)
         run_id = extract_run_id(summary)
-        existing = load_existing_evidence(run_dir)
-        archive_error_present = (
-            existing is not None and "archive_error" in existing
-        )
-        archive_error = (
-            existing.get("archive_error") if archive_error_present else None
-        )
 
         windows, global_missing = collect_stage_windows(summary, run_id)
         client = PrometheusClient(args.prometheus, args.timeout)
@@ -657,21 +778,27 @@ def main(argv=None):
             try:
                 stage_results.append(evaluate_stage(window, client))
             except PrometheusError as exc:
-                prometheus_error = "Prometheus 查询失败：%s" % exc
-                break
+                message = "Prometheus 查询失败：%s" % exc
+                if prometheus_error is None:
+                    prometheus_error = message
+                stage_results.append(
+                    failed_stage_result(window, message)
+                )
 
-        evidence = compose_evidence(
-            run_id=run_id,
-            run_dir_name=os.path.basename(os.path.normpath(run_dir)),
-            prometheus_url=args.prometheus,
-            stage_results=stage_results,
-            global_missing=global_missing,
-            archive_error=archive_error,
-            archive_error_present=archive_error_present,
-            prometheus_error=prometheus_error,
-        )
+        prometheus_url = redact_prometheus_url(args.prometheus)
+
+        def build_document():
+            return compose_evidence(
+                run_id=run_id,
+                run_dir_name=os.path.basename(os.path.normpath(run_dir)),
+                prometheus_url=prometheus_url,
+                stage_results=stage_results,
+                global_missing=global_missing,
+                prometheus_error=prometheus_error,
+            )
+
+        evidence = write_evidence_locked(run_dir, build_document)
         evidence_path = os.path.join(run_dir, "metrics-evidence.json")
-        write_json_atomic(evidence_path, evidence)
     except InputError as exc:
         print("错误：%s" % exc, file=sys.stderr)
         return 2
