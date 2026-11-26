@@ -6,7 +6,7 @@ Fixed CLI:
     --migrate-image <local image> [--k6 <local k6>] [--go <local go>] \
     [--artifacts-dir <outside-repo directory>]
 
-The run is fixed at three sequential rounds, each with a fresh Compose project,
+The run is fixed at five sequential rounds, each with a fresh Compose project,
 database, volume and host ports. Each round runs a 2 RPS x 5 s smoke stage, then
 a 50 RPS x 20 s warmup on the real payment path, then the measured
 200 RPS x 120 s stage with 128 pre-allocated/max VUs. Warmup must pass before
@@ -24,6 +24,8 @@ stage when the effective masks do not match. This is guest affinity, not host
 physical isolation.
 """
 import argparse
+import errno
+import fcntl
 import hashlib
 import http.client
 import json
@@ -70,6 +72,36 @@ DOCKER_SOCKET = Path("/var/run/docker.sock")
 DOCKER_HOST = "unix:///var/run/docker.sock"
 
 PROFILE = "200"
+PG_HOST_PORT = 55432
+METRICS_HOST_PORT = 9091
+MONITOR_PASSWORD_ENV = "PAYMENT_HUB_MONITOR_PASSWORD_FILE"
+DEFAULT_MONITOR_PASSWORD_FILE = Path("~/.config/payment-hub/monitor-password")
+MONITOR_ROLE = "postgres_exporter"
+RUN_LOCK_NAME = "payment-hub-load.lock"
+# Fixed absolute path: TMPDIR/TEMP/TMP must not be able to point two runs at
+# different lock files, because 55432/9091 are host resources.
+RUN_LOCK_PATH = Path("/tmp") / RUN_LOCK_NAME
+
+
+def run_lock_path():
+    """Host-wide lock shared by every artifacts root and every TMPDIR setting.
+
+    The fixed 55432/9091 ports are host resources, so a per-artifacts-root or
+    per-TMPDIR lock cannot serialize two runs.
+    """
+    return RUN_LOCK_PATH
+
+
+def dollar_tag(*texts, base="ph"):
+    """Return a dollar-quote delimiter that does not occur in any text.
+
+    PostgreSQL ends a dollar-quoted string only at the exact matching delimiter,
+    so a delimiter absent from the body cannot be closed early by user input.
+    """
+    tag = base
+    while any(f"${tag}$" in text for text in texts):
+        tag += "_"
+    return f"${tag}$"
 TARGET_RATE = 200
 SMOKE_RATE = 2
 SMOKE_DURATION_S = 5
@@ -81,7 +113,7 @@ SMOKE_PRE_VUS = 4
 SMOKE_MAX_VUS = 8
 WARMUP_PRE_VUS = MAX_VUS
 WARMUP_MAX_VUS = MAX_VUS
-REQUIRED_ROUNDS = 3
+REQUIRED_ROUNDS = 5
 BENCHMARK_BUILD_TAG = "paymenthub_benchmark"
 POOL_CONFIG_PREFIX = "POOL_CONFIG "
 EXPECTED_MAX_CONNS = 16
@@ -131,12 +163,14 @@ def free_loopback_port():
         return sock.getsockname()[1]
 
 
-def free_non_5432_loopback_port():
-    for _ in range(64):
-        port = free_loopback_port()
-        if port != 5432:
-            return port
-    raise PreconditionError("could not obtain a dynamic loopback port other than 5432")
+def loopback_port_is_free(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+        return True
 
 
 def sanitized_env(extra=None):
@@ -241,6 +275,7 @@ class Runner:
             else DEFAULT_ARTIFACTS_ROOT
         )
         artifacts_root = artifacts_root.resolve()
+        self.artifacts_root = artifacts_root
         self.run_root = artifacts_root / "load-runs" / f"{timestamp}-{self.base_run_id}"
         self.run_dir = self.run_root
         self.env_dir = self.run_root / "env"
@@ -272,6 +307,170 @@ class Runner:
         self.k6_path = None
         self.k6_version = None
         self.fatal_reason = None
+        self.lock_fd = None
+        self.lock_path = None
+        self.monitor_password = None
+        self.monitor_password_path = None
+
+    # ---------- run lock / monitor credential ----------
+
+    def acquire_run_lock(self):
+        """Hold one host-wide exclusive lock for the whole run.
+
+        The fixed PostgreSQL and metrics ports are host resources, so the lock
+        file lives outside the artifacts root and every run shares it. The file
+        is opened without following symlinks and must be a regular, single-link
+        file owned by the current user before it is truncated.
+        """
+        path = run_lock_path()
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise PreconditionError(f"run lock path is a symlink: {path}") from exc
+            raise PreconditionError(f"cannot open run lock {path}: {exc}") from exc
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise PreconditionError(f"run lock is not a regular file: {path}")
+            if info.st_nlink != 1:
+                raise PreconditionError(
+                    f"run lock has {info.st_nlink} hard links: {path}"
+                )
+            if info.st_uid != os.geteuid():
+                raise PreconditionError(
+                    f"run lock is owned by uid {info.st_uid}, not the current user: {path}"
+                )
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                holder = os.read(descriptor, 4096).decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                detail = f"; holder: {holder}" if holder else ""
+                raise PreconditionError(f"another benchmark run holds {path}{detail}")
+            os.ftruncate(descriptor, 0)
+            holder = f"pid={os.getpid()} started={self.started_at} run={self.base_run_id}\n"
+            os.write(descriptor, holder.encode("utf-8"))
+            os.fsync(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self.lock_fd = descriptor
+        self.lock_path = path
+        self.log_command(f"# run lock acquired {path} pid={os.getpid()}")
+
+    def release_run_lock(self):
+        descriptor = self.lock_fd
+        if descriptor is None:
+            return
+        self.lock_fd = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def read_monitor_password(self):
+        """Read the exporter password once per run and never keep it in evidence."""
+        configured = os.environ.get(MONITOR_PASSWORD_ENV)
+        path = (
+            Path(configured).expanduser()
+            if configured
+            else DEFAULT_MONITOR_PASSWORD_FILE.expanduser()
+        )
+        try:
+            info = path.stat()
+        except OSError as exc:
+            raise PreconditionError(f"monitor password file is missing: {path}") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise PreconditionError(f"monitor password path is not a regular file: {path}")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode != 0o600:
+            raise PreconditionError(
+                f"monitor password file must be mode 0600: {path} has {mode:04o}"
+            )
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PreconditionError(f"monitor password file is unreadable: {path}") from exc
+        password = raw.rstrip("\n")
+        if not password or "\n" in password or "\r" in password or "\x00" in password:
+            raise PreconditionError(
+                f"monitor password file must contain one non-empty line: {path}"
+            )
+        if password != password.strip():
+            raise PreconditionError(
+                "monitor password must not start or end with whitespace "
+                f"(postgres-exporter trims it when reading the file): {path}"
+            )
+        self.monitor_password = password
+        self.monitor_password_path = path
+        return password
+
+    def monitor_role_sql(self):
+        if self.monitor_password is None:
+            raise PreconditionError("monitor password was not loaded before role creation")
+        # A standard string literal only needs doubled quotes; the DO delimiter is
+        # then chosen to be absent from the whole body so characters such as `$$`
+        # in the password cannot terminate the block early.
+        literal = self.monitor_password.replace("'", "''")
+        body = (
+            "BEGIN\n"
+            f"  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{MONITOR_ROLE}') THEN\n"
+            f"    CREATE ROLE {MONITOR_ROLE} LOGIN PASSWORD '{literal}';\n"
+            "  ELSE\n"
+            f"    ALTER ROLE {MONITOR_ROLE} WITH LOGIN PASSWORD '{literal}';\n"
+            "  END IF;\n"
+            "END"
+        )
+        delimiter = dollar_tag(body)
+        return (
+            f"DO {delimiter}\n{body}\n{delimiter};\n"
+            f"GRANT pg_monitor TO {MONITOR_ROLE};\n"
+        )
+
+    def ensure_monitor_role(self):
+        sql = self.monitor_role_sql()
+        log_path = self.logs_dir / "monitor-role.log"
+        self.log_command(f"$ psql <stdin> (monitor role SQL redacted) > {log_path.name}")
+        try:
+            proc = subprocess.run(
+                ["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1"],
+                input=sql,
+                cwd=str(REPO),
+                env=self.psql_env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RunError(f"monitor role creation timed out; see {log_path}") from exc
+        redacted = (proc.stdout or "") + (proc.stderr or "")
+        if self.monitor_password:
+            # psql may echo either the raw password or its doubled-quote SQL
+            # literal in an error, so redact both forms.
+            secrets = {
+                self.monitor_password,
+                self.monitor_password.replace("'", "''"),
+            }
+            for secret in sorted(secrets, key=len, reverse=True):
+                redacted = redacted.replace(secret, "<redacted>")
+        with open(log_path, "ab") as log:
+            log.write(redacted.encode("utf-8"))
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
+        if proc.returncode != 0:
+            raise RunError(
+                f"monitor role creation failed with exit {proc.returncode}; see {log_path}"
+            )
 
     # ---------- logging / process helpers ----------
 
@@ -533,8 +732,20 @@ class Runner:
             raise PreconditionError(f"cannot find PostgreSQL image in {COMPOSE_BASE}")
         return matches[0]
 
+    def check_fixed_ports(self, pg_port=PG_HOST_PORT, metrics_port=METRICS_HOST_PORT):
+        for port, what in (
+            (pg_port, "benchmark PostgreSQL"),
+            (metrics_port, "application metrics"),
+        ):
+            if not loopback_port_is_free(port):
+                raise PreconditionError(
+                    f"fixed {what} port 127.0.0.1:{port} is already in use"
+                )
+
     def preflight(self):
         validate_artifacts_root(self.run_root)
+        self.read_monitor_password()
+        self.check_fixed_ports()
         try:
             self.cpu_plan = build_cpu_plan()
         except CpuPlanError as exc:
@@ -654,11 +865,9 @@ class Runner:
     # ---------- isolated environment ----------
 
     def create_environment(self):
-        self.pg_port = free_non_5432_loopback_port()
-        if self.pg_port == 5432:
-            raise PreconditionError("host PostgreSQL port 5432 is forbidden")
+        self.pg_port = PG_HOST_PORT
         self.app_port = free_loopback_port()
-        while self.app_port == self.pg_port or self.app_port == 5432:
+        while self.app_port in (self.pg_port, 5432, METRICS_HOST_PORT):
             self.app_port = free_loopback_port()
         self.compose_project = f"payment-hub-load-{self.run_id}"
         self.compose_network = f"{self.compose_project}_default"
@@ -710,6 +919,7 @@ class Runner:
             "PAYMENT_HUB_API_KEY": self.api_key,
             "PAYMENT_HUB_DATABASE_URL": self.app_dsn,
             "PAYMENT_HUB_HTTP_ADDR": f"127.0.0.1:{self.app_port}",
+            "PAYMENT_HUB_METRICS_ADDR": f"127.0.0.1:{METRICS_HOST_PORT}",
             "PAYMENT_HUB_TEST_MODE": "off",
             # No pool diagnostic or COMMIT-tracing environment is set.
         })
@@ -775,6 +985,7 @@ class Runner:
             env=self.docker_env(),
             cwd=REPO,
         )
+        self.ensure_monitor_role()
         inspect = self.capture_cmd(
             ["docker", "inspect", f"{self.compose_project}-postgres-1"],
             env=self.docker_env(),
@@ -2033,6 +2244,7 @@ class Runner:
 
     def run(self):
         self.prepare_dirs()
+        self.acquire_run_lock()
         self.preflight()
         self.build_app()
         for index in range(1, self.rounds + 1):
@@ -2172,6 +2384,16 @@ class Runner:
                 "endpoint_policy": "fixed local default Unix socket; ambient DOCKER_HOST (other than the exact default) and DOCKER_CONTEXT are rejected; all Docker/Compose calls use a sanitized environment",
                 "server_version": self.docker_server_version,
             },
+            "monitoring": {
+                "metrics_addr": f"127.0.0.1:{METRICS_HOST_PORT}",
+                "application_env": "PAYMENT_HUB_METRICS_ADDR",
+                "postgres_host_port": PG_HOST_PORT,
+                "monitor_role": MONITOR_ROLE,
+                "password_file": str(self.monitor_password_path),
+                "password_mode": "0600",
+                "password_in_argv": False,
+                "password_in_evidence": False,
+            },
             "migration": self.migration_check,
             "postgres": {
                 "image": self.pg_image,
@@ -2180,6 +2402,7 @@ class Runner:
                 "cpu_group": PG_CPUS,
                 "persistence_parameters_changed": False,
                 "host_port_5432": False,
+                "fixed_host_port": PG_HOST_PORT,
             },
             "diagnostics": {
                 "pg_sampler": False,
@@ -2337,7 +2560,7 @@ def parse_args(argv):
                         help="fixed benchmark profile (only 200)")
     parser.add_argument("--rounds", type=int, choices=[REQUIRED_ROUNDS],
                         default=REQUIRED_ROUNDS,
-                        help="fixed number of sequential rounds (only 3)")
+                        help="fixed number of sequential rounds (only 5)")
     parser.add_argument("--artifacts-dir", default=None,
                         help=("evidence root outside the repository "
                               f"(default: {DEFAULT_ARTIFACTS_ROOT})"))
@@ -2394,6 +2617,7 @@ def main(argv=None):
             if getattr(runner, "cleanup_warnings", None) and exit_code == 0:
                 exit_code = 1
             summary_path = runner.write_summary(error)
+            runner.release_run_lock()
             if error:
                 print(f"ERROR: {error}")
             for warning in getattr(runner, "cleanup_warnings", []):

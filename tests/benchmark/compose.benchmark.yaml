@@ -1,7 +1,13 @@
 # Benchmark-only Compose override for the repeatable local 200 RPS lane.
 # Always combine with deploy/compose.yaml and deploy/compose.test.yaml.
-# It pins PostgreSQL to the benchmark guest CPU set proven by cpu_plan.py.
+# It pins PostgreSQL to the benchmark guest CPU set proven by cpu_plan.py and
+# replaces the dynamic test port with the fixed loopback port 55432.
 # Stop/restart keeps the named volume; there is no down -v cleanup step.
 services:
   postgres:
     cpuset: "${PAYMENT_HUB_TEST_PG_CPUSET:?请明确设置基准 PostgreSQL 的 guest CPU 集合}"
+    ports: !override
+      - target: 5432
+        protocol: tcp
+        host_ip: 127.0.0.1
+        published: "55432"

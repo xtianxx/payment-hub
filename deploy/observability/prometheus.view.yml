@@ -1,5 +1,7 @@
-# 归档回看期间的 Prometheus 配置（骨架）。
-# 回看时没有抓取目标；数据保留时间由启动参数控制，避免打开归档副本时改写或删除历史块。
-global: { scrape_interval: 5s, scrape_timeout: 4s }
+# 归档回看期间的 Prometheus 配置。
+# 没有抓取目标；数据来自归档副本，启动参数使用 100y 保留时间避免改写或删除历史块。
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
 
 scrape_configs: []
