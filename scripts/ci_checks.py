@@ -6143,6 +6143,70 @@ def _safe_vulnerability_report(source: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+CLEANUP_STAGES = frozenset(
+    (
+        "cleanup",
+        "version",
+        "sql-hash",
+        "negative-dsn",
+        "migration-up",
+        "migration-up-again",
+        "reject-env",
+        "reject-down",
+        "reject-reset",
+        "reject-up-extra",
+        "reject-option",
+    )
+)
+
+CLEANUP_ERROR_PREFIX_RE = re.compile(r"[a-z0-9-]{1,40}")
+CLEANUP_STAGE_ERROR_SUFFIXES = frozenset(
+    ("reap", "container-identity", "container-remains", "container-cleanup")
+)
+CLEANUP_ERROR_CODES = frozenset(
+    (
+        "cleanup:container-list",
+        "cleanup:container-ambiguous",
+        "cleanup:container-identity",
+        "cleanup:containers-remain",
+        "cleanup:network-ambiguous",
+        "cleanup:network-identity",
+        "cleanup:network-remains",
+        "cleanup:network-verify",
+        "cleanup:tool-container",
+        "cleanup:compose-collect",
+        "cleanup:compose-down",
+        "cleanup:volume-not-recorded",
+        "cleanup:volume",
+        "cleanup:volume-ambiguous",
+        "cleanup:volume-identity",
+        "cleanup:volume-inspect",
+        "cleanup:volume-remove",
+        "cleanup:volume-remains",
+    )
+)
+
+
+def _cleanup_error_code(value: Any) -> str | None:
+    """只透传启动器的固定错误码；未知文本丢弃而不影响状态判定。
+
+    启动器新增工具阶段时需同步 ``CLEANUP_STAGES``；``error_count`` 仍是
+    权威计数，过滤后的列表只用于诊断。
+    """
+    if not isinstance(value, str) or ":" not in value:
+        return None
+    prefix, _, suffix = value.partition(":")
+    if value in CLEANUP_ERROR_CODES:
+        return value
+    if (
+        prefix in CLEANUP_STAGES
+        and CLEANUP_ERROR_PREFIX_RE.fullmatch(prefix)
+        and suffix in CLEANUP_STAGE_ERROR_SUFFIXES
+    ):
+        return value
+    return None
+
+
 def _safe_cancellation_report(source: dict[str, Any]) -> dict[str, Any]:
     if source.get("schema") != CANCELLATION_SCHEMA:
         raise CiError("unsupported-report-schema")
@@ -6215,6 +6279,18 @@ def _safe_cancellation_report(source: dict[str, Any]) -> dict[str, Any]:
     )
     if error_count < 0:
         raise CiError("unsafe-field-cleanup.error_count")
+    errors_value = cleanup_source.get("errors", [])
+    if errors_value is None:
+        errors_value = []
+    if not isinstance(errors_value, list):
+        raise CiError("unsafe-field-cleanup.errors")
+    errors = []
+    for item in errors_value:
+        code = _cleanup_error_code(item)
+        if code is not None:
+            errors.append(code)
+    # 先过滤再截断：错误数量多时保留安全子集，不因长度拒绝整个报告。
+    errors = sorted(set(errors))[:32]
     tool_containers_removed = _require_bool(
         cleanup_source.get("tool_containers_removed"),
         "cleanup.tool_containers_removed",
@@ -6227,6 +6303,7 @@ def _safe_cancellation_report(source: dict[str, Any]) -> dict[str, Any]:
         "volume_retained": volume_retained,
         "repeat_signal_ignored": repeat_signal_ignored,
         "error_count": error_count,
+        "errors": errors,
         "tool_containers_removed": tool_containers_removed,
     }
 
@@ -6269,6 +6346,7 @@ def _safe_cancellation_report(source: dict[str, Any]) -> dict[str, Any]:
         cleanup_ok = (
             cleanup_result == "pass"
             and error_count == 0
+            and not errors
             and compose_down_exit == 0
             and network_removed
             and volume_removed
