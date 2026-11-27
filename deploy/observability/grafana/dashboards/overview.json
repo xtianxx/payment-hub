@@ -292,7 +292,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "go_goroutines 为进程当前 goroutine 数的瞬时值，反映并发规模与潜在阻塞泄漏；不设阈值。",
+      "description": "go_goroutines{job=\"payment-hub\"} 为 payment-hub 进程当前 goroutine 数的瞬时值，反映并发规模与潜在阻塞泄漏；不设阈值。",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -330,7 +330,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "go_goroutines",
+          "expr": "go_goroutines{job=\"payment-hub\"}",
           "instant": false,
           "legendFormat": "goroutine",
           "range": true,
@@ -342,7 +342,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "go_memstats_heap_inuse_bytes 为 Go 堆已分配且尚未释放的字节数，含暂未回收的空间；不设阈值。",
+      "description": "go_memstats_heap_inuse_bytes{job=\"payment-hub\"} 为 payment-hub 的 Go 堆已分配且尚未释放的字节数，含暂未回收的空间；不设阈值。",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -380,7 +380,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "go_memstats_heap_inuse_bytes",
+          "expr": "go_memstats_heap_inuse_bytes{job=\"payment-hub\"}",
           "instant": false,
           "legendFormat": "堆 inuse",
           "range": true,
@@ -392,7 +392,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "rate(go_gc_duration_seconds_count[$__rate_interval]) 为每秒 GC 完成次数，用于观察 GC 频率变化；不设阈值。",
+      "description": "rate(go_gc_duration_seconds_count{job=\"payment-hub\"}[$__rate_interval]) 为 payment-hub 每秒 GC 完成次数，用于观察 GC 频率变化；不设阈值。",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -430,7 +430,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "rate(go_gc_duration_seconds_count[$__rate_interval])",
+          "expr": "rate(go_gc_duration_seconds_count{job=\"payment-hub\"}[$__rate_interval])",
           "instant": false,
           "legendFormat": "GC 次数/秒",
           "range": true,
@@ -442,7 +442,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "GC 总暂停时长速率除以 GC 次数速率得到每次 GC 的平均暂停秒数，分母为 0 时显示 No data；不设阈值。",
+      "description": "仅统计 job=\"payment-hub\"：GC 总暂停时长速率除以 GC 次数速率得到每次 GC 的平均暂停秒数，分母为 0 时显示 No data；不设阈值。",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -480,7 +480,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "rate(go_gc_duration_seconds_sum[$__rate_interval]) / (rate(go_gc_duration_seconds_count[$__rate_interval]) > 0)",
+          "expr": "rate(go_gc_duration_seconds_sum{job=\"payment-hub\"}[$__rate_interval]) / (rate(go_gc_duration_seconds_count{job=\"payment-hub\"}[$__rate_interval]) > 0)",
           "instant": false,
           "legendFormat": "平均暂停",
           "range": true,
@@ -492,7 +492,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "rate(process_cpu_seconds_total[$__rate_interval]) 为进程每秒消耗的 CPU 秒数，约等于占用的核数；不设阈值。",
+      "description": "rate(process_cpu_seconds_total{job=\"payment-hub\"}[$__rate_interval]) 为 payment-hub 进程每秒消耗的 CPU 秒数，约等于占用的核数；不设阈值。",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -530,7 +530,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "rate(process_cpu_seconds_total[$__rate_interval])",
+          "expr": "rate(process_cpu_seconds_total{job=\"payment-hub\"}[$__rate_interval])",
           "instant": false,
           "legendFormat": "CPU 核数",
           "range": true,
@@ -542,7 +542,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "process_resident_memory_bytes 为进程常驻集大小（RSS），反映实际占用的物理内存；不设阈值。",
+      "description": "process_resident_memory_bytes{job=\"payment-hub\"} 为 payment-hub 进程常驻集大小（RSS），反映实际占用的物理内存；不设阈值。",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -580,7 +580,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "process_resident_memory_bytes",
+          "expr": "process_resident_memory_bytes{job=\"payment-hub\"}",
           "instant": false,
           "legendFormat": "RSS",
           "range": true,

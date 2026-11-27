@@ -46,6 +46,34 @@ GO_RESOURCE_METRICS = (
     "process_cpu_seconds_total",
     "process_resident_memory_bytes",
 )
+# title -> 完整表达式；逐一核对，避免 goroutine 与堆面板互换等串位错误。
+GO_RESOURCE_PANELS = {
+    "goroutine 数": 'go_goroutines{job="payment-hub"}',
+    "堆使用量": 'go_memstats_heap_inuse_bytes{job="payment-hub"}',
+    "GC 次数速率": (
+        'rate(go_gc_duration_seconds_count{job="payment-hub"}'
+        '[$__rate_interval])'
+    ),
+    "GC 平均暂停": (
+        'rate(go_gc_duration_seconds_sum{job="payment-hub"}'
+        '[$__rate_interval]) / (rate(go_gc_duration_seconds_count'
+        '{job="payment-hub"}[$__rate_interval]) > 0)'
+    ),
+    "进程 CPU 速率": (
+        'rate(process_cpu_seconds_total{job="payment-hub"}'
+        '[$__rate_interval])'
+    ),
+    "常驻内存": 'process_resident_memory_bytes{job="payment-hub"}',
+}
+# title -> (x, y)；全部面板 h=8、w=8。
+GO_RESOURCE_LAYOUT = {
+    "goroutine 数": (0, 18),
+    "堆使用量": (8, 18),
+    "GC 次数速率": (16, 18),
+    "GC 平均暂停": (0, 26),
+    "进程 CPU 速率": (8, 26),
+    "常驻内存": (16, 26),
+}
 REQUIRED_METRICS = (
     "payment_hub_http_requests_total",
     "payment_hub_http_request_duration_seconds_bucket",
@@ -145,28 +173,49 @@ class DashboardJsonTest(unittest.TestCase):
         go_panels = self.panels[start:end]
 
         self.assertEqual(len(go_panels), 6, "“Go 资源”行下应有 6 个面板")
-        for panel in go_panels:
-            with self.subTest(panel=panel.get("title")):
+
+        panels_by_title = {panel["title"]: panel for panel in go_panels}
+        self.assertEqual(
+            set(panels_by_title),
+            set(GO_RESOURCE_PANELS),
+            f"Go 资源面板标题不符：{sorted(panels_by_title)}",
+        )
+
+        for title, expected_expr in GO_RESOURCE_PANELS.items():
+            with self.subTest(panel=title):
+                panel = panels_by_title[title]
                 self.assertEqual(panel.get("type"), "timeseries")
-                self.assertIn(panel["gridPos"]["y"], (18, 26))
                 self.assertEqual(
                     datasource_name(panel.get("datasource")), "Prometheus"
                 )
                 targets = iter_targets(panel)
                 self.assertEqual(len(targets), 1)
+                target = targets[0]
                 self.assertEqual(
-                    datasource_name(targets[0].get("datasource")), "Prometheus"
+                    datasource_name(target.get("datasource")), "Prometheus"
                 )
+                self.assertEqual(target.get("expr"), expected_expr)
 
-        expressions = [
-            target["expr"]
-            for panel in go_panels
-            for target in iter_targets(panel)
-        ]
-        text = "\n".join(expressions)
-        for metric in GO_RESOURCE_METRICS:
-            with self.subTest(metric=metric):
-                self.assertIn(metric, text)
+                grid = panel["gridPos"]
+                self.assertEqual(
+                    (grid["x"], grid["y"]), GO_RESOURCE_LAYOUT[title]
+                )
+                self.assertEqual((grid["h"], grid["w"]), (8, 8))
+
+        for index, left in enumerate(go_panels):
+            for right in go_panels[index + 1:]:
+                left_grid = left["gridPos"]
+                right_grid = right["gridPos"]
+                overlaps = (
+                    left_grid["x"] < right_grid["x"] + right_grid["w"]
+                    and right_grid["x"] < left_grid["x"] + left_grid["w"]
+                    and left_grid["y"] < right_grid["y"] + right_grid["h"]
+                    and right_grid["y"] < left_grid["y"] + left_grid["h"]
+                )
+                self.assertFalse(
+                    overlaps,
+                    f"Go 资源面板重叠：{left['title']} 与 {right['title']}",
+                )
 
     def test_every_panel_has_required_structure(self):
         for panel in self.panels:
