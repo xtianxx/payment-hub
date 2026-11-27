@@ -243,3 +243,8 @@ T038 [P] [US4] 看板 JSON 测试
 - 每个故事结束停在 Checkpoint，独立验证后再进入下一故事
 - 不自动提交或推送；提交需单独授权
 - Grafana 13 经典 JSON、exporter 自定义查询和完整压测链路属于实现时验证项，失败时按 `research.md` 的回退方案处理
+
+## Phase 8: Convergence
+
+- [x] T050 在 `deploy/observability/grafana/dashboards/overview.json` 增加“Go 资源”行及 goroutine 数、堆使用量、GC 次数速率与平均暂停、进程 CPU 速率、常驻内存面板，并更新 `tests/benchmark/test_dashboard_json.py`，把该行与 Go 指标查询纳入断言，确保预置看板覆盖接口、Go 资源、连接池、PostgreSQL 四类 per US4/AC2、SC-001（partial）
+- [x] T051 在 `specs/002-observability-metrics/contracts/metrics.md` 的查询契约和 `docs/observability.md` 的回看说明中补充 goroutine、堆、进程 CPU、常驻内存的可执行查询（使用 `$__rate_interval` 的看板口径与 `[1m]` 的文档口径），使观察者按文档即可完成 US2/AC1 的资源观察 per US2/AC1、FR-013（partial）

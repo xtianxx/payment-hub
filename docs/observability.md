@@ -116,7 +116,20 @@ export PROMETHEUS_CONFIG_FILE="$PWD/deploy/observability/prometheus.view.yml"
 docker compose -f deploy/compose.observability.yaml up -d prometheus grafana
 ```
 
-打开 `http://127.0.0.1:3000`，选择预置看板“Payment Hub 压测总览”，时间范围选该次运行的时间窗。看板包含 HTTP 速率/错误率/P95、连接池利用率与等待、PostgreSQL 事务/锁等待/缓存/临时文件/检查点，以及 `up`/`pg_up` 抓取状态。
+打开 `http://127.0.0.1:3000`，选择预置看板“Payment Hub 压测总览”，时间范围选该次运行的时间窗。看板包含 HTTP 速率/错误率/P95、连接池利用率与等待、PostgreSQL 事务/锁等待/缓存/临时文件/检查点、Go 资源（goroutine、堆使用量、GC 次数速率与平均暂停、进程 CPU 速率、常驻内存），以及 `up`/`pg_up` 抓取状态。
+
+**资源指标查询**
+
+压测中和停压后都可用以下查询观察 Go 资源是否回落，不设固定阈值（文档口径 `[1m]`，看板口径 `$__rate_interval`）：
+
+```promql
+go_goroutines
+go_memstats_heap_inuse_bytes
+rate(process_cpu_seconds_total[1m])
+process_resident_memory_bytes
+```
+
+这些值来自应用侧的 Go/process collector；`rate(process_cpu_seconds_total[1m])` 的结果是每秒 CPU 秒数，即核数。应用停止时这些序列随之消失，`up{job="payment-hub"}=0`，不要只凭查询结果判断应用状态。
 
 Grafana 为回环匿名只读：数据源 `editable: false`，看板 `allowUiUpdates: false`，关闭 basic auth、登录表单和注册。回看配置无抓取目标并设置较长保留时间，避免打开副本时删除过期块；同一副本只能被一个 Prometheus 实例使用。
 

@@ -187,6 +187,17 @@ rate(go_gc_duration_seconds_sum[1m]) / rate(go_gc_duration_seconds_count[1m])
 
 累计分位数只作参考，不能按窗口聚合；判断“是否变频繁”看次数速率和平均暂停。
 
+**Go 资源**
+
+```promql
+go_goroutines
+go_memstats_heap_inuse_bytes
+rate(process_cpu_seconds_total[1m])
+process_resident_memory_bytes
+```
+
+以上是 `client_golang` 标准 Go/process collector 序列；文档口径使用 `[1m]`，看板使用 `$__rate_interval`。不设固定阈值，压测中和停压后观察这些值是否回落；`rate(process_cpu_seconds_total[1m])` 的结果是每秒 CPU 秒数，即核数。
+
 **连接池利用率**
 
 ```promql

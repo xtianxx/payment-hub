@@ -2,7 +2,8 @@
 
 断言范围：
 - 固定 UID、标题、schemaVersion、时间范围和刷新间隔；
-- 面板数量、四组行标题、每个面板的 id/type/title/gridPos/targets；
+- 面板数量、五行行标题、每个面板的 id/type/title/gridPos/targets；
+- “Go 资源”行下的 goroutine、堆、GC、进程 CPU 与常驻内存面板；
 - 所有 target.expr 中的契约指标名与 $__rate_interval / $__range 口径；
 - 不出现 usename、application_name 或订单号类标签；
 - 不引用合同之外的模板变量。
@@ -28,9 +29,23 @@ EXPECTED_TITLE = "Payment Hub 压测总览"
 EXPECTED_SCHEMA_VERSION = 39
 EXPECTED_TIME = {"from": "now-6h", "to": "now"}
 EXPECTED_REFRESH = "30s"
-EXPECTED_PANEL_COUNT = 20
-EXPECTED_GROUP_TITLES = ("HTTP 请求", "数据库连接池", "PostgreSQL", "抓取状态")
+EXPECTED_PANEL_COUNT = 27
+EXPECTED_GROUP_TITLES = (
+    "HTTP 请求",
+    "Go 资源",
+    "数据库连接池",
+    "PostgreSQL",
+    "抓取状态",
+)
 
+GO_RESOURCE_METRICS = (
+    "go_goroutines",
+    "go_memstats_heap_inuse_bytes",
+    "go_gc_duration_seconds_count",
+    "go_gc_duration_seconds_sum",
+    "process_cpu_seconds_total",
+    "process_resident_memory_bytes",
+)
 REQUIRED_METRICS = (
     "payment_hub_http_requests_total",
     "payment_hub_http_request_duration_seconds_bucket",
@@ -43,7 +58,7 @@ REQUIRED_METRICS = (
     "pg_stat_database_temp_files",
     "pg_stat_bgwriter_checkpoint_write_time_total",
     "pg_up",
-)
+) + GO_RESOURCE_METRICS
 REQUIRED_UP_SELECTORS = ('up{job="payment-hub"}', 'up{job="postgres"}')
 FORBIDDEN_LABEL_TOKENS = (
     "usename",
@@ -102,7 +117,7 @@ class DashboardJsonTest(unittest.TestCase):
         self.assertEqual(self.dashboard["time"], EXPECTED_TIME)
         self.assertEqual(self.dashboard["refresh"], EXPECTED_REFRESH)
 
-    def test_panel_count_and_four_group_titles(self):
+    def test_panel_count_and_five_group_titles(self):
         self.assertIsInstance(self.panels, list)
         self.assertEqual(len(self.panels), EXPECTED_PANEL_COUNT)
         row_titles = [
@@ -112,6 +127,46 @@ class DashboardJsonTest(unittest.TestCase):
         for title in EXPECTED_GROUP_TITLES:
             with self.subTest(title=title):
                 self.assertIn(title, row_titles)
+
+    def test_go_resource_row_and_panels(self):
+        row_indexes = [
+            index
+            for index, panel in enumerate(self.panels)
+            if panel.get("type") == "row" and panel.get("title") == "Go 资源"
+        ]
+        self.assertEqual(len(row_indexes), 1, "缺少标题为“Go 资源”的 row")
+
+        start = row_indexes[0] + 1
+        end = len(self.panels)
+        for index in range(start, len(self.panels)):
+            if self.panels[index].get("type") == "row":
+                end = index
+                break
+        go_panels = self.panels[start:end]
+
+        self.assertEqual(len(go_panels), 6, "“Go 资源”行下应有 6 个面板")
+        for panel in go_panels:
+            with self.subTest(panel=panel.get("title")):
+                self.assertEqual(panel.get("type"), "timeseries")
+                self.assertIn(panel["gridPos"]["y"], (18, 26))
+                self.assertEqual(
+                    datasource_name(panel.get("datasource")), "Prometheus"
+                )
+                targets = iter_targets(panel)
+                self.assertEqual(len(targets), 1)
+                self.assertEqual(
+                    datasource_name(targets[0].get("datasource")), "Prometheus"
+                )
+
+        expressions = [
+            target["expr"]
+            for panel in go_panels
+            for target in iter_targets(panel)
+        ]
+        text = "\n".join(expressions)
+        for metric in GO_RESOURCE_METRICS:
+            with self.subTest(metric=metric):
+                self.assertIn(metric, text)
 
     def test_every_panel_has_required_structure(self):
         for panel in self.panels:
